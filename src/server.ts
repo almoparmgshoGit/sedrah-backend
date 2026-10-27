@@ -73,11 +73,11 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
   contentSecurityPolicy: {
     directives: {
-      defaultSrc: ["'self'"],
-      imgSrc: ["'self'", "data:", "http://localhost:5000", "http://localhost:3000", "https:"],
-      scriptSrc: ["'self'"],
+      defaultSrc: ["'self'", "*"],
+      imgSrc: ["'self'", "data:", "blob:", "https:", "http:"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
       styleSrc: ["'self'", "'unsafe-inline'", "https:"],
-      connectSrc: ["'self'", "http://localhost:5000", "http://localhost:3000"],
+      connectSrc: ["'self'", "*", "https:", "http:", "ws:", "wss:"],
     },
   },
 }));

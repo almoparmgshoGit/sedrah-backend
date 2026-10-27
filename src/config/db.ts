@@ -291,7 +291,6 @@ export const initDB = async () => {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
-    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS permission_group_id VARCHAR(16);');
 
     // 1. Users table
     await pool.query(`
@@ -310,7 +309,8 @@ export const initDB = async () => {
       );
     `);
 
-    // Ensure permissions & address columns exist in users table
+    // Ensure permission_group_id, permissions & address columns exist in users table
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS permission_group_id VARCHAR(16);');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions TEXT;');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS address TEXT;');
 

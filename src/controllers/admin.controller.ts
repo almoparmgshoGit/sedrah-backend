@@ -1,7 +1,7 @@
 import { Response, Request } from 'express';
 import { pool } from '../config/db';
 import { AuthRequest } from '../middlewares/security.middleware';
-import { formatUserId, formatCompanyId, generateRandomToken } from '../utils/formatId';
+import { formatUserId, formatCompanyId, generateRandomToken, generate16CharId } from '../utils/formatId';
 import { logAudit } from '../utils/auditLogger';
 import argon2 from 'argon2';
 import nodemailer from 'nodemailer';
@@ -1035,8 +1035,8 @@ export const adminGetCategories = async (_req: AuthRequest, res: Response): Prom
     ];
     for (const cat of DEFAULT_CATS) {
       await pool.query(
-        'INSERT INTO store_categories (name, icon, sort_order) VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING',
-        [cat.name, cat.icon, cat.sort_order]
+        'INSERT INTO store_categories (id, name, icon, sort_order) VALUES ($1, $2, $3, $4) ON CONFLICT (name) DO NOTHING',
+        [generate16CharId(), cat.name, cat.icon, cat.sort_order]
       );
     }
 
@@ -1055,12 +1055,13 @@ export const adminCreateCategory = async (req: AuthRequest, res: Response): Prom
       return;
     }
     const result = await pool.query(
-      'INSERT INTO store_categories (name, icon, sort_order, is_active) VALUES ($1, $2, $3, $4) RETURNING *',
-      [name, icon, parseInt(sort_order, 10) || 0, is_active]
+      'INSERT INTO store_categories (id, name, icon, sort_order, is_active) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [generate16CharId(), name, icon, parseInt(sort_order, 10) || 0, is_active]
     );
     res.status(201).json({ success: true, data: result.rows[0] });
   } catch (error: any) {
-    res.status(500).json({ error: 'فشل إنشاء القسم' });
+    console.error('Create category error:', error);
+    res.status(500).json({ error: error.message || 'فشل إنشاء القسم' });
   }
 };
 
@@ -1145,16 +1146,17 @@ export const adminCreateProduct = async (req: AuthRequest, res: Response): Promi
 
     const result = await pool.query(
       `INSERT INTO store_products
-       (custom_id, name, description, price, discount_price, category_id, image_url, images, sizes, colors, stock, is_featured, is_active)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       (id, custom_id, name, description, price, discount_price, category_id, image_url, images, sizes, colors, stock, is_featured, is_active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        RETURNING *`,
       [
+        generate16CharId(),
         generatedCustomId,
         name,
         description || '',
         price !== undefined && price !== '' && !isNaN(parseFloat(price)) ? parseFloat(price) : 0,
         discount_price !== undefined && discount_price !== '' && !isNaN(parseFloat(discount_price)) ? parseFloat(discount_price) : null,
-        category_id !== undefined && category_id !== '' && !isNaN(parseInt(category_id, 10)) ? parseInt(category_id, 10) : null,
+        category_id ? String(category_id) : null,
         image_url || '',
         JSON.stringify(Array.isArray(images) ? images : []),
         JSON.stringify(Array.isArray(sizes) ? sizes : []),
@@ -1213,7 +1215,7 @@ export const adminUpdateProduct = async (req: AuthRequest, res: Response): Promi
         description !== undefined ? description : null,
         price !== undefined && price !== '' && !isNaN(parseFloat(price)) ? parseFloat(price) : null,
         discount_price !== undefined && discount_price !== '' && !isNaN(parseFloat(discount_price)) ? parseFloat(discount_price) : null,
-        category_id !== undefined && category_id !== '' && !isNaN(parseInt(category_id, 10)) ? parseInt(category_id, 10) : null,
+        category_id ? String(category_id) : null,
         image_url || null,
         images !== undefined ? JSON.stringify(Array.isArray(images) ? images : []) : null,
         sizes !== undefined ? JSON.stringify(Array.isArray(sizes) ? sizes : []) : null,
@@ -1286,14 +1288,15 @@ export const adminCreateBanner = async (req: AuthRequest, res: Response): Promis
     }
 
     const result = await pool.query(
-      `INSERT INTO store_banners (title, image_url, product_id, product_custom_id, governorate_id, start_date, end_date, start_at, end_at, is_active)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+      `INSERT INTO store_banners (id, title, image_url, product_id, product_custom_id, governorate_id, start_date, end_date, start_at, end_at, is_active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
       [
+        generate16CharId(),
         title,
         image_url,
         resolvedProductId,
         resolvedCustomId,
-        governorate_id ? parseInt(governorate_id, 10) : null,
+        governorate_id ? String(governorate_id) : null,
         start_date || null,
         end_date || null,
         start_at || null,

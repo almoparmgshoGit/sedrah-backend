@@ -84,7 +84,7 @@ app.use(helmet({
 
 // 2. Strict CORS Configuration
 app.use(cors({
-  origin: env.CORS_ORIGIN,
+  origin: (origin, callback) => callback(null, true),
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Idempotency-Key', 'x-idempotency-key'],
   credentials: true,

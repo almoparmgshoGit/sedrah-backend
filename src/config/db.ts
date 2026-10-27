@@ -309,10 +309,12 @@ export const initDB = async () => {
       );
     `);
 
-    // Ensure permission_group_id, permissions & address columns exist in users table
+    // Ensure permission_group_id, permissions, address, status & public_id columns exist in users table
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS permission_group_id VARCHAR(16);');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions TEXT;');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS address TEXT;');
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active';");
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS public_id VARCHAR(50);');
 
     // 2. Cities table
     await pool.query(`

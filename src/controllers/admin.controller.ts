@@ -17,7 +17,7 @@ const resolveUserId = async (param: string | number) => {
 export const getAllUsers = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const result = await pool.query(`
-      SELECT u.id, u.name, u.email, u.phone, u.role, u.status, u.permissions, u.permission_group_id, u.created_at, u.public_id,
+      SELECT u.id, u.name, u.email, u.phone, u.role, COALESCE(u.status, 'active') as status, u.permissions, u.permission_group_id, u.created_at, u.public_id,
              pg.name as permission_group_name
       FROM users u
       LEFT JOIN permission_groups pg ON u.permission_group_id = pg.id

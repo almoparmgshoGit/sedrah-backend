@@ -144,9 +144,9 @@ router.post('/base64', authenticate, (req: AuthRequest, res: Response): void => 
       return;
     }
 
-    // Size limit check on base64 payload (15MB chars limit ~ 11MB file)
-    if (image.length > 15 * 1024 * 1024) {
-      res.status(400).json({ error: 'حجم الملف يتجاوز الحد المسموح (10 ميجابايت)' });
+    // Size limit check on base64 payload (50MB chars limit ~ 35MB file)
+    if (image.length > 50 * 1024 * 1024) {
+      res.status(400).json({ error: 'حجم الملف يتجاوز الحد المسموح (35 ميجابايت)' });
       return;
     }
 

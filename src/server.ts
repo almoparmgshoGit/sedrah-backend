@@ -91,8 +91,8 @@ app.use(cors({
 }));
 
 // 3. Request Body Parser with size limits to prevent DoS (payload too large)
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // 4. Pino HTTP Request Logger Middleware
 app.use(pinoHttp({ logger }));

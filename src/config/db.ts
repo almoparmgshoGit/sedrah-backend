@@ -787,12 +787,15 @@ export const initDB = async () => {
         images TEXT DEFAULT '[]',
         sizes TEXT DEFAULT '[]',
         colors TEXT DEFAULT '[]',
+        attributes TEXT DEFAULT '{}',
         stock INT NOT NULL DEFAULT 0,
         is_featured BOOLEAN DEFAULT FALSE,
         is_active BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+
+    await pool.query('ALTER TABLE store_products ADD COLUMN IF NOT EXISTS attributes TEXT DEFAULT \'{}\';');
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS store_banners (

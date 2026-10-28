@@ -1132,6 +1132,7 @@ export const adminCreateProduct = async (req: AuthRequest, res: Response): Promi
       images = [],
       sizes = [],
       colors = [],
+      attributes = {},
       stock = 0,
       is_featured = false,
       is_active = true,
@@ -1146,8 +1147,8 @@ export const adminCreateProduct = async (req: AuthRequest, res: Response): Promi
 
     const result = await pool.query(
       `INSERT INTO store_products
-       (id, custom_id, name, description, price, discount_price, category_id, image_url, images, sizes, colors, stock, is_featured, is_active)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+       (id, custom_id, name, description, price, discount_price, category_id, image_url, images, sizes, colors, attributes, stock, is_featured, is_active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
        RETURNING *`,
       [
         generate16CharId(),
@@ -1161,6 +1162,7 @@ export const adminCreateProduct = async (req: AuthRequest, res: Response): Promi
         JSON.stringify(Array.isArray(images) ? images : []),
         JSON.stringify(Array.isArray(sizes) ? sizes : []),
         JSON.stringify(Array.isArray(colors) ? colors : []),
+        typeof attributes === 'object' ? JSON.stringify(attributes) : (attributes || '{}'),
         stock !== undefined && stock !== '' && !isNaN(parseInt(stock, 10)) ? parseInt(stock, 10) : 0,
         is_featured === true || is_featured === 'true',
         is_active === true || is_active === 'true',
@@ -1188,6 +1190,7 @@ export const adminUpdateProduct = async (req: AuthRequest, res: Response): Promi
       images,
       sizes,
       colors,
+      attributes,
       stock,
       is_featured,
       is_active,
@@ -1205,10 +1208,11 @@ export const adminUpdateProduct = async (req: AuthRequest, res: Response): Promi
            images = COALESCE($8, images),
            sizes = COALESCE($9, sizes),
            colors = COALESCE($10, colors),
-           stock = COALESCE($11, stock),
-           is_featured = COALESCE($12, is_featured),
-           is_active = COALESCE($13, is_active)
-       WHERE id = $14 RETURNING *`,
+           attributes = COALESCE($11, attributes),
+           stock = COALESCE($12, stock),
+           is_featured = COALESCE($13, is_featured),
+           is_active = COALESCE($14, is_active)
+       WHERE id = $15 RETURNING *`,
       [
         custom_id || null,
         name || null,
@@ -1220,6 +1224,7 @@ export const adminUpdateProduct = async (req: AuthRequest, res: Response): Promi
         images !== undefined ? JSON.stringify(Array.isArray(images) ? images : []) : null,
         sizes !== undefined ? JSON.stringify(Array.isArray(sizes) ? sizes : []) : null,
         colors !== undefined ? JSON.stringify(Array.isArray(colors) ? colors : []) : null,
+        attributes !== undefined ? (typeof attributes === 'object' ? JSON.stringify(attributes) : attributes) : null,
         stock !== undefined && stock !== '' && !isNaN(parseInt(stock, 10)) ? parseInt(stock, 10) : null,
         is_featured !== undefined ? (is_featured === true || is_featured === 'true') : null,
         is_active !== undefined ? (is_active === true || is_active === 'true') : null,

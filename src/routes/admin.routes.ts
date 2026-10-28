@@ -110,22 +110,22 @@ router.put('/settings', idempotencyMiddleware, requireModulePermission('settings
 router.post('/settings/test-smtp', idempotencyMiddleware, requireModulePermission('settings'), testSmtpConnection);
 
 // Store Management Routes
-router.get('/store/categories', adminGetCategories);
-router.post('/store/categories', idempotencyMiddleware, adminCreateCategory);
-router.put('/store/categories/:id', idempotencyMiddleware, adminUpdateCategory);
-router.delete('/store/categories/:id', idempotencyMiddleware, adminDeleteCategory);
+router.get('/store/categories', requireModulePermission('store'), adminGetCategories);
+router.post('/store/categories', idempotencyMiddleware, requireModulePermission('store'), adminCreateCategory);
+router.put('/store/categories/:id', idempotencyMiddleware, requireModulePermission('store'), adminUpdateCategory);
+router.delete('/store/categories/:id', idempotencyMiddleware, requireModulePermission('store'), adminDeleteCategory);
 
-router.get('/store/products', adminGetProducts);
-router.post('/store/products', idempotencyMiddleware, adminCreateProduct);
-router.put('/store/products/:id', idempotencyMiddleware, adminUpdateProduct);
-router.delete('/store/products/:id', idempotencyMiddleware, adminDeleteProduct);
+router.get('/store/products', requireModulePermission('store'), adminGetProducts);
+router.post('/store/products', idempotencyMiddleware, requireModulePermission('store'), adminCreateProduct);
+router.put('/store/products/:id', idempotencyMiddleware, requireModulePermission('store'), adminUpdateProduct);
+router.delete('/store/products/:id', idempotencyMiddleware, requireModulePermission('store'), adminDeleteProduct);
 
-router.get('/store/banners', adminGetBanners);
-router.post('/store/banners', idempotencyMiddleware, adminCreateBanner);
-router.put('/store/banners/:id', idempotencyMiddleware, adminUpdateBanner);
-router.delete('/store/banners/:id', idempotencyMiddleware, adminDeleteBanner);
+router.get('/store/banners', requireModulePermission('store'), adminGetBanners);
+router.post('/store/banners', idempotencyMiddleware, requireModulePermission('store'), adminCreateBanner);
+router.put('/store/banners/:id', idempotencyMiddleware, requireModulePermission('store'), adminUpdateBanner);
+router.delete('/store/banners/:id', idempotencyMiddleware, requireModulePermission('store'), adminDeleteBanner);
 
-router.get('/store/orders', adminGetOrders);
-router.patch('/store/orders/:id/status', idempotencyMiddleware, adminUpdateOrderStatus);
+router.get('/store/orders', requireModulePermission('store'), adminGetOrders);
+router.patch('/store/orders/:id/status', idempotencyMiddleware, requireModulePermission('store'), adminUpdateOrderStatus);
 
 export default router;

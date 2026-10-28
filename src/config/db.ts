@@ -915,7 +915,7 @@ export const initDB = async () => {
     );
 
     // Ensure default admin user exists and is verified
-    const allPerms = JSON.stringify(['users','companies','packages','bookings','notifications','reviews','admins','audit_logs','settings']);
+    const allPerms = JSON.stringify(['users','companies','packages','bookings','store','notifications','reviews','admins','audit_logs','settings']);
     const adminCheck = await pool.query('SELECT id FROM users WHERE email = $1', ['admin@sdra.com']);
     if (adminCheck.rows.length === 0) {
       const passwordHash = await argon2.hash('Password123!');

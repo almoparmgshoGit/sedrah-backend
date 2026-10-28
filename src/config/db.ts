@@ -860,10 +860,11 @@ export const initDB = async () => {
     const catCountRes = await pool.query('SELECT COUNT(*) FROM store_categories');
     if (parseInt(catCountRes.rows[0].count, 10) === 0) {
       const DEFAULT_CATS = [
-        { name: 'ملابس الإحرام', icon: 'shirt-outline', sort_order: 1 },
-        { name: 'ملابس النساء', icon: 'woman-outline', sort_order: 2 },
-        { name: 'مستلزمات العمرة', icon: 'home-outline', sort_order: 3 },
-        { name: 'مستلزمات السفر', icon: 'briefcase-outline', sort_order: 4 },
+        { name: 'ملابس', icon: 'shirt-outline', sort_order: 1 },
+        { name: 'أحذية', icon: 'footsteps-outline', sort_order: 2 },
+        { name: 'حقائب', icon: 'briefcase-outline', sort_order: 3 },
+        { name: 'ملابس الإحرام', icon: 'shirt-outline', sort_order: 4 },
+        { name: 'مستلزمات العمرة', icon: 'home-outline', sort_order: 5 },
       ];
       for (const cat of DEFAULT_CATS) {
         await pool.query('INSERT INTO store_categories (id, name, icon, sort_order) VALUES ($1, $2, $3, $4)', [generate16CharId(), cat.name, cat.icon, cat.sort_order]);

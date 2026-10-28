@@ -10,7 +10,7 @@ import { createAndSendNotification } from '../utils/notificationHelper';
 
 const resolveUserId = async (param: string | number) => {
   const str = String(param);
-  const res = await pool.query('SELECT id FROM users WHERE id = $1', [str]);
+  const res = await pool.query('SELECT id FROM users WHERE id = $1 OR public_id = $1', [str]);
   return res.rows.length > 0 ? res.rows[0].id : null;
 };
 

@@ -768,9 +768,9 @@ export const getAuditLogs = async (req: AuthRequest, res: Response): Promise<voi
     let result = await pool.query('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 200');
     if (result.rows.length === 0) {
       await pool.query(
-        `INSERT INTO audit_logs (admin_email, admin_name, action, details, ip_address, before_data, after_data)
-         VALUES ('admin@sdra.com', 'مالك النظام', 'تهيئة نظام التدقيق', 'تم تفعيل نظام تسجيل النشاط والأمان بنجاح', '127.0.0.1', $1, $2)`,
-        [JSON.stringify({ status: 'initializing' }), JSON.stringify({ status: 'active' })]
+        `INSERT INTO audit_logs (id, admin_email, admin_name, action, details, ip_address, before_data, after_data)
+         VALUES ($1, 'admin@sdra.com', 'مالك النظام', 'تهيئة نظام التدقيق', 'تم تفعيل نظام تسجيل النشاط والأمان بنجاح', '127.0.0.1', $2, $3)`,
+        [generate16CharId(), JSON.stringify({ status: 'initializing' }), JSON.stringify({ status: 'active' })]
       );
       result = await pool.query('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 200');
     }
@@ -1500,10 +1500,11 @@ export const createNotificationTemplate = async (req: AuthRequest, res: Response
 
     const result = await pool.query(
       `INSERT INTO notification_templates (
-        system, status_key, name, title, subtitle, category, icon, icon_bg, icon_color, variables, is_active, is_system
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, false)
+        id, system, status_key, name, title, subtitle, category, icon, icon_bg, icon_color, variables, is_active, is_system
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, false)
       RETURNING *`,
       [
+        generate16CharId(),
         system,
         cleanStatusKey,
         name,
@@ -1661,8 +1662,8 @@ export const resetNotificationTemplates = async (req: AuthRequest, res: Response
 
     for (const tpl of defaultTemplates) {
       await pool.query(
-        `INSERT INTO notification_templates (system, status_key, name, title, subtitle, category, icon, icon_bg, icon_color, variables, is_active, is_system)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, true)
+        `INSERT INTO notification_templates (id, system, status_key, name, title, subtitle, category, icon, icon_bg, icon_color, variables, is_active, is_system)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true, true)
          ON CONFLICT (system, status_key) DO UPDATE SET
            name = EXCLUDED.name,
            title = EXCLUDED.title,
@@ -1674,7 +1675,7 @@ export const resetNotificationTemplates = async (req: AuthRequest, res: Response
            variables = EXCLUDED.variables,
            is_active = true,
            updated_at = CURRENT_TIMESTAMP`,
-        [tpl.system, tpl.status_key, tpl.name, tpl.title, tpl.subtitle, tpl.category, tpl.icon, tpl.icon_bg, tpl.icon_color, tpl.variables]
+        [generate16CharId(), tpl.system, tpl.status_key, tpl.name, tpl.title, tpl.subtitle, tpl.category, tpl.icon, tpl.icon_bg, tpl.icon_color, tpl.variables]
       );
     }
 

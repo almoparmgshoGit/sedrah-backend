@@ -393,8 +393,8 @@ export const getBookingStages = async (req: Request, res: Response): Promise<voi
       ];
       for (const st of defaultStages) {
         await pool.query(
-          `INSERT INTO trip_stages (booking_id, stage_order, title, subtitle, status, stage_date) VALUES ($1, $2, $3, $4, $5, $6)`,
-          [bookingId, st.order, st.title, st.subtitle, st.status, st.date]
+          `INSERT INTO trip_stages (id, booking_id, stage_order, title, subtitle, status, stage_date) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [generate16CharId(), bookingId, st.order, st.title, st.subtitle, st.status, st.date]
         );
       }
       stagesRes = await pool.query(

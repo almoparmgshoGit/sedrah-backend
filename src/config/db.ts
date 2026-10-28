@@ -909,6 +909,11 @@ export const initDB = async () => {
       );
     `);
 
+    await pool.query(
+      `INSERT INTO settings (key, value, description) VALUES ($1, $2, $3) ON CONFLICT (key) DO NOTHING`,
+      ['packages_disclaimer_note', 'نحن في سدرة غير مسئولين تماما عن اي اتفاقات تتم خارج البرنامج والشركة غير مسئولة تماما عنها نهائيا', 'ملاحظة وإخلاء مسئولية الباقات للعملاء']
+    );
+
     // Ensure default admin user exists and is verified
     const allPerms = JSON.stringify(['users','companies','packages','bookings','notifications','reviews','admins','audit_logs','settings']);
     const adminCheck = await pool.query('SELECT id FROM users WHERE email = $1', ['admin@sdra.com']);

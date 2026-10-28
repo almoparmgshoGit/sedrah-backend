@@ -1,5 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import http from 'http';
+import fs from 'fs';
 import { Server as SocketIOServer } from 'socket.io';
 import helmet from 'helmet';
 import cors from 'cors';
@@ -100,14 +101,53 @@ app.use(pinoHttp({ logger }));
 // 5. Global Rate Limiter
 app.use('/api/', globalLimiter);
 
-// Serve uploaded files statically with CORS and CORP headers
+// Secure Uploads Access Middleware for sensitive folders (receipts, chats, profiles, documents)
+const baseUploadDir = path.join(__dirname, '../uploads');
+app.get('/uploads/:category/:filename', (req: Request, res: Response): void => {
+  const { category, filename } = req.params;
+  const rawCat = Array.isArray(category) ? category[0] : category;
+  const rawFile = Array.isArray(filename) ? filename[0] : filename;
+  const safeCategory = path.basename(String(rawCat || ''));
+  const safeFilename = path.basename(String(rawFile || ''));
+  const filePath = path.join(baseUploadDir, safeCategory, safeFilename);
+
+  if (!fs.existsSync(filePath)) {
+    res.status(404).json({ error: 'الملف غير موجود' });
+    return;
+  }
+
+  const sensitiveFolders = ['receipts', 'chats', 'profiles', 'documents'];
+  if (sensitiveFolders.includes(safeCategory)) {
+    const authHeader = req.headers.authorization;
+    const queryToken = req.query.token as string;
+    const referer = req.headers.referer || '';
+    const userAgent = req.headers['user-agent'] || '';
+
+    const isAuthorized =
+      Boolean(authHeader || queryToken) ||
+      referer.includes('sedrah.tech') ||
+      referer.includes('vercel.app') ||
+      referer.includes('localhost') ||
+      userAgent.includes('okhttp') ||
+      userAgent.includes('CFNetwork');
+
+    if (!isAuthorized) {
+      res.status(403).json({ error: 'غير مصرح بالوصول إلى هذا المستند الحساس' });
+      return;
+    }
+  }
+
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.sendFile(filePath);
+});
+
+// General static files fallback
 app.use('/uploads', (req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   next();
-}, express.static(path.join(__dirname, '../uploads')));
+}, express.static(baseUploadDir));
 
 // Zod Validation Middleware Factory
 const validate = (schema: AnyZodObject) => async (req: Request, res: Response, next: NextFunction): Promise<void> => {

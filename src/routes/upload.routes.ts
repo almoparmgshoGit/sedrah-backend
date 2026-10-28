@@ -23,15 +23,28 @@ const AUDIO_MIME_TYPES = [
 ];
 const AUDIO_EXTENSIONS = ['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac'];
 
-const ALLOWED_MIME_TYPES = [
+const IMAGE_MIME_TYPES = [
   'image/jpeg',
-  'image/png',
-  'image/webp',
   'image/jpg',
+  'image/png',
+  'image/x-png',
+  'image/pjpeg',
+  'image/webp',
+  'image/gif',
+  'image/bmp',
+  'image/svg+xml',
+  'image/heic',
+  'image/heif',
+];
+
+const ALLOWED_MIME_TYPES = [
+  ...IMAGE_MIME_TYPES,
   'application/pdf',
+  'application/octet-stream',
   ...AUDIO_MIME_TYPES,
 ];
-const ALLOWED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.pdf', ...AUDIO_EXTENSIONS];
+
+const ALLOWED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.heic', '.heif', '.bmp', '.svg', '.pdf', ...AUDIO_EXTENSIONS];
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -47,7 +60,7 @@ const storage = multer.diskStorage({
     const randomPrefix = Date.now() + '-' + Math.round(Math.random() * 1e9);
     const originalExt = path.extname(file.originalname).toLowerCase();
     const category = (req.query.category as string) || '';
-    let safeExt = ALLOWED_EXTENSIONS.includes(originalExt) ? originalExt : '.jpg';
+    let safeExt = (originalExt && originalExt.length < 10) ? originalExt : '.png';
     if (category === 'sounds') {
       safeExt = AUDIO_EXTENSIONS.includes(originalExt) ? originalExt : '.mp3';
     }
@@ -78,7 +91,11 @@ const upload = multer({
       return;
     }
 
-    if (ALLOWED_MIME_TYPES.includes(mime)) {
+    const isImage = mime.startsWith('image/') || IMAGE_MIME_TYPES.includes(mime) || ALLOWED_EXTENSIONS.includes(ext);
+    const isPdf = mime.includes('pdf') || ext === '.pdf';
+    const isAllowed = isImage || isPdf || ALLOWED_MIME_TYPES.includes(mime) || ALLOWED_EXTENSIONS.includes(ext) || mime === 'application/octet-stream';
+
+    if (isAllowed) {
       cb(null, true);
     } else {
       cb(new Error('نوع الملف غير مدعوم، يُسمح بالصور و PDF والملفات الصوتية فقط'));
@@ -147,12 +164,21 @@ router.post('/base64', authenticate, (req: AuthRequest, res: Response): void => 
     }
 
     const mime = matches[1].toLowerCase();
-    if (!ALLOWED_MIME_TYPES.includes(mime)) {
+    const isImage = mime.startsWith('image/') || IMAGE_MIME_TYPES.includes(mime);
+    const isPdf = mime.includes('pdf');
+
+    if (!isImage && !isPdf && !ALLOWED_MIME_TYPES.includes(mime)) {
       res.status(400).json({ error: 'نوع الملف غير مدعوم، يُسمح بالصور و PDF فقط' });
       return;
     }
 
-    const ext = mime.includes('pdf') ? 'pdf' : (mime.split('/')[1] || 'jpg');
+    let ext = 'png';
+    if (mime.includes('pdf')) ext = 'pdf';
+    else if (mime.includes('jpeg') || mime.includes('jpg')) ext = 'jpg';
+    else if (mime.includes('png')) ext = 'png';
+    else if (mime.includes('webp')) ext = 'webp';
+    else if (mime.includes('gif')) ext = 'gif';
+    else if (mime.includes('svg')) ext = 'svg';
     const buffer = Buffer.from(matches[2], 'base64');
 
     if (buffer.length > 10 * 1024 * 1024) {

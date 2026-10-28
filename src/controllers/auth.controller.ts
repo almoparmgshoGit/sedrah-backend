@@ -221,7 +221,9 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    if (user.is_verified === false) {
+    // Admins and Super Admins bypass OTP verification; regular users must be verified
+    const isAdminRole = user.role === 'admin' || user.role === 'super_admin';
+    if (!isAdminRole && user.is_verified === false) {
       await generateAndSendOtp(user.email, user.name);
       res.status(401).json({
         error: 'يرجى تفعيل حسابك أولاً عن طريق إدخال رمز التحقق المرسل لبريدك الإلكتروني',

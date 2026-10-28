@@ -892,22 +892,24 @@ export const initDB = async () => {
       );
     `);
 
-    // Ensure default admin user exists
+    // Ensure default admin user exists and is verified
     const allPerms = JSON.stringify(['users','companies','packages','bookings','notifications','reviews','admins','audit_logs','settings']);
     const adminCheck = await pool.query('SELECT id FROM users WHERE email = $1', ['admin@sdra.com']);
     if (adminCheck.rows.length === 0) {
       const passwordHash = await argon2.hash('Password123!');
       await pool.query(
-        `INSERT INTO users (id, name, email, password_hash, phone, role, balance, permissions) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [generate16CharId(), 'مالك النظام', 'admin@sdra.com', passwordHash, '+966 50 000 0000', 'super_admin', 0.00, allPerms]
+        `INSERT INTO users (id, name, email, password_hash, phone, role, balance, is_verified, permissions) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [generate16CharId(), 'مالك النظام', 'admin@sdra.com', passwordHash, '+966 50 000 0000', 'super_admin', 0.00, true, allPerms]
       );
       console.log('✅ Default super_admin owner created: admin@sdra.com / Password123!');
     } else {
       await pool.query(
-        `UPDATE users SET name = $1, role = 'super_admin', permissions = $2 WHERE email = $3`,
+        `UPDATE users SET name = $1, role = 'super_admin', is_verified = true, permissions = $2 WHERE email = $3`,
         ['مالك النظام', allPerms, 'admin@sdra.com']
       );
     }
+    // Also mark all admin/super_admin accounts as verified by default
+    await pool.query(`UPDATE users SET is_verified = true WHERE role IN ('admin', 'super_admin')`);
 
     // Ensure default test user exists
     const testUserCheck = await pool.query('SELECT id FROM users WHERE email = $1', ['test@example.com']);

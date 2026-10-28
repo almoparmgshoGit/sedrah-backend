@@ -399,6 +399,7 @@ export const initDB = async () => {
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS manager_id_url TEXT;
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS manager_id_back_url TEXT;
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS field_verified BOOLEAN DEFAULT FALSE;
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS public_id VARCHAR(50);
     `);
 
     // 4. Packages table

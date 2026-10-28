@@ -222,10 +222,9 @@ export const updateUserByAdmin = async (req: AuthRequest, res: Response): Promis
     const { name, email, phone, role, country, city, permissions, permission_group_id } = req.body;
     const permsStr = permissions ? (Array.isArray(permissions) ? JSON.stringify(permissions) : String(permissions)) : null;
 
-    let parsedGroupId: number | null = null;
+    let parsedGroupId: string | null = null;
     if (permission_group_id !== undefined && permission_group_id !== null && permission_group_id !== '') {
-      const num = parseInt(String(permission_group_id), 10);
-      if (!isNaN(num)) parsedGroupId = num;
+      parsedGroupId = String(permission_group_id);
     }
 
     const result = await pool.query(
@@ -237,7 +236,7 @@ export const updateUserByAdmin = async (req: AuthRequest, res: Response): Promis
          country = COALESCE($5, country),
          city = COALESCE($6, city),
          permissions = COALESCE($7, permissions),
-         permission_group_id = CASE WHEN $8::boolean THEN $9::integer ELSE permission_group_id END
+         permission_group_id = CASE WHEN $8::boolean THEN $9::text ELSE permission_group_id END
        WHERE id = $10 RETURNING id, name, email, phone, role, country, city, status, permissions, permission_group_id, created_at, public_id`,
       [
         name,

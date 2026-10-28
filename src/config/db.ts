@@ -433,6 +433,7 @@ export const initDB = async () => {
       ALTER TABLE packages ADD COLUMN IF NOT EXISTS cancellation_policy TEXT;
       ALTER TABLE packages ADD COLUMN IF NOT EXISTS itinerary TEXT;
       ALTER TABLE packages ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active';
+      ALTER TABLE packages ADD COLUMN IF NOT EXISTS public_id VARCHAR(50);
       ALTER TABLE packages ALTER COLUMN price DROP NOT NULL;
     `);
 

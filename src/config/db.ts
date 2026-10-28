@@ -704,9 +704,12 @@ export const initDB = async () => {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS governorates (
         id VARCHAR(16) PRIMARY KEY,
-        name VARCHAR(255) NOT NULL UNIQUE
+        name VARCHAR(255) NOT NULL UNIQUE,
+        shipping_fee DECIMAL(10, 2) DEFAULT 50.00
       );
     `);
+
+    await pool.query('ALTER TABLE governorates ADD COLUMN IF NOT EXISTS shipping_fee NUMERIC(10, 2) DEFAULT 50.00;');
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS centers (

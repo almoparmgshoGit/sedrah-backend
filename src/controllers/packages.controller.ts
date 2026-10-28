@@ -22,14 +22,10 @@ export const getPackages = async (req: Request, res: Response): Promise<void> =>
       params.push(parsedCity.value);
     }
     if (companyId) {
-      const parsedComp = parseIdOrToken(companyId);
-      if (parsedComp.isToken) {
-        query += ` AND c.public_id = $${paramIndex++}`;
-      } else {
-        query += ` AND (p.company_id = $${paramIndex++} OR c.public_id = $${paramIndex++})`;
-        params.push(parsedComp.value);
-      }
-      params.push(parsedComp.value);
+      const strComp = String(companyId).trim();
+      query += ` AND (p.company_id = $${paramIndex} OR c.public_id = $${paramIndex} OR c.name = $${paramIndex})`;
+      params.push(strComp);
+      paramIndex++;
     }
     if (minPrice) {
       query += ` AND p.price >= $${paramIndex++}`;

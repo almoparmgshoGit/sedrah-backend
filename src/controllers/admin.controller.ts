@@ -153,61 +153,92 @@ export const getUserDetails = async (req: AuthRequest, res: Response): Promise<v
 export const createUserByAdmin = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { name, email, password, phone, role, permissions, permission_group_id } = req.body;
-
-    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
-    if (existing.rows.length > 0) {
-      res.status(400).json({ error: 'البريد الإلكتروني مسجل مسبقاً' });
+    if (!email) {
+      res.status(400).json({ error: 'البريد الإلكتروني مطلوب' });
       return;
     }
 
-    const passwordHash = await argon2.hash(password || 'Password123!');
-    const publicId = generateRandomToken('usr');
-    const permsStr = Array.isArray(permissions) ? JSON.stringify(permissions) : JSON.stringify([]);
+    const cleanEmail = String(email).trim().toLowerCase();
+    const existing = await pool.query('SELECT * FROM users WHERE LOWER(email) = $1', [cleanEmail]);
 
-    let parsedGroupId: number | null = null;
-    if (permission_group_id) {
-      const num = parseInt(String(permission_group_id), 10);
-      if (!isNaN(num)) parsedGroupId = num;
+    const permsStr = Array.isArray(permissions) ? JSON.stringify(permissions) : JSON.stringify([]);
+    const parsedGroupId = permission_group_id ? String(permission_group_id) : null;
+
+    let targetUser;
+
+    if (existing.rows.length > 0) {
+      // User exists -> Update/promote existing user role, permissions, and group (and password if provided)
+      const user = existing.rows[0];
+      const passwordHash = password ? await argon2.hash(password) : user.password_hash;
+      const updateRes = await pool.query(
+        `UPDATE users SET
+           name = COALESCE($1, name),
+           role = COALESCE($2, role),
+           password_hash = $3,
+           permissions = $4,
+           permission_group_id = $5,
+           is_verified = true
+         WHERE id = $6
+         RETURNING id, name, email, phone, role, status, permissions, permission_group_id, created_at, public_id`,
+        [name || user.name, role || user.role, passwordHash, permsStr, parsedGroupId, user.id]
+      );
+      targetUser = updateRes.rows[0];
+
+      await logAudit(
+        req.user?.email || 'admin@sdra.com',
+        'ترقية / تحديث صلاحيات مستخدم',
+        `تم تحديث صلاحيات ونظام المستخدم "${targetUser.name}" (${targetUser.email}) إلى دور: ${targetUser.role}`,
+        req.ip,
+        req.user?.email || 'المسؤول',
+        user,
+        targetUser
+      );
+    } else {
+      // User does not exist -> Create new user with password & name
+      if (!name || !password) {
+        res.status(400).json({ error: 'الاسم وكلمة المرور مطلوبان لإنشاء حساب جديد' });
+        return;
+      }
+      const passwordHash = await argon2.hash(password);
+      const publicId = generateRandomToken('usr');
+      const newUserId = generateRandomToken('usr');
+      const insertRes = await pool.query(
+        `INSERT INTO users (id, name, email, password_hash, phone, role, status, permissions, permission_group_id, public_id, is_verified)
+         VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8, $9, true)
+         RETURNING id, name, email, phone, role, status, permissions, permission_group_id, created_at, public_id`,
+        [newUserId, name, cleanEmail, passwordHash, phone || null, role || 'user', permsStr, parsedGroupId, publicId]
+      );
+      targetUser = insertRes.rows[0];
+
+      await logAudit(
+        req.user?.email || 'admin@sdra.com',
+        'إنشاء مستخدم جديد',
+        `تم إنشاء مستخدم جديد "${targetUser.name}" (${targetUser.email}) - الدور: ${targetUser.role}`,
+        req.ip,
+        req.user?.email || 'المسؤول',
+        null,
+        targetUser
+      );
     }
 
-    const newUserId = generateRandomToken('usr');
-    const result = await pool.query(
-      `INSERT INTO users (id, name, email, password_hash, phone, role, status, permissions, permission_group_id, public_id)
-       VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8, $9)
-       RETURNING id, name, email, phone, role, status, permissions, permission_group_id, created_at, public_id`,
-      [newUserId, name, email, passwordHash, phone || null, role || 'user', permsStr, parsedGroupId, publicId]
-    );
-
-    const newUser = result.rows[0];
-
-    await logAudit(
-      req.user?.email || 'admin@sdra.com',
-      'إنشاء مستخدم جديد',
-      `تم إنشاء مستخدم جديد "${newUser.name}" (${newUser.email}) - الدور: ${newUser.role}`,
-      req.ip,
-      req.user?.email || 'المسؤول',
-      null,
-      newUser
-    );
-
-    res.status(201).json({
+    res.status(200).json({
       success: true,
-      message: 'تم إنشاء المستخدم بنجاح',
+      message: existing.rows.length > 0 ? 'تم تحديث وترقية المستخدم بنجاح' : 'تم إنشاء المستخدم بنجاح',
       data: {
-        id: newUser.public_id,
-        name: newUser.name,
-        email: newUser.email,
-        phone: newUser.phone,
-        role: newUser.role,
-        permission_group_id: newUser.permission_group_id,
-        createdAt: newUser.created_at,
-        status: newUser.status,
+        id: targetUser.public_id || targetUser.id,
+        name: targetUser.name,
+        email: targetUser.email,
+        phone: targetUser.phone,
+        role: targetUser.role,
+        permission_group_id: targetUser.permission_group_id,
+        createdAt: targetUser.created_at,
+        status: targetUser.status,
         permissions: Array.isArray(permissions) ? permissions : []
       }
     });
   } catch (error: any) {
-    console.error('Error creating user by admin:', error);
-    res.status(500).json({ error: 'فشل إنشاء المستخدم' });
+    console.error('Error creating/updating user by admin:', error);
+    res.status(500).json({ error: error.message || 'فشل معالجة بيانات المستخدم' });
   }
 };
 

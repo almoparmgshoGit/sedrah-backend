@@ -382,7 +382,6 @@ export const createCompanyPackage = async (req: Request, res: Response): Promise
     }
 
     const companyId = compRes.rows[0].id;
-    const defaultCityId = compRes.rows[0].city_id || 1;
     const {
       title,
       duration,
@@ -409,7 +408,13 @@ export const createCompanyPackage = async (req: Request, res: Response): Promise
       return;
     }
 
-    const targetCityId = city_id || defaultCityId;
+    let targetCityId = city_id || compRes.rows[0].city_id;
+    if (!targetCityId) {
+      const firstCityRes = await pool.query('SELECT id FROM cities ORDER BY created_at ASC LIMIT 1');
+      if (firstCityRes.rows.length > 0) {
+        targetCityId = firstCityRes.rows[0].id;
+      }
+    }
     const publicId = generateRandomToken('pkg');
     const packageId = generate16CharId();
 

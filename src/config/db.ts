@@ -842,6 +842,14 @@ export const initDB = async () => {
       );
     `);
 
+    await pool.query(`
+      ALTER TABLE cities ADD COLUMN IF NOT EXISTS public_id VARCHAR(50);
+      ALTER TABLE store_categories ADD COLUMN IF NOT EXISTS public_id VARCHAR(50);
+      ALTER TABLE store_products ADD COLUMN IF NOT EXISTS public_id VARCHAR(50);
+      ALTER TABLE store_banners ADD COLUMN IF NOT EXISTS public_id VARCHAR(50);
+      ALTER TABLE store_orders ADD COLUMN IF NOT EXISTS public_id VARCHAR(50);
+    `);
+
     // Seed default store categories if empty
     const catCountRes = await pool.query('SELECT COUNT(*) FROM store_categories');
     if (parseInt(catCountRes.rows[0].count, 10) === 0) {

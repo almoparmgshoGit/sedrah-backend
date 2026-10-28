@@ -4,21 +4,12 @@ import { AuthRequest } from '../middlewares/security.middleware';
 import { formatCompanyId, formatPackageId, formatUserId, parseIdOrToken, generateRandomToken, generate16CharId } from '../utils/formatId';
 
 const findCompanyQuery = async (rawId: any) => {
-  const parsed = parseIdOrToken(rawId);
-  let compRes;
-  if (parsed.isToken) {
-    const numMatch = String(rawId).match(/\d+/);
-    const numericId = numMatch ? parseInt(numMatch[0], 10) : null;
-    compRes = await pool.query(
-      'SELECT * FROM companies WHERE public_id = $1 OR ($2::int IS NOT NULL AND id = $2::int)',
-      [parsed.value, numericId]
-    );
-  } else {
-    compRes = await pool.query(
-      'SELECT * FROM companies WHERE id = $1 OR public_id = $2',
-      [parsed.value, String(rawId)]
-    );
-  }
+  if (!rawId) return { rows: [] };
+  const strId = String(rawId).trim();
+  const compRes = await pool.query(
+    'SELECT * FROM companies WHERE id = $1 OR public_id = $1 OR name = $1',
+    [strId]
+  );
   return compRes;
 };
 

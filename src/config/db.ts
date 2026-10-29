@@ -914,6 +914,25 @@ export const initDB = async () => {
       ['packages_disclaimer_note', 'نحن في سدرة غير مسئولين تماما عن اي اتفاقات تتم خارج البرنامج والشركة غير مسئولة تماما عنها نهائيا', 'ملاحظة وإخلاء مسئولية الباقات للعملاء']
     );
 
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS platform_earnings (
+        id VARCHAR(16) PRIMARY KEY,
+        booking_id VARCHAR(16) REFERENCES bookings(id) ON DELETE CASCADE,
+        company_id VARCHAR(16) REFERENCES companies(id) ON DELETE CASCADE,
+        commission_amount NUMERIC(10, 2) NOT NULL DEFAULT 0.00,
+        status VARCHAR(50) DEFAULT 'recorded',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(booking_id)
+      );
+    `);
+
+    await pool.query(
+      `INSERT INTO settings (key, value, description) VALUES ($1, $2, $3) ON CONFLICT (key) DO NOTHING`,
+      ['platform_commission_fee', '50', 'المبلغ الثابت لعمولة المنصة عن كل حجز']
+    );
+
+    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(10, 2);');
+
     // Ensure default admin user exists and is verified
     const allPerms = JSON.stringify(['users','companies','packages','bookings','store','notifications','reviews','admins','audit_logs','settings']);
     const adminCheck = await pool.query('SELECT id FROM users WHERE email = $1', ['admin@sdra.com']);

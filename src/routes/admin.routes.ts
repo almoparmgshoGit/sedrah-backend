@@ -3,6 +3,7 @@ import {
   getAllUsers,
   getUserDetails,
   createUserByAdmin,
+  lookupUserByEmail,
   updateUserByAdmin,
   banUserByAdmin,
   createCompanyForUser,
@@ -58,6 +59,7 @@ const router = Router();
 // All routes require authentication and admin/staff role
 router.use(authenticate, authorize(['admin', 'super_admin', 'support', 'moderator']));
 
+router.get('/users-lookup', requireModulePermission('admins'), lookupUserByEmail);
 router.get('/users', requireModulePermission('users'), getAllUsers);
 router.get('/users/:id', requireModulePermission('users'), getUserDetails);
 router.post('/users', idempotencyMiddleware, requireModulePermission('users'), createUserByAdmin);

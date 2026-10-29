@@ -242,6 +242,29 @@ export const createUserByAdmin = async (req: AuthRequest, res: Response): Promis
   }
 };
 
+export const lookupUserByEmail = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { email } = req.query;
+    if (!email || typeof email !== 'string') {
+      res.status(400).json({ error: 'البريد الإلكتروني مطلوب للبحث' });
+      return;
+    }
+    const cleanEmail = email.trim().toLowerCase();
+    const result = await pool.query(
+      'SELECT id, name, email, phone, role, status FROM users WHERE LOWER(email) = $1',
+      [cleanEmail]
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: 'لم يتم العثور على أي مستخدم مسجل بهذا البريد الإلكتروني' });
+      return;
+    }
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error: any) {
+    console.error('Error looking up user:', error);
+    res.status(500).json({ error: 'فشل البحث عن المستخدم' });
+  }
+};
+
 export const updateUserByAdmin = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const internalUserId = await resolveUserId(String(req.params.id));

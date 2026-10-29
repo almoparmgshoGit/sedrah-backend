@@ -22,6 +22,7 @@ import {
   updateSettings,
   testSmtpConnection,
   reviewBookingReceiptByAdmin,
+  getPlatformEarnings,
   adminGetCategories,
   adminCreateCategory,
   adminUpdateCategory,
@@ -106,6 +107,7 @@ router.delete('/notification-templates/:id', idempotencyMiddleware, requireModul
 router.post('/notification-templates/reset', idempotencyMiddleware, requireModulePermission('notifications'), resetNotificationTemplates);
 
 router.get('/audit-logs', requireModulePermission('audit_logs'), getAuditLogs);
+router.get('/earnings', requireModulePermission('settings'), getPlatformEarnings);
 
 router.get('/settings', requireModulePermission('settings'), getSettings);
 router.put('/settings', idempotencyMiddleware, requireModulePermission('settings'), updateSettings);

@@ -973,6 +973,19 @@ export const reviewBookingReceiptByAdmin = async (req: AuthRequest, res: Respons
         [booking.id]
       );
 
+      // Record platform earnings
+      const pkgRes = await pool.query('SELECT company_id FROM packages WHERE id = $1', [booking.package_id]);
+      const companyId = pkgRes.rows.length > 0 ? pkgRes.rows[0].company_id : null;
+      if (companyId) {
+        const commAmt = booking.commission_amount || 0;
+        await pool.query(
+          `INSERT INTO platform_earnings (id, booking_id, company_id, commission_amount, status)
+           VALUES ($1, $2, $3, $4, 'recorded')
+           ON CONFLICT (booking_id) DO UPDATE SET commission_amount = EXCLUDED.commission_amount, status = 'recorded'`,
+          [generate16CharId(), booking.id, companyId, commAmt]
+        );
+      }
+
       await createAndSendNotification({
         userId: booking.user_id,
         title: 'تم اعتماد إيصال الدفع',
@@ -1014,6 +1027,11 @@ export const reviewBookingReceiptByAdmin = async (req: AuthRequest, res: Respons
         `UPDATE trip_stages
          SET status = CASE WHEN stage_order = 2 THEN 'current' ELSE 'pending' END
          WHERE booking_id = $1 AND stage_order >= 2`,
+        [booking.id]
+      );
+
+      await pool.query(
+        `UPDATE platform_earnings SET status = 'cancelled' WHERE booking_id = $1`,
         [booking.id]
       );
 
@@ -1751,5 +1769,64 @@ export const resetNotificationTemplates = async (req: AuthRequest, res: Response
   } catch (error: any) {
     console.error('Error resetting notification templates:', error);
     res.status(500).json({ error: 'فشل استعادة القوالب الافتراضية' });
+  }
+};
+
+export const getPlatformEarnings = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const totalEarningsRes = await pool.query(
+      `SELECT COALESCE(SUM(commission_amount), 0) as total_earnings FROM platform_earnings WHERE status = 'recorded'`
+    );
+    const totalEarnings = parseFloat(totalEarningsRes.rows[0].total_earnings || 0);
+
+    const statsRes = await pool.query(`
+      SELECT
+        COUNT(*) as total_bookings,
+        COUNT(*) FILTER (WHERE status = 'completed') as completed_bookings,
+        COUNT(*) FILTER (WHERE status = 'confirmed' OR status = 'receipt_review' OR status = 'pending') as ongoing_bookings,
+        COUNT(*) FILTER (WHERE receipt_approved = TRUE) as approved_receipts
+      FROM bookings
+    `);
+    const stats = statsRes.rows[0];
+
+    const companyEarningsRes = await pool.query(`
+      SELECT c.id, c.name, c.logo_url, c.public_id,
+             COALESCE(pe.total_earnings, 0) as total_earnings,
+             COALESCE(b_count.bookings_count, 0) as bookings_count
+      FROM companies c
+      LEFT JOIN (
+        SELECT company_id, SUM(commission_amount) as total_earnings
+        FROM platform_earnings
+        WHERE status = 'recorded'
+        GROUP BY company_id
+      ) pe ON c.id = pe.company_id
+      LEFT JOIN (
+        SELECT p.company_id, COUNT(b.id) as bookings_count
+        FROM bookings b
+        JOIN packages p ON b.package_id = p.id
+        GROUP BY p.company_id
+      ) b_count ON c.id = b_count.company_id
+      ORDER BY total_earnings DESC
+    `);
+
+    res.json({
+      success: true,
+      data: {
+        totalEarnings,
+        totalBookings: parseInt(stats.total_bookings || 0, 10),
+        completedBookings: parseInt(stats.completed_bookings || 0, 10),
+        ongoingBookings: parseInt(stats.ongoing_bookings || 0, 10),
+        approvedReceipts: parseInt(stats.approved_receipts || 0, 10),
+        companyEarnings: companyEarningsRes.rows.map(row => ({
+          ...row,
+          id: formatCompanyId(row.id, row.public_id),
+          total_earnings: parseFloat(row.total_earnings || 0),
+          bookings_count: parseInt(row.bookings_count || 0, 10)
+        }))
+      }
+    });
+  } catch (error: any) {
+    console.error('Error fetching platform earnings:', error);
+    res.status(500).json({ error: 'فشل جلب أرباح المنصة' });
   }
 };

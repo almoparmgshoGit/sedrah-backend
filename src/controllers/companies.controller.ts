@@ -252,11 +252,20 @@ export const getCompanyPackages = async (req: Request, res: Response): Promise<v
     }
 
     const companyId = compRes.rows[0].id;
-    const result = await pool.query('SELECT * FROM packages WHERE company_id = $1 ORDER BY id ASC', [companyId]);
+    const result = await pool.query(`
+      SELECT p.*, COUNT(b.id) as bookings_count
+      FROM packages p
+      LEFT JOIN bookings b ON p.id = b.package_id
+      WHERE p.company_id = $1
+      GROUP BY p.id
+      ORDER BY p.id ASC
+    `, [companyId]);
+
     const formatted = result.rows.map(pkg => ({
       ...pkg,
       id: formatPackageId(pkg.id, pkg.public_id),
       company_id: formatCompanyId(companyId, compRes.rows[0].public_id),
+      bookings_count: parseInt(pkg.bookings_count || '0', 10),
     }));
 
     res.json({

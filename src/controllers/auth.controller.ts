@@ -485,12 +485,11 @@ export const updateMyProfile = async (req: AuthRequest, res: Response): Promise<
     const result = await pool.query(
       `UPDATE users
        SET name = COALESCE(NULLIF($1, ''), name),
-           email = COALESCE(NULLIF($2, ''), email),
-           phone = COALESCE($3, phone),
-           address = COALESCE($4, address),
-           password_hash = $5
-       WHERE id = $6 RETURNING id, name, email, phone, address, country, city, role, permissions, permission_group_id`,
-      [name, email, phone, address, newPasswordHash, userId]
+           phone = COALESCE($2, phone),
+           address = COALESCE($3, address),
+           password_hash = $4
+       WHERE id = $5 RETURNING id, name, email, phone, address, country, city, role, permissions, permission_group_id`,
+      [name, phone, address, newPasswordHash, userId]
     );
 
     const updatedUser = result.rows[0];

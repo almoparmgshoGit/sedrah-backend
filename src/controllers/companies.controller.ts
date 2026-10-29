@@ -660,3 +660,44 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
     res.status(500).json({ error: 'فشل تحديث بيانات الشركة' });
   }
 };
+
+export const getMyCompanyProfile = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json({ error: 'غير مصرح - يرجى تسجيل الدخول' });
+      return;
+    }
+
+    const userId = req.user.id;
+    const userEmail = req.user.email;
+
+    const result = await pool.query(
+      `SELECT c.*, ci.name as city_name
+       FROM companies c
+       LEFT JOIN cities ci ON c.city_id = ci.id
+       WHERE c.user_id = $1 OR (c.pending_owner_email IS NOT NULL AND LOWER(c.pending_owner_email) = LOWER($2))
+       LIMIT 1`,
+      [userId, userEmail]
+    );
+
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: 'لم يتم العثور على شركة مرتبطة بحسابك' });
+      return;
+    }
+
+    const comp = result.rows[0];
+    const formatted = {
+      ...comp,
+      id: formatCompanyId(comp.id, comp.public_id),
+    };
+
+    res.json({
+      success: true,
+      data: formatted,
+    });
+  } catch (error: any) {
+    console.error('Error fetching my company profile:', error);
+    res.status(500).json({ error: 'حدث خطأ أثناء جلب ملف الشركة' });
+  }
+};
+

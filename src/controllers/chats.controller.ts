@@ -36,7 +36,7 @@ async function resolveChatTarget(
   }
 
   if (decodedRaw) {
-    const chatRes = await pool.query('SELECT * FROM chats WHERE id = $1 OR public_id = $1 OR company_name = $2', [decodedRaw, decodedRaw]);
+    const chatRes = await pool.query('SELECT * FROM chats WHERE id = $1 OR company_name = $2', [decodedRaw, decodedRaw]);
     if (chatRes.rows.length > 0) {
       const chat = chatRes.rows[0];
       return {
@@ -47,7 +47,7 @@ async function resolveChatTarget(
       };
     }
 
-    const compRes = await pool.query('SELECT id, name FROM companies WHERE id = $1 OR public_id = $1 OR name = $2', [decodedRaw, decodedRaw]);
+    const compRes = await pool.query('SELECT id, name FROM companies WHERE id = $1 OR public_id = $2 OR name = $3', [decodedRaw, decodedRaw, decodedRaw]);
     if (compRes.rows.length > 0) {
       const company = compRes.rows[0];
       const userChatRes = await pool.query(

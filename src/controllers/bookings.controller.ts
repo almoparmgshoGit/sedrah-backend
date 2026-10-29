@@ -42,7 +42,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
     const bookingRef = 'SDR-' + Math.floor(100000 + Math.random() * 900000);
 
     // Fetch commission settings
-    const settingsRes = await pool.query('SELECT key, value FROM settings WHERE key IN (\'commission_system_enabled\', \'commission_method\', \'commission_percentage\', \'adult_commission_rate\', \'child_commission_rate\')');
+    const settingsRes = await pool.query('SELECT key, value FROM settings WHERE key IN (\'commission_system_enabled\', \'commission_method\', \'commission_percentage\', \'adult_commission_rate\', \'child_commission_rate\', \'fixed_commission_amount\', \'platform_commission_fee\')');
     const settingsMap: Record<string, string> = {};
     for (const row of settingsRes.rows) {
       settingsMap[row.key] = row.value;
@@ -64,6 +64,10 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
         const avgPerPerson = countAdults + countChildren > 0 ? total / (countAdults + countChildren) : total;
         commissionAmount = (countAdults * avgPerPerson * (adultRate / 100)) + (countChildren * avgPerPerson * (childRate / 100));
         rateUsedDesc = `أفراد: بالغين ${adultRate}%، أطفال ${childRate}%`;
+      } else if (commissionMethod === 'fixed_amount') {
+        const fixedAmt = Number(settingsMap['fixed_commission_amount'] || settingsMap['platform_commission_fee'] || 50);
+        commissionAmount = fixedAmt;
+        rateUsedDesc = `مبلغ ثابت: ${fixedAmt}`;
       } else {
         const pct = Number(settingsMap['commission_percentage'] || 5);
         commissionAmount = total * (pct / 100);

@@ -931,6 +931,11 @@ export const initDB = async () => {
       ['platform_commission_fee', '50', 'المبلغ الثابت لعمولة المنصة عن كل حجز']
     );
 
+    await pool.query(
+      `INSERT INTO settings (key, value, description) VALUES ($1, $2, $3) ON CONFLICT (key) DO NOTHING`,
+      ['fixed_commission_amount', '50', 'المبلغ الثابت للعمولة لكل حجز مكتمل']
+    );
+
     await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(10, 2);');
 
     // Ensure default admin user exists and is verified

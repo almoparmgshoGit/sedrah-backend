@@ -290,7 +290,8 @@ export const updateUserByAdmin = async (req: AuthRequest, res: Response): Promis
          country = COALESCE($5, country),
          city = COALESCE($6, city),
          permissions = COALESCE($7, permissions),
-         permission_group_id = CASE WHEN $8::boolean THEN $9::text ELSE permission_group_id END
+         permission_group_id = CASE WHEN $8::boolean THEN $9::text ELSE permission_group_id END,
+         is_verified = true
        WHERE id = $10 RETURNING id, name, email, phone, role, country, city, status, permissions, permission_group_id, created_at, public_id`,
       [
         name,

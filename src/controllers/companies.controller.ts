@@ -15,14 +15,46 @@ const findCompanyQuery = async (rawId: any) => {
 
 export const getCompanies = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { cityId, minRating, hasPackages } = req.query;
-    let query = 'SELECT DISTINCT c.* FROM companies c';
+    const { cityId, minRating, hasPackages, verification_type, search, sort } = req.query;
+    let query = `
+      SELECT c.*,
+             ci.name as city_name,
+             COALESCE(b_stats.total_bookings, 0) as total_bookings,
+             COALESCE(b_stats.completed_bookings, 0) as completed_bookings,
+             COALESCE(b_stats.in_progress_bookings, 0) as in_progress_bookings,
+             COALESCE(b_stats.cancelled_bookings, 0) as cancelled_bookings,
+             COALESCE(pe_stats.total_earnings, 0) as platform_earnings,
+             CASE
+               WHEN c.field_verified = TRUE THEN 'field'
+               WHEN c.verified = TRUE THEN 'document'
+               ELSE 'none'
+             END as verification_type
+      FROM companies c
+      LEFT JOIN cities ci ON c.city_id = ci.id
+      LEFT JOIN (
+        SELECT p.company_id,
+               COUNT(b.id) as total_bookings,
+               COUNT(b.id) FILTER (WHERE b.status = 'confirmed' OR b.status = 'completed') as completed_bookings,
+               COUNT(b.id) FILTER (WHERE b.status = 'pending' OR b.status = 'receipt_review' OR b.status = 'current') as in_progress_bookings,
+               COUNT(b.id) FILTER (WHERE b.status = 'cancelled' OR b.status = 'rejected') as cancelled_bookings
+        FROM bookings b
+        JOIN packages p ON b.package_id = p.id
+        GROUP BY p.company_id
+      ) b_stats ON c.id = b_stats.company_id
+      LEFT JOIN (
+        SELECT company_id, SUM(commission_amount) as total_earnings
+        FROM platform_earnings
+        WHERE status = 'recorded'
+        GROUP BY company_id
+      ) pe_stats ON c.id = pe_stats.company_id
+    `;
+
     let conditions: string[] = [];
     let params: any[] = [];
     let paramIndex = 1;
 
     if (hasPackages === 'true' || hasPackages === '1') {
-      query += ' JOIN packages p ON c.id = p.company_id';
+      conditions.push(`EXISTS (SELECT 1 FROM packages p WHERE p.company_id = c.id)`);
     }
 
     if (cityId) {
@@ -38,17 +70,42 @@ export const getCompanies = async (req: Request, res: Response): Promise<void> =
       paramIndex++;
     }
 
+    if (verification_type && verification_type !== 'all') {
+      if (verification_type === 'field') {
+        conditions.push(`c.field_verified = TRUE`);
+      } else if (verification_type === 'document') {
+        conditions.push(`c.verified = TRUE AND (c.field_verified IS NOT TRUE)`);
+      } else if (verification_type === 'none') {
+        conditions.push(`(c.verified IS NOT TRUE) AND (c.field_verified IS NOT TRUE)`);
+      }
+    }
+
+    if (search) {
+      conditions.push(`(c.name ILIKE $${paramIndex} OR c.short_description ILIKE $${paramIndex} OR c.phone ILIKE $${paramIndex})`);
+      params.push(`%${search}%`);
+      paramIndex++;
+    }
+
     if (conditions.length > 0) {
       query += ' WHERE ' + conditions.join(' AND ');
     }
 
-    query += ' ORDER BY c.id ASC';
+    if (sort === 'rating_desc') {
+      query += ' ORDER BY c.rating DESC NULLS LAST';
+    } else if (sort === 'earnings_desc') {
+      query += ' ORDER BY platform_earnings DESC';
+    } else if (sort === 'bookings_desc') {
+      query += ' ORDER BY total_bookings DESC';
+    } else {
+      query += ' ORDER BY c.created_at DESC';
+    }
 
     const result = await pool.query(query, params);
     const formatted = result.rows.map(comp => ({
       ...comp,
       id: formatCompanyId(comp.id, comp.public_id),
       city_id: comp.city_id,
+      platform_earnings: parseFloat(comp.platform_earnings || 0),
     }));
 
     res.json({

@@ -665,6 +665,7 @@ export const initDB = async () => {
       ALTER TABLE chats ADD COLUMN IF NOT EXISTS booking_reference VARCHAR(50);
       ALTER TABLE chats ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'open';
       ALTER TABLE chats ADD COLUMN IF NOT EXISTS department VARCHAR(50) DEFAULT 'users';
+      ALTER TABLE chats ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
     `);
 
     await pool.query(`

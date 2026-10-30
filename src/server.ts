@@ -120,19 +120,23 @@ app.get('/uploads/:category/:filename', (req: Request, res: Response): void => {
   if (sensitiveFolders.includes(safeCategory)) {
     const authHeader = req.headers.authorization;
     const queryToken = req.query.token as string;
-    const referer = req.headers.referer || '';
-    const userAgent = req.headers['user-agent'] || '';
+    let token = queryToken;
+    if (!token && authHeader && authHeader.startsWith('Bearer ')) {
+      token = authHeader.split(' ')[1];
+    }
 
-    const isAuthorized =
-      Boolean(authHeader || queryToken) ||
-      referer.includes('sedrah.tech') ||
-      referer.includes('vercel.app') ||
-      referer.includes('localhost') ||
-      userAgent.includes('okhttp') ||
-      userAgent.includes('CFNetwork');
+    let isAuthorized = false;
+    if (token) {
+      try {
+        jwt.verify(token, env.JWT_SECRET);
+        isAuthorized = true;
+      } catch (e) {
+        isAuthorized = false;
+      }
+    }
 
     if (!isAuthorized) {
-      res.status(403).json({ error: 'غير مصرح بالوصول إلى هذا المستند الحساس' });
+      res.status(403).json({ error: 'غير مصرح بالوصول إلى هذا المستند الحساس. يتطلب تسجيل دخول صالح وتوكن مصادقة.' });
       return;
     }
   }

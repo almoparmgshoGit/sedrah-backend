@@ -13,6 +13,35 @@ const findCompanyQuery = async (rawId: any) => {
   return compRes;
 };
 
+export const formatPublicCompany = (comp: any) => {
+  if (!comp) return null;
+  return {
+    id: formatCompanyId(comp.id, comp.public_id),
+    public_id: comp.public_id,
+    name: comp.name,
+    short_description: comp.short_description,
+    description: comp.description || comp.short_description,
+    logo_url: comp.logo_url,
+    banner_url: comp.banner_url,
+    city_id: comp.city_id,
+    city_name: comp.city_name,
+    address: comp.address,
+    google_maps_url: comp.google_maps_url,
+    phone: comp.phone,
+    whatsapp: comp.whatsapp,
+    social_links: comp.social_links,
+    working_hours: comp.working_hours,
+    holidays_notes: comp.holidays_notes,
+    rating: comp.rating,
+    reviews_count: comp.reviews_count,
+    verification_type: comp.verification_type,
+    total_bookings: comp.total_bookings,
+    completed_bookings: comp.completed_bookings,
+    in_progress_bookings: comp.in_progress_bookings,
+    platform_earnings: comp.platform_earnings,
+  };
+};
+
 export const getCompanies = async (req: Request, res: Response): Promise<void> => {
   try {
     const { cityId, minRating, hasPackages, verification_type, search, sort } = req.query;
@@ -101,10 +130,8 @@ export const getCompanies = async (req: Request, res: Response): Promise<void> =
     }
 
     const result = await pool.query(query, params);
-    const formatted = result.rows.map(comp => ({
+    const formatted = result.rows.map(comp => formatPublicCompany({
       ...comp,
-      id: formatCompanyId(comp.id, comp.public_id),
-      city_id: comp.city_id,
       platform_earnings: parseFloat(comp.platform_earnings || 0),
     }));
 
@@ -129,11 +156,11 @@ export const getCompanyById = async (req: Request, res: Response): Promise<void>
     }
 
     const comp = result.rows[0];
-    comp.id = formatCompanyId(comp.id, comp.public_id);
+    const formatted = formatPublicCompany(comp);
 
     res.json({
       success: true,
-      data: comp,
+      data: formatted,
     });
   } catch (error: any) {
     console.error('Error fetching company details:', error);

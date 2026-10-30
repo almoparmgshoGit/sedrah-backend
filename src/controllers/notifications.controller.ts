@@ -97,9 +97,10 @@ export const registerPushToken = async (req: AuthRequest, res: Response): Promis
     }
 
     if (effectiveUserId) {
+      // Delete any previous associations of this device token with ANY account to ensure absolute account isolation
       await pool.query(
-        'DELETE FROM push_tokens WHERE token = $1 AND (user_id IS NULL OR user_id = $2)',
-        [token, effectiveUserId]
+        'DELETE FROM push_tokens WHERE token = $1',
+        [token]
       );
 
       await pool.query(

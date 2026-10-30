@@ -30,6 +30,29 @@ export interface AuthRequest extends Request {
   };
 }
 
+// Helper to check if a route is in the Guest Allowlist
+const isGuestAllowedRoute = (method: string, originalUrl: string): boolean => {
+  if (method !== 'GET') return false;
+
+  const pathName = originalUrl.split('?')[0];
+
+  const allowedPrefixes = [
+    '/api/public/settings',
+    '/api/cities',
+    '/api/governorates',
+    '/api/companies',
+    '/api/packages',
+    '/api/search',
+    '/api/store/categories',
+    '/api/store/products',
+    '/api/store/banners',
+  ];
+
+  if (pathName === '/api/companies/my-profile') return false;
+
+  return allowedPrefixes.some(prefix => pathName === prefix || pathName.startsWith(prefix + '/'));
+};
+
 // 2. Authentication Middleware (Verify JWT token securely)
 export const authenticate = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
   const authHeader = req.headers.authorization;
@@ -42,9 +65,25 @@ export const authenticate = async (req: AuthRequest, res: Response, next: NextFu
   const token = authHeader.split(' ')[1];
 
   try {
-    const rawDecoded = jwt.verify(token, env.JWT_SECRET) as { id: any; email: string; role: 'user' | 'admin' | 'super_admin' };
-    let userId = String(rawDecoded.id);
+    const rawDecoded = jwt.verify(token, env.JWT_SECRET, { issuer: 'sdra-backend' }) as any;
 
+    const role = rawDecoded.role;
+    const aud = rawDecoded.aud;
+
+    if (role === 'guest' || aud === 'sdra-guest') {
+      if (!isGuestAllowedRoute(req.method, req.originalUrl)) {
+        res.status(403).json({ error: 'Guest access forbidden for this resource' });
+        return;
+      }
+      req.user = {
+        id: rawDecoded.id || 'guest',
+        email: 'guest@sdra.tech',
+        role: 'guest' as any,
+      };
+      return next();
+    }
+
+    let userId = String(rawDecoded.id);
     const userCheck = await pool.query('SELECT id, is_banned, status FROM users WHERE id = $1', [userId]);
     if (userCheck.rows.length === 0) {
       res.status(401).json({ error: 'المستخدم غير موجود أو انتهت صلاحية الجلسة' });
@@ -57,11 +96,10 @@ export const authenticate = async (req: AuthRequest, res: Response, next: NextFu
       return;
     }
 
-    const decoded = {
+    req.user = {
       ...rawDecoded,
       id: userId,
     };
-    req.user = decoded;
     next();
   } catch (err) {
     res.status(401).json({ error: 'Invalid or expired token' });

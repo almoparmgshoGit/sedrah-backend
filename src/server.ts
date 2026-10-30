@@ -187,7 +187,7 @@ app.get('/health', (req: Request, res: Response) => {
 // Public Settings Route
 app.get('/api/public/settings', getPublicSettings);
 
-// Auth Routes (with strict rate limiting & Zod validation)
+// Public Session Creation Routes (No Token Required)
 app.post('/api/auth/register', authLimiter, validate(registerSchema), register);
 app.post('/api/auth/send-otp', authLimiter, validate(sendOtpSchema), sendOtp);
 app.post('/api/auth/verify-otp', authLimiter, validate(verifyOtpSchema), verifyOtp);
@@ -195,11 +195,15 @@ app.post('/api/auth/login', authLimiter, validate(loginSchema), login);
 app.post('/api/auth/google', authLimiter, googleLogin);
 app.post('/api/auth/guest-token', generateGuestToken);
 app.post('/api/auth/refresh-token', handleRefreshToken);
+
+// Default Deny: All other /api/* routes require a valid JWT token (Guest, Customer, Company, or Admin)
+app.use('/api', authenticate);
+
 app.post('/api/auth/logout', logoutUser);
-app.get('/api/auth/me', authenticate, getCurrentUser);
-app.put('/api/auth/profile', authenticate, updateMyProfile);
-app.get('/api/auth/profile-status', authenticate, getProfileStatus);
-app.delete('/api/auth/account', authenticate, deleteMyAccount);
+app.get('/api/auth/me', getCurrentUser);
+app.put('/api/auth/profile', updateMyProfile);
+app.get('/api/auth/profile-status', getProfileStatus);
+app.delete('/api/auth/account', deleteMyAccount);
 
 // Cities Routes
 app.use('/api/cities', citiesRouter);

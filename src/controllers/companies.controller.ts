@@ -325,10 +325,12 @@ export const getCompanyReviews = async (req: Request, res: Response): Promise<vo
     `, [companyId]);
 
     const formatted = result.rows.map(rev => ({
-      ...rev,
       id: rev.id,
+      rating: rev.rating,
+      comment: rev.comment,
+      created_at: rev.created_at,
       company_id: formatCompanyId(companyId, compRes.rows[0].public_id),
-      user_id: formatUserId(rev.user_id, rev.user_public_id),
+      user_name: 'عميل سدرة',
     }));
 
     res.json({

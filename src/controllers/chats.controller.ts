@@ -36,9 +36,25 @@ async function resolveChatTarget(
   }
 
   if (decodedRaw) {
-    const chatRes = await pool.query('SELECT * FROM chats WHERE id = $1 OR company_name = $2', [decodedRaw, decodedRaw]);
-    if (chatRes.rows.length > 0) {
-      const chat = chatRes.rows[0];
+    // 1. Check if decodedRaw is a specific chat ID (unique chat)
+    const chatByIdRes = await pool.query('SELECT * FROM chats WHERE id = $1', [decodedRaw]);
+    if (chatByIdRes.rows.length > 0) {
+      const chat = chatByIdRes.rows[0];
+      return {
+        chatId: chat.id,
+        companyId: chat.company_id || null,
+        companyName: chat.company_name,
+        chat
+      };
+    }
+
+    // 2. Check if decodedRaw is a company ID or company name for THIS user
+    const userChatRes = await pool.query(
+      'SELECT * FROM chats WHERE (user_id = $1 OR $2 = true) AND (company_id = $3 OR company_name = $3) ORDER BY created_at DESC LIMIT 1',
+      [userId, isAdmin, decodedRaw]
+    );
+    if (userChatRes.rows.length > 0) {
+      const chat = userChatRes.rows[0];
       return {
         chatId: chat.id,
         companyId: chat.company_id || null,
@@ -175,7 +191,8 @@ export const chatsController = {
       const targetCompanyId = resolved.companyId;
 
       // IDOR Authorization check
-      if (resolved.chat && resolved.chat.user_id !== userId && !isAdmin) {
+      const isStaffOrAdmin = req.user?.role === 'admin' || req.user?.role === 'super_admin' || (req.user?.role as string) === 'owner';
+      if (resolved.chat && resolved.chat.user_id !== userId && !isStaffOrAdmin) {
         res.status(403).json({ error: 'غير مصرح لك بعرض هذه المحادثة' });
         return;
       }

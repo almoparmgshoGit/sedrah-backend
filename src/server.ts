@@ -73,6 +73,9 @@ app.get(['/.well-known/apple-app-site-association', '/apple-app-site-association
 
 // Non-app browser fallback redirect page for shared links
 app.get(['/company/*', '/package/*', '/product/*'], (req: Request, res: Response) => {
+  const reqPath = req.path;
+  const deepLinkUrl = `sdra:/${reqPath}`;
+
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(`
     <!DOCTYPE html>
@@ -81,19 +84,25 @@ app.get(['/company/*', '/package/*', '/product/*'], (req: Request, res: Response
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <title>تطبيق سدرة | Sedrah App</title>
+      <script>
+        // Attempt automatic redirect to installed app via scheme
+        window.location.href = "${deepLinkUrl}";
+      </script>
       <style>
         body { font-family: system-ui, -apple-system, sans-serif; background: #173D35; color: #fff; text-align: center; padding: 40px 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 80vh; }
         .card { background: #ffffff; color: #202923; padding: 32px 24px; border-radius: 24px; max-width: 400px; width: 100%; box-shadow: 0 10px 25px rgba(0,0,0,0.2); }
         h1 { font-size: 22px; margin-bottom: 12px; color: #173D35; font-weight: bold; }
         p { font-size: 14px; color: #4B5563; margin-bottom: 24px; line-height: 1.6; }
-        .btn { display: inline-block; background: #C8A96A; color: #ffffff; text-decoration: none; padding: 14px 28px; border-radius: 14px; font-weight: bold; font-size: 15px; }
+        .btn-primary { display: block; background: #173D35; color: #ffffff; text-decoration: none; padding: 14px 20px; border-radius: 14px; font-weight: bold; font-size: 15px; margin-bottom: 12px; }
+        .btn-secondary { display: block; background: #C8A96A; color: #ffffff; text-decoration: none; padding: 12px 20px; border-radius: 14px; font-weight: bold; font-size: 14px; }
       </style>
     </head>
     <body>
       <div class="card">
         <h1>منصة وتطبيق سدرة</h1>
-        <p>لعرض تفاصيل هذا المحتوى والتواصل المباشر وبدء الحجز، يرجى فتح أو تحميل تطبيق سدرة على هاتفك.</p>
-        <a href="https://play.google.com/store/apps/details?id=com.sdra.app" class="btn">تحميل تطبيق سدرة</a>
+        <p>لعرض تفاصيل هذا المحتوى والتواصل المباشر، اضغط أدناه لفتح التطبيق أو تحميلة على هاتفك.</p>
+        <a href="${deepLinkUrl}" class="btn-primary">فتح في تطبيق سدرة 📲</a>
+        <a href="https://play.google.com/store/apps/details?id=com.sdra.app" class="btn-secondary">تحميل التطبيق من المتجر</a>
       </div>
     </body>
     </html>

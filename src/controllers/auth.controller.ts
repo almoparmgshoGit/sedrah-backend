@@ -94,14 +94,14 @@ export const handleRefreshToken = async (req: Request, res: Response): Promise<v
     }
 
     // Fetch user and verify active status
-    const userRes = await pool.query('SELECT id, email, role, status, is_banned, permissions, permission_group_id FROM users WHERE id = $1', [tokenRow.user_id]);
+    const userRes = await pool.query('SELECT id, email, role, status, permissions, permission_group_id FROM users WHERE id = $1', [tokenRow.user_id]);
     if (userRes.rows.length === 0) {
       res.status(401).json({ error: 'المستخدم غير موجود' });
       return;
     }
 
     const user = userRes.rows[0];
-    if (user.is_banned || user.status === 'banned' || user.status === 'inactive') {
+    if (user.status === 'banned' || user.status === 'inactive') {
       await pool.query('UPDATE refresh_tokens SET is_revoked = TRUE WHERE user_id = $1', [user.id]);
       res.status(401).json({ error: 'الحساب محظور أو غير نشط' });
       return;

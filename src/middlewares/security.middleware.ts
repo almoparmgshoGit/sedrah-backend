@@ -65,7 +65,7 @@ export const authenticate = async (req: AuthRequest, res: Response, next: NextFu
   const token = authHeader.split(' ')[1];
 
   try {
-    const rawDecoded = jwt.verify(token, env.JWT_SECRET, { issuer: 'sdra-backend' }) as any;
+    const rawDecoded = jwt.verify(token, env.JWT_SECRET) as any;
 
     const role = rawDecoded.role;
     const aud = rawDecoded.aud;
@@ -84,14 +84,14 @@ export const authenticate = async (req: AuthRequest, res: Response, next: NextFu
     }
 
     let userId = String(rawDecoded.id);
-    const userCheck = await pool.query('SELECT id, is_banned, status FROM users WHERE id = $1', [userId]);
+    const userCheck = await pool.query('SELECT id, status FROM users WHERE id = $1', [userId]);
     if (userCheck.rows.length === 0) {
       res.status(401).json({ error: 'المستخدم غير موجود أو انتهت صلاحية الجلسة' });
       return;
     }
 
     const user = userCheck.rows[0];
-    if (user.is_banned || user.status === 'banned' || user.status === 'inactive') {
+    if (user.status === 'banned' || user.status === 'inactive') {
       res.status(401).json({ error: 'الحساب محظور أو غير نشط' });
       return;
     }
@@ -101,7 +101,8 @@ export const authenticate = async (req: AuthRequest, res: Response, next: NextFu
       id: userId,
     };
     next();
-  } catch (err) {
+  } catch (err: any) {
+    console.error('🔒 [Auth Middleware Verification Error]:', err.message || err);
     res.status(401).json({ error: 'Invalid or expired token' });
   }
 };

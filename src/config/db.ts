@@ -314,6 +314,7 @@ export const initDB = async () => {
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions TEXT;');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS address TEXT;');
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active';");
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT FALSE;');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS public_id VARCHAR(50);');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE;');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_code VARCHAR(10);');

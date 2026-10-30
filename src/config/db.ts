@@ -851,6 +851,25 @@ export const initDB = async () => {
     `);
 
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS coupons (
+        id VARCHAR(16) PRIMARY KEY,
+        code VARCHAR(50) UNIQUE NOT NULL,
+        type VARCHAR(20) NOT NULL,
+        discount_type VARCHAR(20) NOT NULL,
+        discount_value DECIMAL(10, 2) NOT NULL,
+        min_order_amount DECIMAL(10, 2) DEFAULT 0.00,
+        max_discount_amount DECIMAL(10, 2),
+        usage_limit INT,
+        used_count INT DEFAULT 0,
+        start_date TIMESTAMP,
+        end_date TIMESTAMP,
+        is_active BOOLEAN DEFAULT TRUE,
+        target_ids TEXT DEFAULT '[]',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await pool.query(`
       ALTER TABLE cities ADD COLUMN IF NOT EXISTS public_id VARCHAR(50);
       ALTER TABLE store_categories ADD COLUMN IF NOT EXISTS public_id VARCHAR(50);
       ALTER TABLE store_products ADD COLUMN IF NOT EXISTS public_id VARCHAR(50);

@@ -26,6 +26,7 @@ import chatsRouter from './routes/chats.routes';
 import uploadRouter from './routes/upload.routes';
 import adminRouter from './routes/admin.routes';
 import storeRouter from './routes/store.routes';
+import couponsRouter from './routes/coupons.routes';
 import permissionsRouter from './routes/permissions.routes';
 import path from 'path';
 import { AnyZodObject } from 'zod';
@@ -316,6 +317,9 @@ app.use('/api/upload', uploadRouter);
 
 // Store Routes
 app.use('/api/store', storeRouter);
+
+// Coupons Routes
+app.use('/api/coupons', couponsRouter);
 
 // Admin Routes (Protected + RBAC)
 app.use('/api/admin', adminRouter);

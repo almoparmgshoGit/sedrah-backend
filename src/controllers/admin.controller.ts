@@ -82,6 +82,15 @@ export const getUserDetails = async (req: AuthRequest, res: Response): Promise<v
       WHERE r.user_id = $1
     `, [internalUserId]);
 
+    // Fetch user store orders
+    const storeOrdersRes = await pool.query(`
+      SELECT o.*,
+              (SELECT JSON_AGG(i.*) FROM store_order_items i WHERE i.order_id = o.id) as items
+      FROM store_orders o
+      WHERE o.user_id = $1
+      ORDER BY o.created_at DESC
+    `, [internalUserId]);
+
     // Fetch company owned or associated with user if any
     const companyRes = await pool.query(
       'SELECT * FROM companies WHERE user_id = $1 OR LOWER(pending_owner_email) = LOWER($2) LIMIT 1',
@@ -137,6 +146,7 @@ export const getUserDetails = async (req: AuthRequest, res: Response): Promise<v
           createdAt: user.created_at,
         },
         bookings: bookingsRes.rows,
+        storeOrders: storeOrdersRes.rows,
         reviews: reviewsRes.rows,
         company: companyData,
         companyBookings,

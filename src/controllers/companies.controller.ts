@@ -614,6 +614,44 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
 
     const workingDaysStr = working_days ? (Array.isArray(working_days) ? JSON.stringify(working_days) : String(working_days)) : null;
 
+    const paramList: any[] = [
+      name,
+      short_description,
+      description,
+      phone,
+      whatsapp,
+      landline_phone,
+      website_url,
+      typeof social_links === 'object' ? JSON.stringify(social_links) : social_links,
+      city_id ? parseInt(String(city_id), 10) : null,
+      address,
+      google_maps_url,
+      logo_url,
+      banner_url,
+      typeof working_hours === 'object' ? JSON.stringify(working_hours) : working_hours,
+      holidays_notes,
+      commercial_register_url,
+      tax_id_url,
+      manager_id_url,
+      manager_id_back_url,
+      isVerified,
+      isVerified,
+      workingDaysStr,
+      working_hours_start,
+      working_hours_end,
+      max_daily_capacity ? parseInt(String(max_daily_capacity), 10) : null,
+      slot_duration_minutes ? parseInt(String(slot_duration_minutes), 10) : null,
+    ];
+
+    let userIdSql = '';
+    if (userId !== undefined) {
+      paramList.push(userId);
+      userIdSql = `, user_id = $${paramList.length}`;
+    }
+
+    paramList.push(companyId);
+    const companyIdParamIndex = paramList.length;
+
     const result = await pool.query(
       `UPDATE companies SET
         name = COALESCE(NULLIF($1, ''), name),
@@ -642,38 +680,10 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
         working_hours_end = COALESCE(NULLIF($24, ''), working_hours_end),
         max_daily_capacity = COALESCE($25, max_daily_capacity),
         slot_duration_minutes = COALESCE($26, slot_duration_minutes)
-        ${userId !== undefined ? ', user_id = $27' : ''}
-      WHERE id = ${companyId}
+        ${userIdSql}
+      WHERE id = $${companyIdParamIndex}
       RETURNING *`,
-      [
-        name,
-        short_description,
-        description,
-        phone,
-        whatsapp,
-        landline_phone,
-        website_url,
-        typeof social_links === 'object' ? JSON.stringify(social_links) : social_links,
-        city_id ? parseInt(String(city_id), 10) : null,
-        address,
-        google_maps_url,
-        logo_url,
-        banner_url,
-        typeof working_hours === 'object' ? JSON.stringify(working_hours) : working_hours,
-        holidays_notes,
-        commercial_register_url,
-        tax_id_url,
-        manager_id_url,
-        manager_id_back_url,
-        isVerified,
-        isVerified,
-        workingDaysStr,
-        working_hours_start,
-        working_hours_end,
-        max_daily_capacity ? parseInt(String(max_daily_capacity), 10) : null,
-        slot_duration_minutes ? parseInt(String(slot_duration_minutes), 10) : null,
-        ...(userId !== undefined ? [userId] : [])
-      ]
+      paramList
     );
 
     const updatedComp = result.rows[0];

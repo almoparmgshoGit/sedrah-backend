@@ -45,23 +45,16 @@ export const authenticate = async (req: AuthRequest, res: Response, next: NextFu
     const rawDecoded = jwt.verify(token, env.JWT_SECRET) as { id: any; email: string; role: 'user' | 'admin' | 'super_admin' };
     let userId = String(rawDecoded.id);
 
-    try {
-      const userCheck = await pool.query('SELECT id FROM users WHERE id = $1', [userId]);
-      if (userCheck.rows.length === 0 && rawDecoded.email) {
-        const emailCheck = await pool.query('SELECT id FROM users WHERE email = $1', [rawDecoded.email]);
-        if (emailCheck.rows.length > 0) {
-          userId = emailCheck.rows[0].id;
-        } else {
-          await pool.query(
-            'INSERT INTO users (id, name, email, password_hash, role) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (email) DO NOTHING',
-            [userId, rawDecoded.email.split('@')[0], rawDecoded.email, 'dummyhash', rawDecoded.role || 'user']
-          );
-        }
-      } else if (userCheck.rows.length > 0) {
-        userId = userCheck.rows[0].id;
-      }
-    } catch (dbErr) {
-      console.error('Auto-user ensure error:', dbErr);
+    const userCheck = await pool.query('SELECT id, is_banned, status FROM users WHERE id = $1', [userId]);
+    if (userCheck.rows.length === 0) {
+      res.status(401).json({ error: 'المستخدم غير موجود أو انتهت صلاحية الجلسة' });
+      return;
+    }
+
+    const user = userCheck.rows[0];
+    if (user.is_banned || user.status === 'banned' || user.status === 'inactive') {
+      res.status(401).json({ error: 'الحساب محظور أو غير نشط' });
+      return;
     }
 
     const decoded = {
@@ -71,7 +64,7 @@ export const authenticate = async (req: AuthRequest, res: Response, next: NextFu
     req.user = decoded;
     next();
   } catch (err) {
-    res.status(403).json({ error: 'Invalid or expired token' });
+    res.status(401).json({ error: 'Invalid or expired token' });
   }
 };
 

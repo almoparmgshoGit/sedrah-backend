@@ -28,12 +28,15 @@ export const createCoupon = async (req: AuthRequest, res: Response): Promise<voi
       target_ids
     } = req.body;
 
-    if (!code || !type || !discount_type || discount_value === undefined) {
-      res.status(400).json({ success: false, message: 'جميع الحقول الأساسية مطلوبة' });
+    if (!type || !discount_type || discount_value === undefined) {
+      res.status(400).json({ success: false, message: 'نوع الكوبون ونوع وقيمة الخصم مطلوبان' });
       return;
     }
 
-    const cleanCode = String(code).trim().toUpperCase();
+    let cleanCode = code ? String(code).trim().toUpperCase() : '';
+    if (!cleanCode) {
+      cleanCode = 'SDRA' + Math.random().toString(36).substring(2, 8).toUpperCase();
+    }
     const id = generate16CharId();
     const targetIdsStr = Array.isArray(target_ids) ? JSON.stringify(target_ids) : (target_ids ? String(target_ids) : '[]');
 

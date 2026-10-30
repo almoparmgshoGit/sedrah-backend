@@ -940,6 +940,18 @@ export const reviewBookingReceiptByAdmin = async (req: AuthRequest, res: Respons
     const { id } = req.params;
     const { action, rejectionReason, allowRetry, retryCount } = req.body; // action: 'approve' | 'reject'
 
+    const bookingRes = await pool.query('SELECT * FROM bookings WHERE id = $1', [id]);
+    if (bookingRes.rows.length === 0) {
+      res.status(404).json({ error: 'الحجز غير موجود' });
+      return;
+    }
+    const bookingRecord = bookingRes.rows[0];
+
+    if (!bookingRecord.receipt_url || !String(bookingRecord.receipt_url).trim()) {
+      res.status(400).json({ error: 'لا يمكن مراجعة الإيصال لعدم وجود ملف إيصال مرفوع من العميل بعد' });
+      return;
+    }
+
     if (action === 'approve' || action === 'approved') {
       const result = await pool.query(
         `UPDATE bookings
@@ -951,10 +963,6 @@ export const reviewBookingReceiptByAdmin = async (req: AuthRequest, res: Respons
          RETURNING *`,
         [id]
       );
-      if (result.rows.length === 0) {
-        res.status(404).json({ error: 'الحجز غير موجود' });
-        return;
-      }
       const booking = result.rows[0];
 
       // Mark stage 2 ("بانتظار مراجعة إيصال الدفع") as completed

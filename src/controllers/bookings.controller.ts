@@ -247,6 +247,29 @@ export const updateBookingReceipt = async (req: Request, res: Response): Promise
       return;
     }
 
+    const bookingCheck = await pool.query(
+      'SELECT * FROM bookings WHERE (id::text = $1 OR booking_reference = $1) AND user_id = $2',
+      [bookingId, userId]
+    );
+
+    if (bookingCheck.rows.length === 0) {
+      res.status(404).json({ error: 'الحجز غير موجود' });
+      return;
+    }
+
+    const bookingRecord = bookingCheck.rows[0];
+
+    // Enforce stage sequencing: Stage 1 (Visit company) must be completed before uploading receipt
+    const stageCheck = await pool.query(
+      'SELECT status FROM trip_stages WHERE booking_id = $1 AND stage_order = 1',
+      [bookingRecord.id]
+    );
+    const visitStage = stageCheck.rows[0];
+    if (visitStage && visitStage.status !== 'completed') {
+      res.status(400).json({ error: 'لا يمكن رفع إيصال الدفع قبل إتمام وتسجيل زيارة الشركة بنجاح' });
+      return;
+    }
+
     const result = await pool.query(
       `UPDATE bookings
        SET status = 'receipt_review',
@@ -254,9 +277,9 @@ export const updateBookingReceipt = async (req: Request, res: Response): Promise
            receipt_approved = FALSE,
            receipt_status = 'pending',
            rejection_reason = NULL
-       WHERE (id::text = $2 OR booking_reference = $2) AND user_id = $3
+       WHERE id = $2
        RETURNING *`,
-      [finalReceiptUrl, bookingId, userId]
+      [finalReceiptUrl, bookingRecord.id]
     );
 
     if (result.rows.length === 0) {

@@ -1,12 +1,175 @@
 import { Request, Response } from 'express';
 import argon2 from 'argon2';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 import { env } from '../config/env';
 import { pool } from '../config/db';
 import { AuthRequest } from '../middlewares/security.middleware';
 import { safeParseArray } from '../middlewares/permission.middleware';
 import { formatUserId, generate16CharId } from '../utils/formatId';
 import { sendPlatformEmail } from '../utils/mailer';
+
+export const issueTokenPair = async (
+  user: { id: string; email: string; role: string; permissions?: string[] },
+  clientType: 'customer' | 'company' | 'admin' = 'customer',
+  userAgent?: string,
+  ipAddress?: string
+) => {
+  const audMap: Record<string, string> = {
+    customer: 'sdra-customer',
+    company: 'sdra-company',
+    admin: 'sdra-admin',
+  };
+  const aud = audMap[clientType] || 'sdra-customer';
+
+  // Access token: 15 minutes
+  const accessToken = jwt.sign(
+    { id: user.id, email: user.email, role: user.role, permissions: user.permissions || [] },
+    env.JWT_SECRET,
+    { expiresIn: '15m', audience: aud, issuer: 'sdra-backend' }
+  );
+
+  // Refresh token: 30 days
+  const rawRefreshToken = crypto.randomBytes(32).toString('hex');
+  const tokenHash = crypto.createHash('sha256').update(rawRefreshToken).digest('hex');
+  const familyId = generate16CharId();
+  const tokenId = generate16CharId();
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
+
+  await pool.query(
+    `INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, client_type, expires_at, user_agent, ip_address)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [tokenId, user.id, tokenHash, familyId, clientType, expiresAt, userAgent || null, ipAddress || null]
+  );
+
+  return { accessToken, refreshToken: `${tokenId}.${rawRefreshToken}` };
+};
+
+export const generateGuestToken = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const guestToken = jwt.sign(
+      { id: 'guest_' + generate16CharId(), role: 'guest' },
+      env.JWT_SECRET,
+      { expiresIn: '30m', audience: 'sdra-guest', issuer: 'sdra-backend' }
+    );
+    res.json({ success: true, guest_token: guestToken, token: guestToken, expires_in: 1800 });
+  } catch (error: any) {
+    console.error('Error generating guest token:', error);
+    res.status(500).json({ error: 'فشل إصدار توكن الزائر' });
+  }
+};
+
+export const handleRefreshToken = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { refreshToken, clientType = 'customer' } = req.body || {};
+    if (!refreshToken || typeof refreshToken !== 'string' || !refreshToken.includes('.')) {
+      res.status(401).json({ error: 'Refresh token missing or malformed' });
+      return;
+    }
+
+    const [tokenId, rawToken] = refreshToken.split('.');
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+
+    const tokenRes = await pool.query('SELECT * FROM refresh_tokens WHERE id = $1', [tokenId]);
+    if (tokenRes.rows.length === 0) {
+      res.status(401).json({ error: 'Invalid refresh token' });
+      return;
+    }
+
+    const tokenRow = tokenRes.rows[0];
+
+    // Reuse detection: if token is already revoked, revoke the entire family!
+    if (tokenRow.is_revoked) {
+      console.warn(`⚠️ [Security Alert] Refresh token reuse detected for family ${tokenRow.family_id}! Revoking family.`);
+      await pool.query('UPDATE refresh_tokens SET is_revoked = TRUE WHERE family_id = $1', [tokenRow.family_id]);
+      res.status(401).json({ error: 'Security breach detected. All sessions in this family revoked.' });
+      return;
+    }
+
+    // Verify token hash and expiration
+    if (tokenRow.token_hash !== tokenHash || new Date(tokenRow.expires_at) < new Date()) {
+      await pool.query('UPDATE refresh_tokens SET is_revoked = TRUE WHERE id = $1', [tokenId]);
+      res.status(401).json({ error: 'Expired or invalid refresh token' });
+      return;
+    }
+
+    // Fetch user and verify active status
+    const userRes = await pool.query('SELECT id, email, role, status, is_banned, permissions, permission_group_id FROM users WHERE id = $1', [tokenRow.user_id]);
+    if (userRes.rows.length === 0) {
+      res.status(401).json({ error: 'المستخدم غير موجود' });
+      return;
+    }
+
+    const user = userRes.rows[0];
+    if (user.is_banned || user.status === 'banned' || user.status === 'inactive') {
+      await pool.query('UPDATE refresh_tokens SET is_revoked = TRUE WHERE user_id = $1', [user.id]);
+      res.status(401).json({ error: 'الحساب محظور أو غير نشط' });
+      return;
+    }
+
+    // Revoke old token and rotate to a new token in the same family
+    await pool.query('UPDATE refresh_tokens SET is_revoked = TRUE WHERE id = $1', [tokenId]);
+
+    const newRawRefreshToken = crypto.randomBytes(32).toString('hex');
+    const newTokenHash = crypto.createHash('sha256').update(newRawRefreshToken).digest('hex');
+    const newCountTokenId = generate16CharId();
+    const newExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
+    await pool.query(
+      `INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, client_type, expires_at, user_agent, ip_address)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [newCountTokenId, user.id, newTokenHash, tokenRow.family_id, clientType, newExpiresAt, req.headers['user-agent'] || null, req.ip || null]
+    );
+
+    let permissions: string[] = [];
+    try {
+      permissions = safeParseArray(user.permissions);
+      if (user.permission_group_id) {
+        const groupRes = await pool.query('SELECT permissions FROM permission_groups WHERE id = $1', [String(user.permission_group_id)]);
+        if (groupRes.rows.length > 0) {
+          permissions = Array.from(new Set([...permissions, ...safeParseArray(groupRes.rows[0].permissions)]));
+        }
+      }
+    } catch (e) {
+      permissions = [];
+    }
+
+    const audMap: Record<string, string> = {
+      customer: 'sdra-customer',
+      company: 'sdra-company',
+      admin: 'sdra-admin',
+    };
+    const newAccessToken = jwt.sign(
+      { id: user.id, email: user.email, role: user.role, permissions },
+      env.JWT_SECRET,
+      { expiresIn: '15m', audience: audMap[clientType] || 'sdra-customer', issuer: 'sdra-backend' }
+    );
+
+    res.json({
+      success: true,
+      token: newAccessToken,
+      accessToken: newAccessToken,
+      refreshToken: `${newCountTokenId}.${newRawRefreshToken}`,
+    });
+  } catch (error: any) {
+    console.error('Error handling refresh token:', error);
+    res.status(500).json({ error: 'فشل تجديد الجلسة' });
+  }
+};
+
+export const logoutUser = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { refreshToken } = req.body || {};
+    if (refreshToken && typeof refreshToken === 'string' && refreshToken.includes('.')) {
+      const [tokenId] = refreshToken.split('.');
+      await pool.query('UPDATE refresh_tokens SET is_revoked = TRUE WHERE id = $1', [tokenId]);
+    }
+    res.json({ success: true, message: 'تم تسجيل الخروج بنجاح' });
+  } catch (error: any) {
+    console.error('Error logging out:', error);
+    res.status(500).json({ error: 'حدث خطأ أثناء تسجيل الخروج' });
+  }
+};
 
 const generateAndSendOtp = async (email: string, userName?: string): Promise<{ code: string; expiresAt: Date }> => {
   const code = Math.floor(100000 + Math.random() * 900000).toString();
@@ -167,16 +330,15 @@ export const verifyOtp = async (req: Request, res: Response): Promise<void> => {
 
     const verifiedUser = updatedUserRes.rows[0];
 
-    const token = jwt.sign(
-      { id: verifiedUser.id, email: verifiedUser.email, role: verifiedUser.role },
-      env.JWT_SECRET,
-      { expiresIn: env.JWT_EXPIRES_IN } as any
-    );
+    const clientType = (verifiedUser.role === 'admin' || verifiedUser.role === 'super_admin') ? 'admin' : (verifiedUser.role === 'owner' ? 'company' : 'customer');
+    const { accessToken, refreshToken } = await issueTokenPair(verifiedUser, clientType, req.headers['user-agent'], req.ip);
 
     res.json({
       success: true,
       message: 'تم التحقق من الحساب بنجاح',
-      token,
+      token: accessToken,
+      accessToken,
+      refreshToken,
       user: {
         id: formatUserId(verifiedUser.id),
         name: verifiedUser.name,
@@ -250,15 +412,14 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       permissions = [];
     }
 
-    const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role, permissions },
-      env.JWT_SECRET,
-      { expiresIn: env.JWT_EXPIRES_IN } as any
-    );
+    const clientType = (user.role === 'admin' || user.role === 'super_admin') ? 'admin' : (user.role === 'owner' ? 'company' : 'customer');
+    const { accessToken, refreshToken } = await issueTokenPair({ ...user, permissions }, clientType, req.headers['user-agent'], req.ip);
 
     res.json({
       message: 'تم تسجيل الدخول بنجاح',
-      token,
+      token: accessToken,
+      accessToken,
+      refreshToken,
       user: {
         id: formatUserId(user.id),
         name: user.name,
@@ -480,6 +641,8 @@ export const updateMyProfile = async (req: AuthRequest, res: Response): Promise<
         return;
       }
       newPasswordHash = await argon2.hash(newPassword);
+      // Revoke all refresh tokens for user on password change
+      await pool.query('UPDATE refresh_tokens SET is_revoked = TRUE WHERE user_id = $1', [userId]);
     }
 
     const result = await pool.query(
@@ -562,16 +725,15 @@ export const googleLogin = async (req: Request, res: Response): Promise<void> =>
       permissions = [];
     }
 
-    const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role, permissions },
-      env.JWT_SECRET,
-      { expiresIn: env.JWT_EXPIRES_IN } as any
-    );
+    const clientType = (user.role === 'admin' || user.role === 'super_admin') ? 'admin' : (user.role === 'owner' ? 'company' : 'customer');
+    const { accessToken, refreshToken } = await issueTokenPair({ ...user, permissions }, clientType, req.headers['user-agent'], req.ip);
 
     res.json({
       message: 'تم تسجيل الدخول بواسطة جوجل بنجاح',
       isNewUser,
-      token,
+      token: accessToken,
+      accessToken,
+      refreshToken,
       user: {
         id: formatUserId(user.id),
         name: user.name,

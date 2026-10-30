@@ -958,6 +958,24 @@ export const initDB = async () => {
     // Also mark all admin/super_admin accounts as verified by default
     await pool.query(`UPDATE users SET is_verified = true WHERE role IN ('admin', 'super_admin')`);
 
+    // 18. Refresh Tokens Table (Session Management & Token Refresh Strategy)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS refresh_tokens (
+        id VARCHAR(64) PRIMARY KEY,
+        user_id VARCHAR(64) NOT NULL,
+        token_hash VARCHAR(255) NOT NULL,
+        family_id VARCHAR(64) NOT NULL,
+        client_type VARCHAR(50) DEFAULT 'customer',
+        is_revoked BOOLEAN DEFAULT FALSE,
+        expires_at TIMESTAMP NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        user_agent TEXT,
+        ip_address VARCHAR(45)
+      );
+      CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
+      CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family_id);
+    `);
+
     // Ensure default test user exists
     const testUserCheck = await pool.query('SELECT id FROM users WHERE email = $1', ['test@example.com']);
     if (testUserCheck.rows.length === 0) {

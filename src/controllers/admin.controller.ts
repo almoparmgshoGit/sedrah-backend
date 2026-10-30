@@ -1463,7 +1463,7 @@ export const adminGetOrders = async (_req: AuthRequest, res: Response): Promise<
       `SELECT o.*,
               (SELECT JSON_AGG(i.*) FROM store_order_items i WHERE i.order_id = o.id) as items
        FROM store_orders o
-       ORDER BY o.id DESC`
+       ORDER BY o.created_at DESC`
     );
     res.json({ success: true, data: result.rows });
   } catch (error: any) {

@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { getCoupons, createCoupon, updateCoupon, deleteCoupon, validateCoupon } from '../controllers/coupons.controller';
-import { authenticateToken, requireModulePermission } from '../middlewares/permission.middleware';
+import { authenticate as authenticateToken } from '../middlewares/security.middleware';
+import { requireModulePermission } from '../middlewares/permission.middleware';
 
 const router = Router();
 

@@ -1,5 +1,5 @@
 import { Response } from 'express';
-import { AuthRequest } from '../middlewares/permission.middleware';
+import { AuthRequest } from '../middlewares/security.middleware';
 import { pool } from '../config/db';
 import { generate16CharId } from '../utils/formatId';
 

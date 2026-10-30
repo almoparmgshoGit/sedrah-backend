@@ -1495,6 +1495,16 @@ export const adminUpdateOrderStatus = async (req: AuthRequest, res: Response): P
 
     const order = result.rows[0];
 
+    await logAudit(
+      req.user?.email || 'admin@sdra.com',
+      'تحديث حالة طلب المتجر',
+      `تحديث حالة الطلب #${order.order_number} إلى (${status})`,
+      req.ip,
+      req.user?.email || 'المسؤول',
+      null,
+      JSON.stringify({ status, orderId: order.id, orderNumber: order.order_number })
+    );
+
     // Send notification to user if linked
     if (order.user_id) {
       const statusNames: Record<string, string> = {

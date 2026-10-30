@@ -39,6 +39,67 @@ const logger = pino({
 const app = express();
 app.disable('x-powered-by');
 
+// Deep Link Verification Endpoints (Android App Links & iOS Universal Links)
+app.get('/.well-known/assetlinks.json', (req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.json([
+    {
+      relation: ['delegate_permission/common.handle_all_urls'],
+      target: {
+        namespace: 'android_app',
+        package_name: 'com.sdra.app',
+        sha256_cert_fingerprints: [
+          'FA:C6:17:45:DC:09:03:78:6F:B9:ED:E6:2A:96:2B:39:9F:73:48:F0:BB:6F:89:9B:83:32:66:75:91:03:3B:9C'
+        ]
+      }
+    }
+  ]);
+});
+
+app.get(['/.well-known/apple-app-site-association', '/apple-app-site-association'], (req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.json({
+    applinks: {
+      apps: [],
+      details: [
+        {
+          appID: 'TEAMID.com.sdra.app',
+          paths: ['/company/*', '/package/*', '/product/*']
+        }
+      ]
+    }
+  });
+});
+
+// Non-app browser fallback redirect page for shared links
+app.get(['/company/*', '/package/*', '/product/*'], (req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="ar" dir="rtl">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>تطبيق سدرة | Sedrah App</title>
+      <style>
+        body { font-family: system-ui, -apple-system, sans-serif; background: #173D35; color: #fff; text-align: center; padding: 40px 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 80vh; }
+        .card { background: #ffffff; color: #202923; padding: 32px 24px; border-radius: 24px; max-width: 400px; width: 100%; box-shadow: 0 10px 25px rgba(0,0,0,0.2); }
+        h1 { font-size: 22px; margin-bottom: 12px; color: #173D35; font-weight: bold; }
+        p { font-size: 14px; color: #4B5563; margin-bottom: 24px; line-height: 1.6; }
+        .btn { display: inline-block; background: #C8A96A; color: #ffffff; text-decoration: none; padding: 14px 28px; border-radius: 14px; font-weight: bold; font-size: 15px; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>منصة وتطبيق سدرة</h1>
+        <p>لعرض تفاصيل هذا المحتوى والتواصل المباشر وبدء الحجز، يرجى فتح أو تحميل تطبيق سدرة على هاتفك.</p>
+        <a href="https://play.google.com/store/apps/details?id=com.sdra.app" class="btn">تحميل تطبيق سدرة</a>
+      </div>
+    </body>
+    </html>
+  `);
+});
+
 app.get('/', (req: Request, res: Response) => {
   res.status(404).json({ error: 'Not Found' });
 });

@@ -37,6 +37,12 @@ const logger = pino({
 });
 
 const app = express();
+app.disable('x-powered-by');
+
+app.get('/', (req: Request, res: Response) => {
+  res.status(404).json({ error: 'Not Found' });
+});
+
 const server = http.createServer(app);
 const io = new SocketIOServer(server, {
   cors: {

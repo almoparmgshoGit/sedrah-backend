@@ -931,9 +931,17 @@ export const testSmtpConnection = async (req: AuthRequest, res: Response): Promi
   }
 };
 
+// Only these keys are readable without logging in
+const PUBLIC_SETTING_KEYS = [
+  'platform_name', 'currency', 'support_email', 'support_phone', 'whatsapp_number', 'website_url', 'company_address',
+  'google_login_enabled', 'google_client_id_web', 'google_client_id_android', 'google_client_id_ios',
+  'privacy_policy_title', 'privacy_policy_content', 'privacy_policy_status', 'packages_disclaimer_note',
+  'profile_required_fields', 'profile_completion_enforced', 'auth_require_email_verification', 'auth_password_min_length',
+];
+
 export const getPublicSettings = async (req: Request, res: Response): Promise<void> => {
   try {
-    const result = await pool.query('SELECT key, value FROM settings WHERE key NOT LIKE \'%smtp_pass%\' AND key NOT LIKE \'%secret%\'');
+    const result = await pool.query('SELECT key, value FROM settings WHERE key = ANY($1)', [PUBLIC_SETTING_KEYS]);
     const settingsObj: Record<string, string> = {};
     for (const row of result.rows) {
       settingsObj[row.key] = row.value;

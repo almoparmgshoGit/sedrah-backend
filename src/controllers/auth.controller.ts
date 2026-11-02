@@ -678,9 +678,24 @@ export const googleLogin = async (req: Request, res: Response): Promise<void> =>
       return;
     }
 
-    const { email, name, googleId } = req.body;
-    if (!email) {
-      res.status(400).json({ error: 'البريد الإلكتروني مطلوب لتسجيل الدخول بجوجل' });
+    const { idToken } = req.body || {};
+    if (!idToken || typeof idToken !== 'string') {
+      res.status(400).json({ error: 'رمز جوجل مطلوب لتسجيل الدخول، يرجى تحديث التطبيق' });
+      return;
+    }
+
+    // Identity comes only from a token signed by Google for one of our client IDs
+    const clientsRes = await pool.query(
+      `SELECT value FROM settings WHERE key IN ('google_client_id_web', 'google_client_id_android', 'google_client_id_ios')`
+    );
+    const allowedAudiences = clientsRes.rows.map(row => String(row.value || '').trim()).filter(Boolean);
+    const googleRes = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`);
+    const googlePayload: any = googleRes.ok ? await googleRes.json() : null;
+    const email = googlePayload?.email;
+    const name = googlePayload?.name;
+
+    if (!email || String(googlePayload.email_verified) !== 'true' || !allowedAudiences.includes(googlePayload.aud)) {
+      res.status(401).json({ error: 'تعذر التحقق من حساب جوجل' });
       return;
     }
 

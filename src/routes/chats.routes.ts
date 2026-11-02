@@ -1,8 +1,11 @@
 import { Router } from 'express';
 import { chatsController } from '../controllers/chats.controller';
-import { authenticate } from '../middlewares/security.middleware';
+import { authenticate, authorize } from '../middlewares/security.middleware';
+import { requireModulePermission } from '../middlewares/permission.middleware';
 
 const router = Router();
+
+const supportStaff = [authenticate, authorize(), requireModulePermission('notifications')];
 
 router.get('/', authenticate, chatsController.getUserChats);
 router.post('/tickets', authenticate, chatsController.createSupportTicket);
@@ -10,13 +13,13 @@ router.get('/tickets/user', authenticate, chatsController.getUserSupportTickets)
 router.patch('/tickets/:chatId/close', authenticate, chatsController.requestCloseTicket);
 router.post('/tickets/:chatId/remind', authenticate, chatsController.sendTicketReminder);
 
-router.get('/admin/all', authenticate, chatsController.getAdminChats);
-router.post('/admin/initiate', authenticate, chatsController.createAdminInitiatedChat);
-router.get('/admin/:chatId/messages', authenticate, chatsController.getAdminChatMessages);
-router.post('/admin/:chatId/messages', authenticate, chatsController.sendAdminChatMessage);
-router.patch('/admin/:chatId/status', authenticate, chatsController.updateTicketStatus);
-router.patch('/admin/:chatId/assign', authenticate, chatsController.assignAndOpenTicket);
-router.delete('/admin/:chatId', authenticate, chatsController.deleteTicketAdmin);
+router.get('/admin/all', supportStaff, chatsController.getAdminChats);
+router.post('/admin/initiate', supportStaff, chatsController.createAdminInitiatedChat);
+router.get('/admin/:chatId/messages', supportStaff, chatsController.getAdminChatMessages);
+router.post('/admin/:chatId/messages', supportStaff, chatsController.sendAdminChatMessage);
+router.patch('/admin/:chatId/status', supportStaff, chatsController.updateTicketStatus);
+router.patch('/admin/:chatId/assign', supportStaff, chatsController.assignAndOpenTicket);
+router.delete('/admin/:chatId', supportStaff, chatsController.deleteTicketAdmin);
 
 router.get('/:companyName/messages', authenticate, chatsController.getChatMessages);
 router.post('/:companyName/messages', authenticate, chatsController.sendMessage);

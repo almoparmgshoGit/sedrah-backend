@@ -206,8 +206,8 @@ app.get('/uploads/:category/:filename', (req: Request, res: Response): void => {
     let isAuthorized = false;
     if (token) {
       try {
-        jwt.verify(token, env.JWT_SECRET);
-        isAuthorized = true;
+        const decoded = jwt.verify(token, env.JWT_SECRET) as any;
+        isAuthorized = decoded.role !== 'guest' && decoded.aud !== 'sdra-guest';
       } catch (e) {
         isAuthorized = false;
       }
@@ -223,13 +223,6 @@ app.get('/uploads/:category/:filename', (req: Request, res: Response): void => {
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   res.sendFile(filePath);
 });
-
-// General static files fallback
-app.use('/uploads', (req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-  next();
-}, express.static(baseUploadDir));
 
 // Zod Validation Middleware Factory
 const validate = (schema: AnyZodObject) => async (req: Request, res: Response, next: NextFunction): Promise<void> => {

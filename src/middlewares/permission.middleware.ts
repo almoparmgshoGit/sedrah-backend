@@ -63,6 +63,8 @@ export const requireModulePermission = (moduleName: string) => {
         manage_packages: ['packages', 'manage_packages'],
         bookings: ['manage_bookings', 'bookings'],
         manage_bookings: ['bookings', 'manage_bookings'],
+        // Existing groups with the notifications permission keep their support desk access
+        support: ['support', 'notifications', 'send_notifications'],
         notifications: ['send_notifications', 'notifications'],
         send_notifications: ['notifications', 'send_notifications'],
         reviews: ['manage_reviews', 'reviews'],

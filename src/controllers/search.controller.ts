@@ -3,7 +3,7 @@ import { pool } from '../config/db';
 
 export const searchPackages = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { q, cityId, minPrice, maxPrice, rating } = req.query;
+    const { q, cityId, minPrice, maxPrice, rating, minNights, maxNights, months, ramadan, date, flights } = req.query;
 
     let query = `
       SELECT p.*, c.name as company_name, ci.name as city_name
@@ -40,9 +40,45 @@ export const searchPackages = async (req: Request, res: Response): Promise<void>
     }
 
     if (rating) {
-      query += ` AND p.rating >= $${paramIndex}`;
+      query += ` AND c.rating >= $${paramIndex}`;
       params.push(parseFloat(rating as string));
       paramIndex++;
+    }
+
+    if (minNights) {
+      query += ` AND p.nights_count >= $${paramIndex}`;
+      params.push(parseInt(minNights as string, 10));
+      paramIndex++;
+    }
+
+    if (maxNights) {
+      query += ` AND p.nights_count <= $${paramIndex}`;
+      params.push(parseInt(maxNights as string, 10));
+      paramIndex++;
+    }
+
+    const travelConditions: string[] = [];
+    const monthList = String(months || '').split(',').filter((m) => /^\d{2}$/.test(m));
+    if (monthList.length > 0) {
+      travelConditions.push(`substring(p.departure_date from 6 for 2) = ANY($${paramIndex})`);
+      params.push(monthList);
+      paramIndex++;
+    }
+    if (ramadan === 'true') {
+      travelConditions.push(`p.title ILIKE '%رمضان%'`);
+    }
+    if (travelConditions.length > 0) {
+      query += ` AND (${travelConditions.join(' OR ')})`;
+    }
+
+    if (date) {
+      query += ` AND p.departure_date LIKE $${paramIndex}`;
+      params.push(`${String(date).slice(0, 10)}%`);
+      paramIndex++;
+    }
+
+    if (flights === 'true') {
+      query += ` AND p.features ILIKE '%طيران%'`;
     }
 
     query += ' ORDER BY p.created_at DESC';

@@ -5,6 +5,26 @@ import { io } from '../server';
 import { createAndSendNotification } from '../utils/notificationHelper';
 import { sendPushToUsers } from '../utils/pushNotification';
 import { generate16CharId } from '../utils/formatId';
+import { logAudit } from '../utils/auditLogger';
+
+const PLATFORM_DESK_NAME = 'إدارة منصة سدرة الرسمية';
+const TICKET_STATUSES = ['new', 'open', 'in_progress', 'resolved', 'closed'];
+const TICKET_STATUS_LABELS: Record<string, string> = {
+  new: 'جديدة',
+  open: 'مفتوحة',
+  in_progress: 'قيد المتابعة',
+  resolved: 'تم حلها',
+  closed: 'مغلقة',
+};
+
+const generateTicketNumber = async (): Promise<string> => {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const candidate = '#T-' + Math.floor(100000 + Math.random() * 900000);
+    const exists = await pool.query('SELECT 1 FROM chats WHERE ticket_number = $1', [candidate]);
+    if (exists.rows.length === 0) return candidate;
+  }
+  return '#T-' + Date.now();
+};
 
 interface ResolvedChatTarget {
   chatId: string | null;
@@ -241,7 +261,7 @@ export const chatsController = {
       }
 
       const messagesRes = await pool.query(
-        'SELECT * FROM messages WHERE chat_id = $1 ORDER BY id ASC',
+        'SELECT * FROM messages WHERE chat_id = $1 ORDER BY created_at ASC',
         [chatId]
       );
 
@@ -335,15 +355,18 @@ export const chatsController = {
 
       // Update chat last message & updated_at
       await pool.query(
-        'UPDATE chats SET last_message = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+        `UPDATE chats
+         SET last_message = $1,
+             updated_at = CURRENT_TIMESTAMP,
+             status = CASE WHEN ticket_number IS NOT NULL AND status IN ('resolved', 'closed') THEN 'open' ELSE status END
+         WHERE id = $2`,
         [message || '[صورة مرفقة]', chatId]
       );
 
       const createdMsg = msgRes.rows[0];
 
       if (io) {
-        io.to(`chat_${chatId}`).emit('receive_message', createdMsg);
-        io.to(targetCompanyName).emit('receive_message', createdMsg);
+        io.to(`chat_${chatId}`).to(targetCompanyName).to('staff').emit('receive_message', createdMsg);
       }
 
       // Push notification to company owner for new chat message (skip if owner is currently viewing the chat)
@@ -421,13 +444,13 @@ export const chatsController = {
       let apptRes;
       if (targetChatId) {
         apptRes = await pool.query(
-          'SELECT * FROM interview_appointments WHERE chat_id = $1 ORDER BY id DESC LIMIT 1',
+          'SELECT * FROM interview_appointments WHERE chat_id = $1 ORDER BY created_at DESC LIMIT 1',
           [targetChatId]
         );
       }
       if (!apptRes || apptRes.rows.length === 0) {
         apptRes = await pool.query(
-          'SELECT * FROM interview_appointments WHERE (user_id = $1 OR $2 = true) AND company_name = $3 ORDER BY id DESC LIMIT 1',
+          'SELECT * FROM interview_appointments WHERE (user_id = $1 OR $2 = true) AND company_name = $3 ORDER BY created_at DESC LIMIT 1',
           [userId, isAdmin, targetCompanyName]
         );
       }
@@ -453,7 +476,7 @@ export const chatsController = {
          JOIN packages p ON b.package_id = p.id
          JOIN companies c ON p.company_id = c.id
          WHERE (b.user_id = $1 OR $2 = true) AND (c.name = $3 OR c.id = $4) AND b.appointment_date IS NOT NULL AND b.status != 'cancelled'
-         ORDER BY b.id DESC LIMIT 1`,
+         ORDER BY b.created_at DESC LIMIT 1`,
         [userId, isAdmin, targetCompanyName, resolved.companyId || -1]
       );
 
@@ -612,24 +635,22 @@ export const chatsController = {
     try {
       const result = await pool.query(
         `SELECT c.*,
-                COALESCE(c.ticket_number, '#T-' || LEFT(c.id, 6)) as ticket_number,
+                (c.ticket_number IS NOT NULL OR c.company_name = $1) AS is_ticket,
+                COALESCE(c.ticket_number, '#C-' || LEFT(c.id, 6)) as ticket_number,
                 COALESCE(c.status, 'open') as ticket_status,
                 COALESCE(c.department, 'users') as department,
-                COALESCE(c.category_title, c.context, 'استفسار عن حجز') as category_title,
+                COALESCE(c.category_title, c.context, 'استفسار') as category_title,
                 u.name as user_name, u.phone as user_phone, u.email as user_email,
-                COALESCE(b_ref.id, b_user.id) as booking_id,
-                COALESCE(c.booking_reference, b_user.booking_reference) as booking_reference,
-                COALESCE(b_ref.status, b_user.status) as booking_status,
-                COALESCE(p_ref.title, p_user.title) as package_title
+                b.id as booking_id,
+                b.status as booking_status,
+                p.title as package_title,
+                (SELECT sender FROM messages WHERE chat_id = c.id ORDER BY created_at DESC LIMIT 1) as last_sender
          FROM chats c
          LEFT JOIN users u ON c.user_id = u.id
-         LEFT JOIN bookings b_ref ON c.booking_reference IS NOT NULL AND b_ref.booking_reference = c.booking_reference
-         LEFT JOIN packages p_ref ON b_ref.package_id = p_ref.id
-         LEFT JOIN LATERAL (
-           SELECT b.id, b.booking_reference, b.status, b.package_id FROM bookings b WHERE b.user_id = c.user_id ORDER BY b.id DESC LIMIT 1
-         ) b_user ON c.booking_reference IS NULL
-         LEFT JOIN packages p_user ON b_user.package_id = p_user.id
-         ORDER BY c.updated_at DESC`
+         LEFT JOIN bookings b ON c.booking_reference IS NOT NULL AND b.booking_reference = c.booking_reference
+         LEFT JOIN packages p ON b.package_id = p.id
+         ORDER BY c.updated_at DESC`,
+        [PLATFORM_DESK_NAME]
       );
       res.status(200).json({ success: true, data: result.rows });
     } catch (error: any) {
@@ -638,10 +659,40 @@ export const chatsController = {
     }
   },
 
+  async getTicketRecipients(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const [users, companies, bookings, staff] = await Promise.all([
+        pool.query(`SELECT id, name, phone, email FROM users WHERE COALESCE(role, 'user') = 'user' ORDER BY created_at DESC`),
+        pool.query('SELECT id, name, user_id FROM companies ORDER BY name ASC'),
+        pool.query(
+          `SELECT b.id, b.user_id, b.booking_reference, b.status, p.title AS package_title
+           FROM bookings b LEFT JOIN packages p ON b.package_id = p.id
+           ORDER BY b.created_at DESC`
+        ),
+        pool.query(`SELECT id, name, email FROM users WHERE role IN ('admin', 'super_admin', 'support', 'moderator') ORDER BY name ASC`),
+      ]);
+      res.status(200).json({
+        success: true,
+        data: { users: users.rows, companies: companies.rows, bookings: bookings.rows, staff: staff.rows },
+      });
+    } catch (error: any) {
+      console.error('Error in getTicketRecipients:', error);
+      res.status(500).json({ error: 'فشل جلب بيانات إنشاء التذكرة' });
+    }
+  },
+
   async updateTicketStatus(req: AuthRequest, res: Response): Promise<void> {
     try {
       const chatId = await resolveChatId(req.params.chatId);
       const { status, department } = req.body;
+
+      if (status && !TICKET_STATUSES.includes(status)) {
+        res.status(400).json({ error: 'حالة التذكرة غير صالحة' });
+        return;
+      }
+
+      const previous = await pool.query('SELECT status FROM chats WHERE id = $1', [chatId]);
+      const statusChanged = Boolean(status) && previous.rows[0]?.status !== status;
 
       const updateRes = await pool.query(
         `UPDATE chats
@@ -658,18 +709,22 @@ export const chatsController = {
       }
 
       if (io) {
-        io.emit('ticket_updated', updateRes.rows[0]);
+        io.to('staff').emit('ticket_updated', updateRes.rows[0]);
       }
 
-      if (updateRes.rows[0]?.user_id) {
+      if (statusChanged) {
+        await logAudit(
+          req.user?.email || 'admin',
+          'تحديث حالة تذكرة',
+          `التذكرة ${updateRes.rows[0].ticket_number || chatId} إلى (${TICKET_STATUS_LABELS[status]})`,
+          req.ip,
+          req.user?.email
+        );
+      }
+
+      if (statusChanged && updateRes.rows[0]?.user_id) {
         const ticketNum = updateRes.rows[0].ticket_number || `#T-${chatId}`;
-        const statusMap: Record<string, string> = {
-          open: 'مفتوحة',
-          in_progress: 'قيد المتابعة',
-          resolved: 'تم حلها',
-          closed: 'مغلقة'
-        };
-        const statusArabic = statusMap[status] || status || 'محدثة';
+        const statusArabic = TICKET_STATUS_LABELS[status];
         createAndSendNotification({
           userId: updateRes.rows[0].user_id,
           title: 'تحديث حالة تذكرة الدعم',
@@ -693,7 +748,7 @@ export const chatsController = {
     try {
       const chatId = await resolveChatId(req.params.chatId);
       const messagesRes = await pool.query(
-        'SELECT * FROM messages WHERE chat_id = $1 ORDER BY id ASC',
+        'SELECT * FROM messages WHERE chat_id = $1 ORDER BY created_at ASC',
         [chatId]
       );
       res.status(200).json({ success: true, data: messagesRes.rows });
@@ -720,6 +775,11 @@ export const chatsController = {
       }
       const chat = chatRes.rows[0];
 
+      if (chat.status === 'closed') {
+        res.status(409).json({ error: 'التذكرة مغلقة، أعد فتحها أولاً' });
+        return;
+      }
+
       const timeStr = new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' });
 
       const msgRes = await pool.query(
@@ -728,16 +788,25 @@ export const chatsController = {
         [generate16CharId(), chatId, chat.user_id, chat.company_name, 'company', message || '[صورة مرفقة]', imageUri || null, timeStr, 'received']
       );
 
+      // The first staff member to reply takes ownership of an unassigned ticket
+      const staffRes = await pool.query('SELECT name, email FROM users WHERE id = $1', [req.user?.id]);
+      const staffName = staffRes.rows[0]?.name || staffRes.rows[0]?.email || null;
       await pool.query(
-        'UPDATE chats SET last_message = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-        [message || '[صورة مرفقة]', chatId]
+        `UPDATE chats
+         SET last_message = $1,
+             updated_at = CURRENT_TIMESTAMP,
+             status = CASE WHEN ticket_number IS NOT NULL AND status IN ('new', 'open') THEN 'in_progress' ELSE status END,
+             assigned_admin_id = COALESCE(assigned_admin_id, $2),
+             assigned_admin_name = COALESCE(assigned_admin_name, $3)
+         WHERE id = $4`,
+        [message || '[صورة مرفقة]', req.user?.id || null, staffName, chatId]
       );
 
       const createdMsg = msgRes.rows[0];
 
       if (io) {
-        io.to(`chat_${chatId}`).emit('receive_message', createdMsg);
-        io.to(chat.company_name).emit('receive_message', createdMsg);
+        io.to(`chat_${chatId}`).to(chat.company_name).to('staff').emit('receive_message', createdMsg);
+        io.to('staff').emit('ticket_updated', { id: chatId });
       }
 
       if (chat.user_id) {
@@ -761,29 +830,60 @@ export const chatsController = {
 
   async createAdminInitiatedChat(req: AuthRequest, res: Response): Promise<void> {
     try {
-      const { userId, companyName, context, initialMessage, bookingReference } = req.body;
+      const { userId, companyId, context, initialMessage, bookingReference } = req.body;
 
-      let targetUserId = userId ? String(userId) : (req.user?.id ? String(req.user.id) : null);
-      let targetCompanyName = companyName || 'إدارة منصة سدرة الرسمية';
+      if (!String(context || '').trim() || !String(initialMessage || '').trim()) {
+        res.status(400).json({ error: 'موضوع التذكرة والرسالة مطلوبان' });
+        return;
+      }
 
-      if (!targetUserId) {
-        const userRes = await pool.query('SELECT id FROM users ORDER BY created_at ASC LIMIT 1');
-        targetUserId = userRes.rows.length > 0 ? String(userRes.rows[0].id) : '1';
+      let targetUserId: string;
+      let targetCompanyName = PLATFORM_DESK_NAME;
+      let targetCompanyId: string | null = null;
+      let department = 'users';
+
+      if (companyId) {
+        const companyRes = await pool.query('SELECT id, name, user_id FROM companies WHERE id = $1', [String(companyId)]);
+        if (companyRes.rows.length === 0) {
+          res.status(404).json({ error: 'الشركة غير موجودة' });
+          return;
+        }
+        if (!companyRes.rows[0].user_id) {
+          res.status(400).json({ error: 'لا يوجد مالك مرتبط بهذه الشركة، اربطها بمستخدم أولاً' });
+          return;
+        }
+        targetUserId = String(companyRes.rows[0].user_id);
+        targetCompanyId = companyRes.rows[0].id;
+        targetCompanyName = companyRes.rows[0].name;
+        department = 'companies';
+      } else if (userId) {
+        const userRes = await pool.query('SELECT id FROM users WHERE id = $1', [String(userId)]);
+        if (userRes.rows.length === 0) {
+          res.status(404).json({ error: 'المستخدم غير موجود' });
+          return;
+        }
+        targetUserId = String(userId);
+      } else {
+        res.status(400).json({ error: 'يرجى اختيار مستخدم أو شركة' });
+        return;
       }
 
       const cleanBookingRef = bookingReference ? String(bookingReference).trim() : null;
-      const ticketNumber = '#T-' + Math.floor(10000 + Math.random() * 90000);
-      const title = context || 'استفسار إداري جديد';
-      const initialText = initialMessage || 'مرحباً بك، تواصل رسمي وخاص من إدارة منصة سدرة';
+      const ticketNumber = await generateTicketNumber();
+      const title = String(context).trim();
+      const initialText = String(initialMessage).trim();
       const timeStr = new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' });
+
+      const creatorRes = await pool.query('SELECT name, email FROM users WHERE id = $1', [req.user?.id]);
+      const creatorName = creatorRes.rows[0]?.name || creatorRes.rows[0]?.email || null;
 
       const compRes = await pool.query('SELECT logo_url FROM companies WHERE name = $1 LIMIT 1', [targetCompanyName]);
       const avatarUrl = compRes.rows.length > 0 ? compRes.rows[0].logo_url : null;
 
       const newChatId = generate16CharId();
       const newChat = await pool.query(
-        `INSERT INTO chats (id, user_id, company_name, context, last_message, unread_count, avatar, verified, ticket_number, category_title, booking_reference, status, department)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *`,
+        `INSERT INTO chats (id, user_id, company_name, company_id, context, last_message, unread_count, avatar, verified, ticket_number, category_title, booking_reference, status, department, assigned_admin_id, assigned_admin_name)
+         VALUES ($1, $2, $3, $14, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15, $16) RETURNING *`,
         [
           newChatId,
           targetUserId,
@@ -796,8 +896,11 @@ export const chatsController = {
           ticketNumber,
           title,
           cleanBookingRef,
-          'open',
-          'users'
+          'in_progress',
+          department,
+          targetCompanyId,
+          req.user?.id || null,
+          creatorName
         ]
       );
 
@@ -812,7 +915,7 @@ export const chatsController = {
       if (io) {
         io.to(`chat_${chatId}`).emit('receive_message', msgRes.rows[0]);
         io.to(targetCompanyName).emit('receive_message', msgRes.rows[0]);
-        io.emit('ticket_updated', newChat.rows[0]);
+        io.to('staff').emit('ticket_updated', newChat.rows[0]);
       }
 
       // Push notification to user for admin-initiated chat
@@ -850,8 +953,8 @@ export const chatsController = {
         return;
       }
 
-      const ticketNumber = '#T-' + Math.floor(10000 + Math.random() * 90000);
-      const companyName = 'إدارة منصة سدرة الرسمية';
+      const ticketNumber = await generateTicketNumber();
+      const companyName = PLATFORM_DESK_NAME;
       const timeStr = new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' });
 
       const newChatId = generate16CharId();
@@ -888,11 +991,11 @@ export const chatsController = {
 
       if (io) {
         io.to(`chat_${chatId}`).emit('receive_message', msgRes.rows[0]);
-        io.emit('ticket_updated', newChat.rows[0]);
+        io.to('staff').emit('ticket_updated', newChat.rows[0]);
       }
 
       // Push notification to admins for new support ticket
-      const adminUsers = await pool.query("SELECT id FROM users WHERE role IN ('admin', 'super_admin')");
+      const adminUsers = await pool.query("SELECT id FROM users WHERE role IN ('admin', 'super_admin', 'support')");
       const adminIds = adminUsers.rows.map((r: any) => r.id);
       if (adminIds.length > 0) {
         sendPushToUsers(
@@ -917,14 +1020,23 @@ export const chatsController = {
   async assignAndOpenTicket(req: AuthRequest, res: Response): Promise<void> {
     try {
       const chatId = await resolveChatId(req.params.chatId);
-      const adminName = (req.user as any)?.name || req.user?.email || 'م. أحمد محمد - الدعم الفني';
-      const adminId = req.user?.id || null;
+      const adminId = req.body?.adminId ? String(req.body.adminId) : String(req.user?.id || '');
+
+      const staffRes = await pool.query(
+        `SELECT id, name, email FROM users WHERE id = $1 AND role IN ('admin', 'super_admin', 'support', 'moderator')`,
+        [adminId]
+      );
+      if (staffRes.rows.length === 0) {
+        res.status(400).json({ error: 'الموظف المحدد غير صالح' });
+        return;
+      }
+      const adminName = staffRes.rows[0].name || staffRes.rows[0].email;
 
       const updateRes = await pool.query(
         `UPDATE chats
          SET assigned_admin_id = $1,
              assigned_admin_name = $2,
-             status = 'open',
+             status = CASE WHEN status IN ('new', 'open') THEN 'in_progress' ELSE status END,
              updated_at = CURRENT_TIMESTAMP
          WHERE id = $3 RETURNING *`,
         [adminId, adminName, chatId]
@@ -935,27 +1047,42 @@ export const chatsController = {
         return;
       }
 
+      await logAudit(
+        req.user?.email || 'admin',
+        'إسناد تذكرة',
+        `التذكرة ${updateRes.rows[0].ticket_number || chatId} أُسندت إلى ${adminName}`,
+        req.ip,
+        req.user?.email
+      );
+
       if (io) {
-        io.emit('ticket_updated', updateRes.rows[0]);
+        io.to('staff').emit('ticket_updated', updateRes.rows[0]);
       }
 
       res.status(200).json({
         success: true,
-        message: `تم استلام التذكرة من قبل ${adminName}`,
+        message: `تم إسناد التذكرة إلى ${adminName}`,
         data: updateRes.rows[0]
       });
     } catch (error: any) {
       console.error('Error in assignAndOpenTicket:', error);
-      res.status(500).json({ error: 'فشل استلام التذكرة: ' + (error.message || '') });
+      res.status(500).json({ error: 'فشل إسناد التذكرة' });
     }
   },
 
   async deleteTicketAdmin(req: AuthRequest, res: Response): Promise<void> {
     try {
       const chatId = await resolveChatId(req.params.chatId);
-      await pool.query('DELETE FROM chats WHERE id = $1', [chatId]);
+      const deleted = await pool.query('DELETE FROM chats WHERE id = $1 RETURNING ticket_number', [chatId]);
+      await logAudit(
+        req.user?.email || 'admin',
+        'حذف تذكرة',
+        `حذف التذكرة ${deleted.rows[0]?.ticket_number || chatId}`,
+        req.ip,
+        req.user?.email
+      );
       if (io) {
-        io.emit('ticket_updated', { id: chatId, deleted: true });
+        io.to('staff').emit('ticket_updated', { id: chatId, deleted: true });
       }
       res.status(200).json({ success: true, message: 'تم حذف التذكرة بنجاح' });
     } catch (error: any) {
@@ -977,7 +1104,7 @@ export const chatsController = {
                 COALESCE(c.ticket_number, '#T-' || LEFT(c.id, 6)) as ticket_number,
                 COALESCE(c.category_title, c.context, 'استفسار عن حجز') as category_title,
                 COALESCE(c.status, 'open') as status,
-                (SELECT sender FROM messages WHERE chat_id = c.id ORDER BY id DESC LIMIT 1) as last_sender
+                (SELECT sender FROM messages WHERE chat_id = c.id ORDER BY created_at DESC LIMIT 1) as last_sender
          FROM chats c
          WHERE c.user_id = $1 AND (c.company_name = 'إدارة منصة سدرة الرسمية' OR c.ticket_number IS NOT NULL)
          ORDER BY c.updated_at DESC`,
@@ -1007,7 +1134,7 @@ export const chatsController = {
       }
 
       if (io) {
-        io.emit('ticket_updated', updateRes.rows[0]);
+        io.to('staff').emit('ticket_updated', updateRes.rows[0]);
       }
 
       res.status(200).json({ success: true, message: 'تم إغلاق التذكرة بنجاح', data: updateRes.rows[0] });
@@ -1020,8 +1147,7 @@ export const chatsController = {
   async sendTicketReminder(req: AuthRequest, res: Response): Promise<void> {
     try {
       const chatId = await resolveChatId(req.params.chatId);
-      const userId = req.user?.id;
-
+      
       const chatRes = await pool.query('SELECT * FROM chats WHERE id = $1', [chatId]);
       if (chatRes.rows.length === 0) {
         res.status(404).json({ error: 'التذكرة غير موجودة' });
@@ -1029,8 +1155,13 @@ export const chatsController = {
       }
       const chat = chatRes.rows[0];
 
+      if (chat.status === 'closed') {
+        res.status(409).json({ error: 'لا يمكن إرسال تذكير على تذكرة مغلقة' });
+        return;
+      }
+
       const timeStr = new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' });
-      const reminderText = '🔔 [تذكير إداري]: تم إرسال تذكير بخصوص هذه التذكرة لعدم الرد لأكثر من 12 ساعة.';
+      const reminderText = '🔔 تذكير: هذه التذكرة بانتظار ردك.';
 
       const msgRes = await pool.query(
         `INSERT INTO messages (id, chat_id, user_id, company_name, sender, text, time, status)
@@ -1039,7 +1170,7 @@ export const chatsController = {
       );
 
       if (io) {
-        io.emit('receive_message', msgRes.rows[0]);
+        io.to(`chat_${chatId}`).to('staff').emit('receive_message', msgRes.rows[0]);
       }
 
       // Push notification to user for ticket reminder
@@ -1052,7 +1183,7 @@ export const chatsController = {
           icon: 'notifications-outline',
           iconBg: '#FEF3C7',
           iconColor: '#D97706',
-          data: { type: 'ticket_reminder', chatId: parseInt(chatId as string) }
+          data: { type: 'ticket_reminder', chatId }
         }).catch(() => {});
       }
 

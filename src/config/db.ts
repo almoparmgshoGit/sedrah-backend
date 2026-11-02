@@ -313,6 +313,7 @@ export const initDB = async () => {
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS permission_group_id VARCHAR(16);');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions TEXT;');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS address TEXT;');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT;');
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active';");
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT FALSE;');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS public_id VARCHAR(50);');
@@ -347,24 +348,25 @@ export const initDB = async () => {
       "محافظة الوادي الجديد", "محافظة مطروح"
     ];
 
-    if (parseInt(cityCountResult.rows[0].count, 10) < 27) {
-      await pool.query('DELETE FROM cities');
+    // Seed only an empty table: existing cities and their companies must survive every restart
+    if (parseInt(cityCountResult.rows[0].count, 10) === 0) {
       for (const govName of egyptianGovernoratesList) {
         await pool.query(
           `INSERT INTO cities (id, name, image_url, total_companies, total_packages, description) VALUES ($1, $2, NULL, 0, 0, $3)`,
           [generate16CharId(), govName, govName]
         );
       }
-      console.log('✅ Re-seeded all 27 Egyptian governorates without default images.');
-    } else {
-      const existingCities = await pool.query('SELECT id FROM cities ORDER BY created_at ASC');
-      for (let i = 0; i < Math.min(existingCities.rows.length, egyptianGovernoratesList.length); i++) {
-        const targetName = egyptianGovernoratesList[i];
-        await pool.query('UPDATE cities SET name = $1 WHERE id = $2', [targetName, existingCities.rows[i].id]);
-      }
-      // Remove any dummy unsplash default image_urls
-      await pool.query("UPDATE cities SET image_url = NULL WHERE image_url LIKE '%unsplash%'");
+      console.log('✅ Seeded all 27 Egyptian governorates without default images.');
     }
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS city_notifications (
+        city_id VARCHAR(16) NOT NULL,
+        user_id VARCHAR(16) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (city_id, user_id)
+      );
+    `);
 
     // 3. Companies table
     await pool.query(`
@@ -960,7 +962,7 @@ export const initDB = async () => {
     await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(10, 2);');
 
     // Ensure default admin user exists and is verified
-    const allPerms = JSON.stringify(['users','companies','packages','bookings','store','notifications','reviews','admins','audit_logs','settings']);
+    const allPerms = JSON.stringify(['users','companies','packages','bookings','store','notifications','support','reviews','admins','audit_logs','settings']);
     const adminCheck = await pool.query('SELECT id FROM users WHERE email = $1', ['admin@sdra.com']);
     if (adminCheck.rows.length === 0 && process.env.ADMIN_INITIAL_PASSWORD) {
       const passwordHash = await argon2.hash(process.env.ADMIN_INITIAL_PASSWORD);

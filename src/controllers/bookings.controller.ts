@@ -4,6 +4,33 @@ import { parseIdOrToken, generate16CharId } from '../utils/formatId';
 import { suggestAppointmentForBooking } from '../utils/appointmentEngine';
 import { createAndSendNotification } from '../utils/notificationHelper';
 
+// Mirrors the room pricing shown in the app, so the charged total never comes from the client
+const calculateBookingTotal = (pkg: any, roomType: string, adults: number, children: number): number => {
+  let prices: any = null;
+  try {
+    prices = typeof pkg.room_prices === 'string' ? JSON.parse(pkg.room_prices) : pkg.room_prices;
+  } catch {}
+
+  const multipliers: Record<string, number> = { quad: 1.0, triple: 1.15, double: 1.3, single: 1.6 };
+  const room = multipliers[roomType] ? roomType : 'quad';
+  const basePrice = pkg.price ? parseFloat(pkg.price) : 5000;
+  const entry = prices && typeof prices === 'object' ? prices[room] : null;
+
+  let adult = 0;
+  let child = 0;
+  if (entry && typeof entry === 'object') {
+    adult = parseFloat(entry.adult || entry.price || 0);
+    child = parseFloat(entry.child || 0);
+  } else if (entry) {
+    adult = parseFloat(String(entry));
+    child = parseFloat(prices[`${room}_child`] || 0);
+  }
+  if (adult <= 0) adult = Math.round(basePrice * multipliers[room]);
+  if (child <= 0) child = Math.round(adult * 0.5);
+
+  return adults * adult + children * child;
+};
+
 export const createBooking = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = (req as any).user?.id || (req as any).user?.userId;
@@ -12,8 +39,8 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
-    const { packageId, travelersCount, totalPrice, bookingMethod, roomType, childrenCount, notes } = req.body;
-    if (!packageId || !totalPrice) {
+    const { packageId, travelersCount, bookingMethod, roomType, childrenCount, notes } = req.body;
+    if (!packageId) {
       res.status(400).json({ error: 'بيانات الحجز غير مكتملة' });
       return;
     }
@@ -25,8 +52,16 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       resolvedPackageId = pkgRes.rows.length > 0 ? pkgRes.rows[0].id : parsedPkg.value;
     }
 
-    const pkgRes = await pool.query('SELECT company_id FROM packages WHERE id = $1', [resolvedPackageId]);
-    const companyId = pkgRes.rows.length > 0 ? pkgRes.rows[0].company_id : 1;
+    const pkgRes = await pool.query('SELECT company_id, price, room_prices FROM packages WHERE id = $1', [resolvedPackageId]);
+    if (pkgRes.rows.length === 0) {
+      res.status(404).json({ error: 'الباقة غير موجودة' });
+      return;
+    }
+    const companyId = pkgRes.rows[0].company_id;
+
+    const childrenTotal = Math.max(Number(childrenCount) || 0, 0);
+    const adultsTotal = Math.max((Number(travelersCount) || 2) - childrenTotal, 1);
+    const totalPrice = calculateBookingTotal(pkgRes.rows[0], roomType || 'quad', adultsTotal, childrenTotal);
 
     // Suggest appointment for booking
     let suggestedAppt = await suggestAppointmentForBooking(companyId);
@@ -211,11 +246,13 @@ export const getBookingById = async (req: Request, res: Response): Promise<void>
 
     const result = await pool.query(
       `
-      SELECT b.*, p.title as package_title, p.duration, p.image_url, p.price, c.name as company_name, c.logo_url as company_logo
+      SELECT b.*, p.title as package_title, p.duration, p.image_url, p.price, p.departure_date, p.return_date,
+             c.name as company_name, c.logo_url as company_logo, c.phone as company_phone, c.whatsapp as company_whatsapp,
+             c.address as company_address, c.google_maps_url as company_maps_url, c.working_hours as company_working_hours
       FROM bookings b
       JOIN packages p ON b.package_id = p.id
       JOIN companies c ON p.company_id = c.id
-      WHERE b.id = $1 AND b.user_id = $2
+      WHERE (b.id = $1 OR b.booking_reference = $1) AND b.user_id = $2
       `,
       [bookingId, userId]
     );
@@ -239,7 +276,8 @@ export const updateBookingReceipt = async (req: Request, res: Response): Promise
   try {
     const userId = (req as any).user?.id || (req as any).user?.userId;
     const bookingId = req.params.id;
-    const { receiptUrl, receipt_url } = req.body || {};
+    const { receiptUrl, receipt_url, paidAmount } = req.body || {};
+    const parsedPaidAmount = Number(paidAmount) > 0 ? Number(paidAmount) : null;
     const finalReceiptUrl = receiptUrl || receipt_url || null;
 
     if (!userId) {
@@ -276,10 +314,11 @@ export const updateBookingReceipt = async (req: Request, res: Response): Promise
            receipt_url = COALESCE(NULLIF($1, ''), receipt_url),
            receipt_approved = FALSE,
            receipt_status = 'pending',
-           rejection_reason = NULL
+           rejection_reason = NULL,
+           paid_amount = COALESCE($3, paid_amount)
        WHERE id = $2
        RETURNING *`,
-      [finalReceiptUrl, bookingRecord.id]
+      [finalReceiptUrl, bookingRecord.id, parsedPaidAmount]
     );
 
     if (result.rows.length === 0) {
@@ -351,6 +390,11 @@ export const linkBookingByReference = async (req: Request, res: Response): Promi
     }
 
     const booking = bookingResult.rows[0];
+
+    if (booking.user_id && String(booking.user_id) !== String(userId)) {
+      res.status(403).json({ error: 'هذا الحجز مرتبط بحساب آخر' });
+      return;
+    }
 
     const updateResult = await pool.query(
       'UPDATE bookings SET user_id = $1 WHERE id = $2 RETURNING *',

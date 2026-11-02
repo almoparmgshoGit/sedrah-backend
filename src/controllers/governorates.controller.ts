@@ -12,11 +12,11 @@ export const getGovernorates = async (req: Request, res: Response): Promise<void
     const shippingMode = settingsMap['shipping_mode'] || 'unified';
     const unifiedFee = parseFloat(settingsMap['unified_shipping_fee'] ?? '50') || 0;
 
-    const govRes = await pool.query('SELECT * FROM governorates ORDER BY id ASC');
+    const govRes = await pool.query('SELECT * FROM governorates ORDER BY name ASC');
     const governorates = [];
 
     for (const gov of govRes.rows) {
-      const centersRes = await pool.query('SELECT name FROM centers WHERE governorate_id = $1 ORDER BY id ASC', [gov.id]);
+      const centersRes = await pool.query('SELECT name FROM centers WHERE governorate_id = $1 ORDER BY name ASC', [gov.id]);
       const fee = shippingMode === 'unified'
         ? unifiedFee
         : (gov.shipping_fee !== null && gov.shipping_fee !== undefined ? parseFloat(gov.shipping_fee) : 50.00);
@@ -49,7 +49,7 @@ export const getShippingConfig = async (req: any, res: Response): Promise<void> 
       settingsMap[row.key] = row.value;
     }
 
-    const govRes = await pool.query('SELECT * FROM governorates ORDER BY id ASC');
+    const govRes = await pool.query('SELECT * FROM governorates ORDER BY name ASC');
 
     res.json({
       success: true,

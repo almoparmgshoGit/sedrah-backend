@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { pool } from '../config/db';
+import { notifyCitySubscribers } from './cities.controller';
 import { AuthRequest } from '../middlewares/security.middleware';
 import { formatCompanyId, formatPackageId, formatUserId, parseIdOrToken, generateRandomToken, generate16CharId } from '../utils/formatId';
 
@@ -38,7 +39,6 @@ export const formatPublicCompany = (comp: any) => {
     total_bookings: comp.total_bookings,
     completed_bookings: comp.completed_bookings,
     in_progress_bookings: comp.in_progress_bookings,
-    platform_earnings: comp.platform_earnings,
   };
 };
 
@@ -190,6 +190,7 @@ export const createCompanyFull = async (req: AuthRequest, res: Response): Promis
       commercial_register_url,
       tax_id_url,
       manager_id_url,
+      manager_id_back_url,
       field_verified,
     } = req.body;
 
@@ -220,8 +221,8 @@ export const createCompanyFull = async (req: AuthRequest, res: Response): Promis
         id, user_id, pending_owner_email, city_id, name, short_description, description,
         phone, whatsapp, landline_phone, website_url, social_links, address, google_maps_url,
         logo_url, banner_url, working_hours, holidays_notes, commercial_register_url,
-        tax_id_url, manager_id_url, field_verified, verified, rating, reviews_count, public_id
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, 0.0, 0, $24)
+        tax_id_url, manager_id_url, manager_id_back_url, field_verified, verified, rating, reviews_count, public_id
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, 0.0, 0, $25)
       RETURNING *`,
       [
         companyId,
@@ -245,6 +246,7 @@ export const createCompanyFull = async (req: AuthRequest, res: Response): Promis
         commercial_register_url || '',
         tax_id_url || '',
         manager_id_url || '',
+        manager_id_back_url || '',
         isVerified,
         isVerified,
         publicId
@@ -255,6 +257,7 @@ export const createCompanyFull = async (req: AuthRequest, res: Response): Promis
 
     if (city_id) {
       await pool.query('UPDATE cities SET total_companies = (SELECT COUNT(*) FROM companies WHERE city_id = $1) WHERE id = $1', [city_id]);
+      notifyCitySubscribers(city_id, name).catch((err) => console.error('City notification error:', err));
     }
 
     res.status(201).json({
@@ -285,7 +288,7 @@ export const getCompanyPackages = async (req: Request, res: Response): Promise<v
       LEFT JOIN bookings b ON p.id = b.package_id
       WHERE p.company_id = $1
       GROUP BY p.id
-      ORDER BY p.id ASC
+      ORDER BY p.created_at ASC
     `, [companyId]);
 
     const formatted = result.rows.map(pkg => ({
@@ -321,7 +324,7 @@ export const getCompanyReviews = async (req: Request, res: Response): Promise<vo
       FROM reviews r
       JOIN users u ON r.user_id = u.id
       WHERE r.company_id = $1
-      ORDER BY r.id DESC
+      ORDER BY r.created_at DESC
     `, [companyId]);
 
     const formatted = result.rows.map(rev => ({
@@ -418,7 +421,7 @@ export const getCompanyAdminDetails = async (req: Request, res: Response): Promi
     const companyId = company.id;
 
     // 1. Packages
-    const packagesRes = await pool.query('SELECT * FROM packages WHERE company_id = $1 ORDER BY id DESC', [companyId]);
+    const packagesRes = await pool.query('SELECT * FROM packages WHERE company_id = $1 ORDER BY created_at DESC', [companyId]);
 
     // 2. Reviews
     const reviewsRes = await pool.query(`
@@ -426,7 +429,7 @@ export const getCompanyAdminDetails = async (req: Request, res: Response): Promi
       FROM reviews r
       LEFT JOIN users u ON r.user_id = u.id
       WHERE r.company_id = $1
-      ORDER BY r.id DESC
+      ORDER BY r.created_at DESC
     `, [companyId]);
 
     // 3. Bookings
@@ -436,7 +439,7 @@ export const getCompanyAdminDetails = async (req: Request, res: Response): Promi
       JOIN packages p ON b.package_id = p.id
       LEFT JOIN users u ON b.user_id = u.id
       WHERE p.company_id = $1
-      ORDER BY b.id DESC
+      ORDER BY b.created_at DESC
     `, [companyId]);
 
     // 4. Trip Stages / Trips
@@ -447,7 +450,7 @@ export const getCompanyAdminDetails = async (req: Request, res: Response): Promi
       JOIN packages p ON b.package_id = p.id
       LEFT JOIN users u ON b.user_id = u.id
       WHERE p.company_id = $1
-      ORDER BY ts.id DESC
+      ORDER BY ts.created_at DESC
     `, [companyId]);
 
     res.json({

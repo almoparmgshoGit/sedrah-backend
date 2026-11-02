@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { pool } from '../config/db';
 import { generate16CharId, generateRandomToken } from '../utils/formatId';
+import { createAndSendNotification } from '../utils/notificationHelper';
 
 export const getCities = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -95,39 +96,6 @@ export const getCityCompanies = async (req: Request, res: Response): Promise<voi
   }
 };
 
-export const createCityCompany = async (req: Request, res: Response): Promise<void> => {
-  try {
-    const cityId = req.params.id;
-    const { name, description, logoUrl, bannerUrl, user_id } = req.body;
-
-    if (!name) {
-      res.status(400).json({ error: 'اسم الشركة مطلوب' });
-      return;
-    }
-
-    const companyId = generate16CharId();
-    const publicId = generateRandomToken('cmp');
-    const result = await pool.query(
-      `INSERT INTO companies (id, user_id, city_id, name, logo_url, banner_url, description, rating, reviews_count, verified, public_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 0.0, 0, true, $8)
-       RETURNING *`,
-      [companyId, user_id || null, cityId, name, logoUrl || '', bannerUrl || '', description || 'شركة سياحية مرخصة', publicId]
-    );
-
-    // Update total_companies count in cities
-    await pool.query('UPDATE cities SET total_companies = (SELECT COUNT(*) FROM companies WHERE city_id = $1) WHERE id = $1', [cityId]);
-
-    res.status(201).json({
-      success: true,
-      message: 'تم إضافة الشركة للمحافظة بنجاح',
-      data: result.rows[0],
-    });
-  } catch (error: any) {
-    console.error('Error creating company for city:', error);
-    res.status(500).json({ error: 'فشل إضافة الشركة للمحافظة' });
-  }
-};
-
 export const linkCompanyToCity = async (req: Request, res: Response): Promise<void> => {
   try {
     const cityId = req.params.id;
@@ -158,5 +126,34 @@ export const linkCompanyToCity = async (req: Request, res: Response): Promise<vo
   } catch (error: any) {
     console.error('Error linking company to city:', error);
     res.status(500).json({ error: 'فشل ربط الشركة بالمحافظة' });
+  }
+};
+
+export const subscribeToCity = async (req: any, res: Response): Promise<void> => {
+  try {
+    await pool.query(
+      'INSERT INTO city_notifications (city_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [req.params.id, req.user.id]
+    );
+    res.json({ success: true, message: 'سنخبرك عند انضمام أول شركة في هذه المدينة' });
+  } catch (error: any) {
+    console.error('Error subscribing to city:', error);
+    res.status(500).json({ error: 'تعذر تفعيل التنبيه' });
+  }
+};
+
+export const notifyCitySubscribers = async (cityId: string, companyName: string): Promise<void> => {
+  const subs = await pool.query('DELETE FROM city_notifications WHERE city_id = $1 RETURNING user_id', [cityId]);
+  for (const row of subs.rows) {
+    await createAndSendNotification({
+      userId: row.user_id,
+      title: 'شركة جديدة في مدينتك',
+      subtitle: `انضمت ${companyName} إلى المنصة في المدينة التي طلبت التنبيه عنها.`,
+      category: 'عام',
+      icon: 'business-outline',
+      iconBg: '#EFF6FF',
+      iconColor: '#2563EB',
+      data: { type: 'city_company_added', cityId },
+    });
   }
 };

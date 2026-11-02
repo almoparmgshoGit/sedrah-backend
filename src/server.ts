@@ -8,6 +8,7 @@ import cors from 'cors';
 import pino from 'pino';
 import pinoHttp from 'pino-http';
 import { env } from './config/env';
+import { pool } from './config/db';
 import { globalLimiter, authLimiter, authenticate, authorize, verifyOwnershipOrAdmin, AuthRequest } from './middlewares/security.middleware';
 import { registerSchema, loginSchema, updateProfileSchema, sendOtpSchema, verifyOtpSchema } from './validators/auth.validator';
 import { register, login, sendOtp, verifyOtp, getUserProfile, updateUserProfile, getCurrentUser, updateMyProfile, getProfileStatus, googleLogin, deleteMyAccount, generateGuestToken, handleRefreshToken, logoutUser } from './controllers/auth.controller';
@@ -122,21 +123,37 @@ const io = new SocketIOServer(server, {
   },
 });
 
+const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
+
+io.use((socket, next) => {
+  try {
+    const decoded = jwt.verify(String(socket.handshake.auth?.token || ''), env.JWT_SECRET) as any;
+    if (decoded.role === 'guest' || decoded.aud === 'sdra-guest') return next(new Error('Unauthorized'));
+    socket.data.user = decoded;
+    next();
+  } catch {
+    next(new Error('Unauthorized'));
+  }
+});
+
 io.on('connection', (socket) => {
+  const user = socket.data.user;
+  const isStaff = STAFF_ROLES.includes(user.role);
+  if (isStaff) socket.join('staff');
   logger.info(`Socket connected: ${socket.id}`);
 
-  socket.on('join_room', (room: string) => {
-    socket.join(room);
-    logger.info(`Socket ${socket.id} joined room: ${room}`);
-  });
-
-  socket.on('send_message', (data: any) => {
-    if (data?.companyName) {
-      io.to(data.companyName).emit('receive_message', data);
-    } else if (data?.chatId) {
-      io.to(`chat_${data.chatId}`).emit('receive_message', data);
-    } else {
-      io.emit('receive_message', data);
+  socket.on('join_room', async (room: string) => {
+    try {
+      if (typeof room !== 'string') return;
+      if (!isStaff) {
+        // Customers may only join the rooms of their own chats
+        if (!room.startsWith('chat_')) return;
+        const owned = await pool.query('SELECT 1 FROM chats WHERE id = $1 AND user_id = $2', [room.slice(5), String(user.id)]);
+        if (owned.rows.length === 0) return;
+      }
+      socket.join(room);
+    } catch (err) {
+      logger.error(err);
     }
   });
 

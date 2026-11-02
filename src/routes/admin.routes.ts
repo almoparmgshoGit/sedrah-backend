@@ -6,7 +6,7 @@ import {
   lookupUserByEmail,
   updateUserByAdmin,
   banUserByAdmin,
-  createCompanyForUser,
+  setCompanyOwner,
   deleteUserByAdmin,
   getAllBookings,
   updateBookingStatusByAdmin,
@@ -46,7 +46,6 @@ import {
 import {
   updateCity,
   getCityCompanies,
-  createCityCompany,
   linkCompanyToCity
 } from '../controllers/cities.controller';
 import { createCompanyFull, getCompanyAdminDetails, createCompanyPackage, updateCompany } from '../controllers/companies.controller';
@@ -66,7 +65,6 @@ router.get('/users/:id', requireModulePermission('users'), getUserDetails);
 router.post('/users', idempotencyMiddleware, requireModulePermission('users'), createUserByAdmin);
 router.put('/users/:id', idempotencyMiddleware, requireModulePermission('users'), updateUserByAdmin);
 router.put('/users/:id/ban', idempotencyMiddleware, requireModulePermission('users'), banUserByAdmin);
-router.post('/users/:id/company', idempotencyMiddleware, requireModulePermission('companies'), createCompanyForUser);
 router.delete('/users/:id', idempotencyMiddleware, requireModulePermission('users'), deleteUserByAdmin);
 
 router.get('/bookings', requireModulePermission('bookings'), getAllBookings);
@@ -78,6 +76,7 @@ router.get('/bookings/:id/stages', requireModulePermission('bookings'), getBooki
 router.get('/companies', requireModulePermission('companies'), getAllCompanies);
 router.post('/companies', idempotencyMiddleware, requireModulePermission('companies'), createCompanyFull);
 router.put('/companies/:id', idempotencyMiddleware, requireModulePermission('companies'), updateCompany);
+router.patch('/companies/:id/owner', idempotencyMiddleware, requireModulePermission('companies'), setCompanyOwner);
 router.get('/companies/:id/details', requireModulePermission('companies'), getCompanyAdminDetails);
 router.post('/companies/:id/packages', idempotencyMiddleware, requireModulePermission('packages'), createCompanyPackage);
 router.put('/packages/:id', idempotencyMiddleware, requireModulePermission('packages'), updatePackageByAdmin);
@@ -87,7 +86,6 @@ router.patch('/packages/:id/status', idempotencyMiddleware, requireModulePermiss
 router.get('/cities', getAllCities);
 router.put('/cities/:id', idempotencyMiddleware, requireModulePermission('companies'), updateCity);
 router.get('/cities/:id/companies', requireModulePermission('companies'), getCityCompanies);
-router.post('/cities/:id/companies', idempotencyMiddleware, requireModulePermission('companies'), createCityCompany);
 router.post('/cities/:id/link-company', idempotencyMiddleware, requireModulePermission('companies'), linkCompanyToCity);
 
 router.get('/reviews', requireModulePermission('reviews'), getAllReviews);

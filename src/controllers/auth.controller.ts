@@ -477,11 +477,11 @@ export const updateUserProfile = async (req: AuthRequest, res: Response): Promis
       return;
     }
 
-    const { name, phone, email, country, city } = req.body;
+    const { name, phone, email, country, city, avatar } = req.body;
 
     const result = await pool.query(
-      `UPDATE users SET name = COALESCE($1, name), phone = COALESCE($2, phone), email = COALESCE($3, email), country = COALESCE($4, country), city = COALESCE($5, city) WHERE id = $6 RETURNING id, name, email, phone, role, balance, country, city, created_at`,
-      [name, phone, email, country, city, userId]
+      `UPDATE users SET name = COALESCE($1, name), phone = COALESCE($2, phone), email = COALESCE($3, email), country = COALESCE($4, country), city = COALESCE($5, city), avatar = COALESCE($6, avatar) WHERE id = $7 RETURNING id, name, email, phone, role, balance, country, city, avatar, created_at`,
+      [name, phone, email, country, city, avatar, userId]
     );
 
     if (result.rows.length === 0) {
@@ -595,6 +595,7 @@ export const getCurrentUser = async (req: AuthRequest, res: Response): Promise<v
         address: user.address || '',
         country: user.country || '',
         city: user.city || '',
+        avatar: user.avatar || null,
         role: user.role,
         permissions,
         permission_group_id: user.permission_group_id,

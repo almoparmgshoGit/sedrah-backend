@@ -8,6 +8,21 @@ import nodemailer from 'nodemailer';
 import { replaceEmailPlaceholders } from '../utils/mailer';
 import { createAndSendNotification } from '../utils/notificationHelper';
 
+const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
+
+// Roles and permissions are only changeable by people who manage staff
+const canManageStaff = async (req: AuthRequest): Promise<boolean> => {
+  if (req.user?.role === 'super_admin') return true;
+  const res = await pool.query(
+    `SELECT u.permissions AS direct, pg.permissions AS grouped
+     FROM users u LEFT JOIN permission_groups pg ON u.permission_group_id = pg.id
+     WHERE u.id = $1`,
+    [req.user?.id]
+  );
+  const row = res.rows[0] || {};
+  return `${row.direct || ''} ${row.grouped || ''}`.includes('admins');
+};
+
 const resolveUserId = async (param: string | number) => {
   const str = String(param);
   const res = await pool.query('SELECT id FROM users WHERE id = $1 OR public_id = $1', [str]);
@@ -140,8 +155,8 @@ export const getUserDetails = async (req: AuthRequest, res: Response): Promise<v
           email: user.email,
           phone: user.phone,
           role: user.role,
-          country: user.country || 'المملكة العربية السعودية',
-          city: user.city || 'الرياض',
+          country: user.country || '',
+          city: user.city || '',
           status: user.status || 'active',
           createdAt: user.created_at,
         },
@@ -170,6 +185,25 @@ export const createUserByAdmin = async (req: AuthRequest, res: Response): Promis
 
     const cleanEmail = String(email).trim().toLowerCase();
     const existing = await pool.query('SELECT * FROM users WHERE LOWER(email) = $1', [cleanEmail]);
+
+    const manageStaff = await canManageStaff(req);
+    const requestsStaffAccess = (role && role !== 'user') || (Array.isArray(permissions) && permissions.length > 0) || permission_group_id;
+    if (!manageStaff && requestsStaffAccess) {
+      res.status(403).json({ error: 'ليس لديك صلاحية منح أدوار أو صلاحيات إدارية' });
+      return;
+    }
+    if (role === 'super_admin' && req.user?.role !== 'super_admin') {
+      res.status(403).json({ error: 'منح دور المشرف العام متاح للمشرف العام فقط' });
+      return;
+    }
+    if (existing.rows.length > 0 && !manageStaff) {
+      res.status(409).json({ error: 'هذا البريد مسجل مسبقاً' });
+      return;
+    }
+    if (existing.rows.length > 0 && existing.rows[0].role === 'super_admin' && req.user?.role !== 'super_admin') {
+      res.status(403).json({ error: 'لا يمكن تعديل حساب مشرف عام' });
+      return;
+    }
 
     const permsStr = Array.isArray(permissions) ? JSON.stringify(permissions) : JSON.stringify([]);
     const parsedGroupId = permission_group_id ? String(permission_group_id) : null;
@@ -284,6 +318,19 @@ export const updateUserByAdmin = async (req: AuthRequest, res: Response): Promis
     }
 
     const { name, email, phone, role, country, city, permissions, permission_group_id } = req.body;
+
+    const currentRes = await pool.query('SELECT role, permissions, permission_group_id FROM users WHERE id = $1', [internalUserId]);
+    const current = currentRes.rows[0] || {};
+    const changesStaffAccess = (role !== undefined && role !== current.role) || permissions !== undefined || permission_group_id !== undefined;
+    if (changesStaffAccess && !(await canManageStaff(req))) {
+      res.status(403).json({ error: 'ليس لديك صلاحية تعديل الأدوار أو الصلاحيات' });
+      return;
+    }
+    if ((role === 'super_admin' || current.role === 'super_admin') && req.user?.role !== 'super_admin') {
+      res.status(403).json({ error: 'تعديل حسابات المشرف العام متاح للمشرف العام فقط' });
+      return;
+    }
+
     const permsStr = permissions ? (Array.isArray(permissions) ? JSON.stringify(permissions) : String(permissions)) : null;
 
     let parsedGroupId: string | null = null;
@@ -343,7 +390,22 @@ export const banUserByAdmin = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    const newStatus = status || 'banned';
+    const newStatus = req.body?.status === 'active' ? 'active' : 'banned';
+
+    const targetRes = await pool.query('SELECT role FROM users WHERE id = $1', [internalUserId]);
+    if (String(internalUserId) === String(req.user?.id)) {
+      res.status(400).json({ error: 'لا يمكنك حظر حسابك' });
+      return;
+    }
+    if (STAFF_ROLES.includes(targetRes.rows[0]?.role) && !(await canManageStaff(req))) {
+      res.status(403).json({ error: 'حظر المشرفين يتطلب صلاحية إدارة المشرفين' });
+      return;
+    }
+    if (targetRes.rows[0]?.role === 'super_admin' && req.user?.role !== 'super_admin') {
+      res.status(403).json({ error: 'لا يمكن حظر مشرف عام' });
+      return;
+    }
+
     await pool.query(
       'UPDATE users SET status = $1 WHERE id = $2',
       [newStatus, internalUserId]
@@ -366,71 +428,55 @@ export const banUserByAdmin = async (req: AuthRequest, res: Response): Promise<v
   }
 };
 
-export const createCompanyForUser = async (req: AuthRequest, res: Response): Promise<void> => {
+export const setCompanyOwner = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const internalUserId = await resolveUserId(String(req.params.id));
-    if (!internalUserId) {
-      res.status(404).json({ error: 'المستخدم غير موجود' });
+    const companyId = String(req.params.id);
+    const { userId, replace } = req.body || {};
+
+    const companyRes = await pool.query('SELECT * FROM companies WHERE id = $1 OR public_id = $1', [companyId]);
+    if (companyRes.rows.length === 0) {
+      res.status(404).json({ error: 'الشركة غير موجودة' });
       return;
     }
+    const company = companyRes.rows[0];
 
-    const { name, cityId, description, logoUrl, bannerUrl } = req.body;
-
-    if (!name) {
-      res.status(400).json({ error: 'اسم الشركة مطلوب' });
-      return;
-    }
-
-    // Resolve a valid city_id to avoid foreign key constraint violations
-    let targetCityId = parseInt(cityId, 10);
-    if (isNaN(targetCityId)) {
-      targetCityId = 1;
-    }
-
-    const cityCheck = await pool.query('SELECT id FROM cities WHERE id = $1', [targetCityId]);
-    if (cityCheck.rows.length === 0) {
-      const firstCityRes = await pool.query('SELECT id FROM cities ORDER BY id ASC LIMIT 1');
-      if (firstCityRes.rows.length > 0) {
-        targetCityId = firstCityRes.rows[0].id;
-      } else {
-        const newCityRes = await pool.query(
-          `INSERT INTO cities (id, name, image_url, total_companies, total_packages, description)
-           VALUES ($1, 'القاهرة', '', 0, 0, 'العاصمة') RETURNING id`,
-          [generateRandomToken('cty')]
-        );
-        targetCityId = newCityRes.rows[0].id;
+    let ownerId: string | null = null;
+    if (userId) {
+      ownerId = await resolveUserId(String(userId));
+      if (!ownerId) {
+        res.status(404).json({ error: 'المستخدم غير موجود' });
+        return;
+      }
+      if (company.user_id && String(company.user_id) !== String(ownerId) && !replace) {
+        res.status(409).json({ error: 'هذه الشركة مرتبطة بمستخدم آخر' });
+        return;
+      }
+      const ownedRes = await pool.query('SELECT name FROM companies WHERE user_id = $1 AND id != $2', [ownerId, company.id]);
+      if (ownedRes.rows.length > 0) {
+        res.status(409).json({ error: `هذا المستخدم مرتبط بالفعل بشركة: ${ownedRes.rows[0].name}` });
+        return;
       }
     }
 
-    const publicId = generateRandomToken('cmp');
-    const newCompanyId = generateRandomToken('cmp');
-    const result = await pool.query(
-      `INSERT INTO companies (id, user_id, city_id, name, logo_url, banner_url, description, rating, reviews_count, verified, public_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 0.0, 0, true, $8)
-       RETURNING *`,
-      [newCompanyId, internalUserId, targetCityId, name, logoUrl || '', bannerUrl || '', description || 'شركة سياحية مرخصة', publicId]
+    const updated = await pool.query(
+      'UPDATE companies SET user_id = $1, pending_owner_email = NULL WHERE id = $2 RETURNING *',
+      [ownerId, company.id]
     );
-
-    const newCompany = result.rows[0];
 
     await logAudit(
-      req.user?.email || 'admin@sdra.com',
-      'فتح وربط شركة جديدة',
-      `تم إنشاء وربط الشركة "${newCompany.name}" للمستخدم رقم ${internalUserId}`,
+      req.user?.email || 'admin',
+      ownerId ? 'ربط شركة بمالك' : 'فك ربط شركة من مالكها',
+      `الشركة "${company.name}" - المالك: ${ownerId || 'بدون'}`,
       req.ip,
-      req.user?.email || 'المسؤول',
-      null,
-      newCompany
+      req.user?.email,
+      { user_id: company.user_id },
+      { user_id: ownerId }
     );
 
-    res.status(201).json({
-      success: true,
-      message: 'تم فتح وربط الشركة للمستخدم بنجاح',
-      data: newCompany,
-    });
+    res.json({ success: true, message: ownerId ? 'تم ربط الشركة بالمستخدم' : 'تم فك ربط الشركة', data: updated.rows[0] });
   } catch (error: any) {
-    console.error('Error creating company for user:', error);
-    res.status(500).json({ error: 'فشل فتح الشركة للمستخدم' });
+    console.error('Error setting company owner:', error);
+    res.status(500).json({ error: 'فشل تحديث مالك الشركة' });
   }
 };
 
@@ -439,6 +485,20 @@ export const deleteUserByAdmin = async (req: AuthRequest, res: Response): Promis
     const internalUserId = await resolveUserId(String(req.params.id));
     if (!internalUserId) {
       res.status(404).json({ error: 'المستخدم غير موجود' });
+      return;
+    }
+
+    const targetRes = await pool.query('SELECT role FROM users WHERE id = $1', [internalUserId]);
+    if (String(internalUserId) === String(req.user?.id)) {
+      res.status(400).json({ error: 'لا يمكنك حذف حسابك من هنا' });
+      return;
+    }
+    if (STAFF_ROLES.includes(targetRes.rows[0]?.role) && !(await canManageStaff(req))) {
+      res.status(403).json({ error: 'حذف المشرفين يتطلب صلاحية إدارة المشرفين' });
+      return;
+    }
+    if (targetRes.rows[0]?.role === 'super_admin' && req.user?.role !== 'super_admin') {
+      res.status(403).json({ error: 'لا يمكن حذف مشرف عام' });
       return;
     }
 
@@ -721,7 +781,7 @@ export const getBookingStagesByAdmin = async (req: AuthRequest, res: Response): 
 
 export const getAllCompanies = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const result = await pool.query('SELECT * FROM companies ORDER BY id DESC');
+    const result = await pool.query('SELECT * FROM companies ORDER BY created_at DESC');
     res.json({ success: true, data: result.rows });
   } catch (error: any) {
     console.error('Error fetching companies:', error);
@@ -753,7 +813,7 @@ export const getAllCities = async (req: AuthRequest, res: Response): Promise<voi
         WHERE city_id IS NOT NULL
         GROUP BY city_id
       ) pkg ON c.id = pkg.city_id
-      ORDER BY c.id ASC
+      ORDER BY c.created_at ASC
     `);
     res.json({ success: true, data: result.rows });
   } catch (error: any) {
@@ -936,6 +996,7 @@ const PUBLIC_SETTING_KEYS = [
   'platform_name', 'currency', 'support_email', 'support_phone', 'whatsapp_number', 'website_url', 'company_address',
   'google_login_enabled', 'google_client_id_web', 'google_client_id_android', 'google_client_id_ios',
   'privacy_policy_title', 'privacy_policy_content', 'privacy_policy_status', 'packages_disclaimer_note',
+  'about_us_content', 'terms_content', 'support_whatsapp_hours', 'support_email_note',
   'profile_required_fields', 'profile_completion_enforced', 'auth_require_email_verification', 'auth_password_min_length',
 ];
 
@@ -1203,7 +1264,7 @@ export const adminGetProducts = async (_req: AuthRequest, res: Response): Promis
       `SELECT p.*, c.name as category_name
        FROM store_products p
        LEFT JOIN store_categories c ON p.category_id = c.id
-       ORDER BY p.id DESC`
+       ORDER BY p.created_at DESC`
     );
     const products = result.rows.map((p) => ({
       ...p,
@@ -1360,7 +1421,7 @@ export const adminGetBanners = async (_req: AuthRequest, res: Response): Promise
        FROM store_banners b
        LEFT JOIN store_products p ON b.product_id = p.id
        LEFT JOIN governorates g ON b.governorate_id = g.id
-       ORDER BY b.id DESC`
+       ORDER BY b.created_at DESC`
     );
     res.json({ success: true, data: result.rows });
   } catch (error: any) {
@@ -1507,6 +1568,34 @@ export const adminUpdateOrderStatus = async (req: AuthRequest, res: Response): P
       return;
     }
 
+    const currentOrder = await pool.query('SELECT status FROM store_orders WHERE id = $1', [id]);
+    if (currentOrder.rows.length === 0) {
+      res.status(404).json({ error: 'الطلب غير موجود' });
+      return;
+    }
+    const previousStatus = currentOrder.rows[0].status || 'pending';
+    const allowedTransitions: Record<string, string[]> = {
+      pending: ['processing', 'cancelled'],
+      processing: ['shipped', 'cancelled'],
+      shipped: ['delivered'],
+      delivered: [],
+      cancelled: [],
+    };
+    if (status !== previousStatus && !(allowedTransitions[previousStatus] || []).includes(status)) {
+      res.status(409).json({ error: 'لا يمكن نقل الطلب إلى هذه الحالة من حالته الحالية' });
+      return;
+    }
+
+    // Cancelled orders give their reserved quantities back to the store
+    if (status === 'cancelled' && previousStatus !== 'cancelled') {
+      await pool.query(
+        `UPDATE store_products p SET stock = p.stock + i.quantity
+         FROM store_order_items i
+         WHERE i.order_id = $1 AND i.product_id = p.id`,
+        [id]
+      );
+    }
+
     const result = await pool.query(
       `UPDATE store_orders
        SET status = $1, updated_at = NOW()
@@ -1569,7 +1658,7 @@ export const getNotificationTemplates = async (req: AuthRequest, res: Response):
       query += ' WHERE system = $1';
       params.push(system);
     }
-    query += ' ORDER BY id ASC';
+    query += ' ORDER BY created_at ASC';
 
     const result = await pool.query(query, params);
     res.json({ success: true, data: result.rows });
@@ -1792,7 +1881,7 @@ export const resetNotificationTemplates = async (req: AuthRequest, res: Response
       );
     }
 
-    const all = await pool.query('SELECT * FROM notification_templates ORDER BY id ASC');
+    const all = await pool.query('SELECT * FROM notification_templates ORDER BY created_at ASC');
 
     await logAudit(
       req.user?.email || 'admin',

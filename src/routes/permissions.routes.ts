@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { authenticate, authorize } from '../middlewares/security.middleware';
+import { requireModulePermission } from '../middlewares/permission.middleware';
 import {
   getPermissionGroups,
   createPermissionGroup,
@@ -9,7 +10,7 @@ import {
 
 const router = Router();
 
-router.use(authenticate, authorize(['admin', 'super_admin']));
+router.use(authenticate, authorize(['admin', 'super_admin']), requireModulePermission('admins'));
 
 router.get('/', getPermissionGroups);
 router.post('/', createPermissionGroup);

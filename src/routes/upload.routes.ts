@@ -49,7 +49,7 @@ const ALLOWED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.heic', '
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const category = (req.query.category as string) || 'general';
-    const subFolder = ['chats', 'companies', 'receipts', 'profiles', 'sounds'].includes(category) ? category : 'general';
+    const subFolder = ['chats', 'companies', 'receipts', 'profiles', 'sounds', 'documents'].includes(category) ? category : 'general';
     const uploadDir = path.join(baseUploadDir, subFolder);
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true });
@@ -122,7 +122,7 @@ router.post('/', authenticate, uploadHandler, (req: AuthRequest, res: Response):
       return;
     }
     const category = (req.query.category as string) || 'general';
-    const subFolder = ['chats', 'companies', 'receipts', 'profiles', 'sounds'].includes(category) ? category : 'general';
+    const subFolder = ['chats', 'companies', 'receipts', 'profiles', 'sounds', 'documents'].includes(category) ? category : 'general';
     const filename = req.file.filename;
 
     const host = req.get('host') || `${req.hostname || 'localhost'}:${process.env.PORT || 5000}`;
@@ -151,7 +151,7 @@ router.post('/base64', authenticate, (req: AuthRequest, res: Response): void => 
     }
 
     const category = (req.query.category as string) || 'general';
-    const subFolder = ['chats', 'companies', 'receipts', 'profiles', 'sounds'].includes(category) ? category : 'general';
+    const subFolder = ['chats', 'companies', 'receipts', 'profiles', 'sounds', 'documents'].includes(category) ? category : 'general';
     const uploadDir = path.join(baseUploadDir, subFolder);
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true });

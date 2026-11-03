@@ -3,12 +3,12 @@ import argon2 from 'argon2';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { env } from '../config/env';
+import type { PoolClient } from 'pg';
 import { pool } from '../config/db';
 import { AuthRequest } from '../middlewares/security.middleware';
 import { safeParseArray } from '../middlewares/permission.middleware';
 import { formatUserId, generate16CharId } from '../utils/formatId';
 import { sendPlatformEmail } from '../utils/mailer';
-import { getCompanyRequestLoginMessage } from './companyRequests.controller';
 import { resolveUserUpload } from '../utils/uploadAccess';
 
 export const issueTokenPair = async (
@@ -391,6 +391,190 @@ export const verifyOtp = async (req: Request, res: Response): Promise<void> => {
   }
 };
 
+const RESET_MAX_ATTEMPTS = 5;
+const RESET_MAX_SENDS_PER_HOUR = 5;
+const BLOCKED_STATUSES = ['banned', 'inactive'];
+// Wrong, expired, locked and unknown-email all answer alike, so the reply never reveals whether an account exists
+const INVALID_RESET_CODE = 'رمز التحقق غير صحيح أو منتهي الصلاحية، يمكنك طلب رمز جديد';
+
+// Bound to the purpose and the account, so a reset code can never pass as an activation code or for another user
+const hashResetCode = (userId: string, code: string): string =>
+  crypto.createHmac('sha256', env.JWT_SECRET).update(`password-reset:${userId}:${code}`).digest('hex');
+
+const findUserForReset = async (email: string) => {
+  const result = await pool.query(
+    'SELECT id, email, password_hash, status FROM users WHERE LOWER(email) = LOWER($1) ORDER BY (email = $1) DESC LIMIT 1',
+    [email]
+  );
+  const user = result.rows[0];
+  return user && !BLOCKED_STATUSES.includes(user.status) ? user : null;
+};
+
+const sendPasswordResetCode = async (email: string): Promise<void> => {
+  const user = await findUserForReset(email);
+  if (!user) return;
+
+  const code = crypto.randomInt(100000, 1000000).toString();
+
+  // One statement, so parallel requests cannot slip past the cooldown or the hourly cap.
+  // Attempts carry over to the new code, so requesting another one cannot buy more guesses.
+  const issued = await pool.query(
+    `INSERT INTO password_resets (user_id, code_hash, expires_at)
+     VALUES ($1, $2, NOW() + INTERVAL '10 minutes')
+     ON CONFLICT (user_id) DO UPDATE SET
+       code_hash = EXCLUDED.code_hash,
+       expires_at = EXCLUDED.expires_at,
+       last_sent_at = NOW(),
+       send_count = CASE WHEN password_resets.window_started_at <= NOW() - INTERVAL '1 hour' THEN 1 ELSE password_resets.send_count + 1 END,
+       window_started_at = CASE WHEN password_resets.window_started_at <= NOW() - INTERVAL '1 hour' THEN NOW() ELSE password_resets.window_started_at END
+     WHERE password_resets.last_sent_at <= NOW() - ($3 * INTERVAL '1 millisecond')
+       AND (password_resets.locked_until IS NULL OR password_resets.locked_until <= NOW())
+       AND (password_resets.window_started_at <= NOW() - INTERVAL '1 hour' OR password_resets.send_count < $4)
+     RETURNING user_id`,
+    [user.id, hashResetCode(user.id, code), OTP_RESEND_COOLDOWN_MS, RESET_MAX_SENDS_PER_HOUR]
+  );
+  if (issued.rows.length === 0) return;
+
+  // Sent to the stored address, never the typed one, which may only match it after case folding
+  const sent = await sendPlatformEmail({
+    to: user.email,
+    fallbackSubject: 'رمز إعادة تعيين كلمة المرور - سدرة',
+    fallbackHtml: `
+      <div style="font-family: Arial, sans-serif; direction: rtl; text-align: right; padding: 24px; background-color: #f8fafc; border-radius: 12px; max-width: 500px; margin: 0 auto; border: 1px solid #e2e8f0;">
+        <h2 style="color: #111827; margin-bottom: 8px;">إعادة تعيين كلمة المرور</h2>
+        <p style="color: #4b5563; font-size: 15px; margin-bottom: 20px;">استخدم الرمز التالي لتعيين كلمة مرور جديدة لحسابك:</p>
+        <div style="font-size: 32px; font-weight: bold; color: #1a4d2e; background: #e8f5e9; padding: 18px; border-radius: 12px; text-align: center; letter-spacing: 6px; margin: 24px 0; border: 1px dashed #2e7d32;">
+          ${code}
+        </div>
+        <p style="color: #64748b; font-size: 13px;">الرمز صالح لمدة 10 دقائق. لا تشاركه مع أي شخص، فلن يطلبه منك فريق سدرة أبداً.</p>
+        <p style="color: #64748b; font-size: 13px;">إذا لم تطلب ذلك فتجاهل هذه الرسالة، وستبقى كلمة مرورك كما هي.</p>
+      </div>
+    `,
+  });
+  if (!sent) console.error('[Password reset] The reset email could not be sent');
+};
+
+export const forgotPassword = async (req: Request, res: Response): Promise<void> => {
+  // Answered before any lookup, so neither the reply nor its timing reveals whether the account exists
+  res.json({
+    success: true,
+    message: 'إذا كان هذا البريد مسجلاً لدينا فستصلك رسالة برمز إعادة التعيين خلال دقائق',
+  });
+
+  sendPasswordResetCode(req.body.email.trim()).catch((error) => {
+    console.error('Forgot password error:', error);
+  });
+};
+
+export const resetPassword = async (req: Request, res: Response): Promise<void> => {
+  let client: PoolClient | undefined;
+  let inTransaction = false;
+  try {
+    const { email, code, newPassword } = req.body;
+    const user = await findUserForReset(email.trim());
+
+    if (!user) {
+      res.status(400).json({ error: INVALID_RESET_CODE });
+      return;
+    }
+
+    // The attempt is counted before comparing, so parallel guesses cannot exceed the limit
+    const attemptRes = await pool.query(
+      `UPDATE password_resets SET attempts = attempts + 1
+       WHERE user_id = $1 AND code_hash IS NOT NULL AND expires_at > NOW()
+         AND attempts < $2 AND (locked_until IS NULL OR locked_until <= NOW())
+       RETURNING code_hash, attempts`,
+      [user.id, RESET_MAX_ATTEMPTS]
+    );
+
+    if (attemptRes.rows.length === 0) {
+      res.status(400).json({ error: INVALID_RESET_CODE });
+      return;
+    }
+
+    const attempt = attemptRes.rows[0];
+    const submitted = Buffer.from(hashResetCode(user.id, code));
+    const stored = Buffer.from(String(attempt.code_hash));
+
+    if (stored.length !== submitted.length || !crypto.timingSafeEqual(stored, submitted)) {
+      if (attempt.attempts >= RESET_MAX_ATTEMPTS) {
+        await pool.query(
+          `UPDATE password_resets SET attempts = 0, code_hash = NULL, expires_at = NULL, locked_until = $1 WHERE user_id = $2`,
+          [new Date(Date.now() + OTP_LOCK_MS), user.id]
+        );
+      }
+      res.status(400).json({ error: INVALID_RESET_CODE });
+      return;
+    }
+
+    // Only reached with the right code, so the code stays valid and this reveals nothing to a stranger
+    let isSamePassword = user.password_hash === newPassword;
+    if (String(user.password_hash || '').startsWith('$')) {
+      isSamePassword = await argon2.verify(user.password_hash, newPassword);
+    }
+    if (isSamePassword) {
+      res.status(400).json({ error: 'كلمة المرور الجديدة يجب أن تختلف عن الحالية' });
+      return;
+    }
+
+    const newHash = await argon2.hash(newPassword);
+
+    client = await pool.connect();
+    await client.query('BEGIN');
+    inTransaction = true;
+
+    // Deleting by the hash makes the code single use even when two correct requests race
+    const consumed = await client.query(
+      'DELETE FROM password_resets WHERE user_id = $1 AND code_hash = $2 RETURNING user_id',
+      [user.id, attempt.code_hash]
+    );
+    if (consumed.rows.length === 0) {
+      await client.query('ROLLBACK');
+      inTransaction = false;
+      res.status(400).json({ error: INVALID_RESET_CODE });
+      return;
+    }
+
+    // The code proved the mailbox, so an account that was still waiting for activation is activated too
+    await client.query(
+      `UPDATE users SET password_hash = $1, is_verified = true,
+         otp_code = NULL, otp_expires_at = NULL, otp_attempts = 0, otp_locked_until = NULL
+       WHERE id = $2`,
+      [newHash, user.id]
+    );
+    await client.query(
+      `UPDATE companies SET user_id = $1, pending_owner_email = NULL WHERE LOWER(pending_owner_email) = LOWER($2)`,
+      [user.id, user.email]
+    );
+    // Whoever knew the old password loses their sessions on every app
+    await client.query('UPDATE refresh_tokens SET is_revoked = TRUE WHERE user_id = $1', [user.id]);
+
+    await client.query('COMMIT');
+    inTransaction = false;
+
+    res.json({ success: true, message: 'تم تغيير كلمة المرور بنجاح، يمكنك تسجيل الدخول الآن' });
+
+    // Tells the real owner if this was not them. Not awaited: the password has already changed.
+    sendPlatformEmail({
+      to: user.email,
+      fallbackSubject: 'تم تغيير كلمة مرور حسابك - سدرة',
+      fallbackHtml: `
+        <div style="font-family: Arial, sans-serif; direction: rtl; text-align: right; padding: 24px; background-color: #f8fafc; border-radius: 12px; max-width: 500px; margin: 0 auto; border: 1px solid #e2e8f0;">
+          <h2 style="color: #111827; margin-bottom: 8px;">تم تغيير كلمة المرور</h2>
+          <p style="color: #4b5563; font-size: 15px;">تم تغيير كلمة مرور حسابك وتسجيل خروجك من جميع الأجهزة.</p>
+          <p style="color: #b91c1c; font-size: 14px;">إذا لم تقم بذلك، فأعد تعيين كلمة المرور فوراً وتواصل مع الدعم الفني.</p>
+        </div>
+      `,
+    }).catch((error) => console.error('[Password reset] Confirmation email failed:', error));
+  } catch (error: any) {
+    if (inTransaction) await client?.query('ROLLBACK').catch(() => {});
+    console.error('Reset password error:', error);
+    if (!res.headersSent) res.status(500).json({ error: 'تعذر تغيير كلمة المرور، يرجى المحاولة لاحقاً' });
+  } finally {
+    client?.release();
+  }
+};
+
 export const login = async (req: Request, res: Response): Promise<void> => {
   try {
     const { email, password } = req.body;
@@ -400,11 +584,6 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       [email.trim()]
     );
     if (userResult.rows.length === 0) {
-      const requestMessage = await getCompanyRequestLoginMessage(email.trim(), password);
-      if (requestMessage) {
-        res.status(403).json({ error: requestMessage });
-        return;
-      }
       res.status(401).json({ error: 'البريد الإلكتروني أو كلمة المرور غير صحيحة' });
       return;
     }

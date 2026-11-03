@@ -1007,12 +1007,28 @@ export const initDB = async () => {
       CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family_id);
     `);
 
-    // Company registration requests: password_hash moves to users on approval, only then is an account created
+    // Kept out of the users table so reset codes can never leak through a SELECT * on users
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS password_resets (
+        user_id VARCHAR(16) PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        code_hash VARCHAR(64),
+        expires_at TIMESTAMPTZ,
+        attempts INT NOT NULL DEFAULT 0,
+        locked_until TIMESTAMPTZ,
+        last_sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        send_count INT NOT NULL DEFAULT 1,
+        window_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    // Company registration requests belong to a signed-in account, one open request per account
     await pool.query(`
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS license_number VARCHAR(100);
       ALTER TABLE companies ADD COLUMN IF NOT EXISTS tax_number VARCHAR(100);
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS contact_email VARCHAR(255);
       CREATE TABLE IF NOT EXISTS company_requests (
         id VARCHAR(16) PRIMARY KEY,
+        user_id VARCHAR(16) REFERENCES users(id) ON DELETE CASCADE,
         status VARCHAR(20) NOT NULL DEFAULT 'pending',
         status_reason TEXT,
         company_name VARCHAR(255) NOT NULL,
@@ -1025,14 +1041,17 @@ export const initDB = async () => {
         tax_number VARCHAR(100),
         license_doc_url TEXT,
         logo_url TEXT,
-        password_hash VARCHAR(255),
         company_id VARCHAR(16) REFERENCES companies(id) ON DELETE SET NULL,
         reviewed_by VARCHAR(255),
         reviewed_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_company_requests_active_email
-        ON company_requests (LOWER(email)) WHERE status IN ('pending', 'under_review', 'on_hold');
+      -- Upgrades the first version of this table, which stored a password hash and identified applicants by email
+      ALTER TABLE company_requests ADD COLUMN IF NOT EXISTS user_id VARCHAR(16) REFERENCES users(id) ON DELETE CASCADE;
+      ALTER TABLE company_requests DROP COLUMN IF EXISTS password_hash;
+      DROP INDEX IF EXISTS idx_company_requests_active_email;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_company_requests_active_user
+        ON company_requests (user_id) WHERE status IN ('pending', 'under_review', 'on_hold');
     `);
 
     console.log('✅ Database tables initialized successfully with 16-character secure alphanumeric IDs.');

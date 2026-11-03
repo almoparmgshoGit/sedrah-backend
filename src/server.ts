@@ -9,10 +9,10 @@ import pino from 'pino';
 import pinoHttp from 'pino-http';
 import { env } from './config/env';
 import { pool } from './config/db';
-import { globalLimiter, authLimiter, authenticate, verifyOwnershipOrAdmin, AuthRequest } from './middlewares/security.middleware';
-import { registerSchema, loginSchema, updateProfileSchema, sendOtpSchema, verifyOtpSchema, companyRequestSchema } from './validators/auth.validator';
-import { createCompanyRequest } from './controllers/companyRequests.controller';
-import { register, login, sendOtp, verifyOtp, getUserProfile, updateUserProfile, getCurrentUser, updateMyProfile, getProfileStatus, googleLogin, deleteMyAccount, generateGuestToken, handleRefreshToken, logoutUser } from './controllers/auth.controller';
+import { globalLimiter, authLimiter, passwordResetLimiter, authenticate, verifyOwnershipOrAdmin, AuthRequest } from './middlewares/security.middleware';
+import { registerSchema, loginSchema, updateProfileSchema, sendOtpSchema, verifyOtpSchema, forgotPasswordSchema, resetPasswordSchema, companyRequestSchema, companyRequestDocumentSchema } from './validators/auth.validator';
+import { createCompanyRequest, getMyCompanyRequest, resubmitMyCompanyRequestDocument } from './controllers/companyRequests.controller';
+import { register, login, sendOtp, verifyOtp, forgotPassword, resetPassword, getUserProfile, updateUserProfile, getCurrentUser, updateMyProfile, getProfileStatus, googleLogin, deleteMyAccount, generateGuestToken, handleRefreshToken, logoutUser } from './controllers/auth.controller';
 import { getPublicSettings } from './controllers/admin.controller';
 import citiesRouter from './routes/cities.routes';
 import governoratesRouter from './routes/governorates.routes';
@@ -303,13 +303,19 @@ app.post('/api/auth/register', authLimiter, validate(registerSchema), register);
 app.post('/api/auth/send-otp', authLimiter, validate(sendOtpSchema), sendOtp);
 app.post('/api/auth/verify-otp', authLimiter, validate(verifyOtpSchema), verifyOtp);
 app.post('/api/auth/login', authLimiter, validate(loginSchema), login);
+app.post('/api/auth/forgot-password', passwordResetLimiter, validate(forgotPasswordSchema), forgotPassword);
+app.post('/api/auth/reset-password', passwordResetLimiter, validate(resetPasswordSchema), resetPassword);
 app.post('/api/auth/google', authLimiter, googleLogin);
 app.post('/api/auth/guest-token', generateGuestToken);
 app.post('/api/auth/refresh-token', handleRefreshToken);
-app.post('/api/company-requests', authLimiter, validate(companyRequestSchema), createCompanyRequest);
 
 // Default Deny: All other /api/* routes require a valid JWT token (Guest, Customer, Company, or Admin)
 app.use('/api', authenticate);
+
+// Company registration: guests are refused by authenticate, since these paths are not on its allowlist
+app.post('/api/company-requests', authLimiter, validate(companyRequestSchema), createCompanyRequest);
+app.get('/api/company-requests/my', getMyCompanyRequest);
+app.post('/api/company-requests/my/document', authLimiter, validate(companyRequestDocumentSchema), resubmitMyCompanyRequestDocument);
 
 app.post('/api/auth/logout', logoutUser);
 app.get('/api/auth/me', getCurrentUser);

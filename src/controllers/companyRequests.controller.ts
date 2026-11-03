@@ -1,5 +1,4 @@
 import { Request, Response } from 'express';
-import argon2 from 'argon2';
 import fs from 'fs';
 import path from 'path';
 import { PoolClient } from 'pg';
@@ -8,20 +7,20 @@ import { AuthRequest } from '../middlewares/security.middleware';
 import { generate16CharId, generateRandomToken } from '../utils/formatId';
 import { logAudit } from '../utils/auditLogger';
 import { sendPlatformEmail } from '../utils/mailer';
-import { getPublicServerUrl } from '../utils/uploadAccess';
+import { getPublicServerUrl, recordUpload } from '../utils/uploadAccess';
 import { notifyCitySubscribers } from './cities.controller';
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
-// The endpoint is public, so only inert image types get served back from our domain (no SVG or PDF)
+const MAX_REASON_LENGTH = 1000;
+// Only inert image types get served back from our domain (no SVG or PDF)
 const IMAGE_EXTENSIONS: Record<string, string> = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' };
 const uploadsDir = path.join(__dirname, '../../uploads');
 
 const ACTIVE_STATUSES = ['pending', 'under_review', 'on_hold'];
 const REVIEW_STATUSES = ['under_review', 'on_hold', 'approved', 'rejected'];
 
-// Every column except password_hash, which must never reach the dashboard
-const PUBLIC_COLUMNS = `id, status, status_reason, company_name, governorate, city, phone, email, address,
-  license_number, tax_number, license_doc_url, logo_url, company_id, reviewed_by, reviewed_at, created_at`;
+// Staff identity (reviewed_by) stays out of what the applicant receives
+const APPLICANT_COLUMNS = 'id, status, status_reason, company_name, license_number, email, created_at, reviewed_at';
 
 class InvalidImageError extends Error {}
 
@@ -35,31 +34,31 @@ const decodeImage = (dataUri?: string | null): { buffer: Buffer; ext: string } |
   return { buffer, ext };
 };
 
-const saveImage = (req: Request, image: { buffer: Buffer; ext: string } | null, folder: string): string | null => {
+// Recording the upload is what lets the applicant open their own protected document later
+const saveImage = async (req: Request, image: { buffer: Buffer; ext: string } | null, folder: string, userId: string): Promise<string | null> => {
   if (!image) return null;
   const dir = path.join(uploadsDir, folder);
   fs.mkdirSync(dir, { recursive: true });
   const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${image.ext}`;
   fs.writeFileSync(path.join(dir, filename), image.buffer);
+  await recordUpload(filename, folder, userId);
   return `${getPublicServerUrl(req)}/uploads/${folder}/${filename}`;
 };
 
 const escapeHtml = (text: string) =>
   text.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
 
-const sendStatusEmail = async (request: any, status: string, reason: string | null, linkedExistingAccount: boolean) => {
-  const name = escapeHtml(request.company_name);
+const sendStatusEmail = async (to: string, companyName: string, status: string, reason: string | null) => {
+  const name = escapeHtml(companyName);
   const reasonHtml = reason ? `<p><strong>السبب:</strong> ${escapeHtml(reason)}</p>` : '';
   const messages: Record<string, { subject: string; body: string }> = {
     approved: {
       subject: 'تم قبول طلب تسجيل شركتك - سدرة',
-      body: linkedExistingAccount
-        ? `<p>تم قبول طلب تسجيل شركة <strong>${name}</strong>، وتم ربطها بحسابك الحالي في سدرة. سجّل الدخول في تطبيق سدرة للشركات ببيانات حسابك الحالي.</p>`
-        : `<p>تم قبول طلب تسجيل شركة <strong>${name}</strong>. سجّل الدخول في تطبيق سدرة للشركات بالبريد وكلمة المرور اللذين أدخلتهما في الطلب، وسيصلك رمز تحقق لتفعيل حسابك عند أول دخول.</p>`,
+      body: `<p>تم قبول طلب تسجيل شركة <strong>${name}</strong>. افتح تطبيق سدرة للشركات لبدء إدارة شركتك.</p>`,
     },
     on_hold: {
-      subject: 'تم تعليق طلب تسجيل شركتك - سدرة',
-      body: `<p>تم تعليق طلب تسجيل شركة <strong>${name}</strong> مؤقتًا.</p>${reasonHtml}`,
+      subject: 'طلب تسجيل شركتك يحتاج إلى استكمال - سدرة',
+      body: `<p>يحتاج طلب تسجيل شركة <strong>${name}</strong> إلى استكمال.</p>${reasonHtml}<p>افتح تطبيق سدرة للشركات لرفع المستند المطلوب.</p>`,
     },
     rejected: {
       subject: 'تم رفض طلب تسجيل شركتك - سدرة',
@@ -71,7 +70,7 @@ const sendStatusEmail = async (request: any, status: string, reason: string | nu
   if (!message) return;
   try {
     await sendPlatformEmail({
-      to: request.email,
+      to,
       fallbackSubject: message.subject,
       fallbackHtml: `<div style="font-family: Arial, sans-serif; direction: rtl; text-align: right; padding: 24px;">${message.body}</div>`,
     });
@@ -80,44 +79,51 @@ const sendStatusEmail = async (request: any, status: string, reason: string | nu
   }
 };
 
-export const createCompanyRequest = async (req: Request, res: Response): Promise<void> => {
+export const createCompanyRequest = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { companyName, governorate, city, phone, address, licenseNumber, taxNumber, password, licenseDoc, logo } = req.body;
-    const email = req.body.email.trim().toLowerCase();
+    // The owner always comes from the token, never from the request body
+    const userId = String(req.user!.id);
+    const { companyName, governorate, city, phone, email, address, licenseNumber, taxNumber, licenseDoc, logo } = req.body;
 
     const licenseImage = decodeImage(licenseDoc);
     const logoImage = decodeImage(logo);
 
-    const existingUser = await pool.query('SELECT 1 FROM users WHERE LOWER(email) = $1', [email]);
-    if (existingUser.rows.length > 0) {
-      res.status(409).json({ error: 'هذا البريد الإلكتروني مسجل بالفعل في سدرة، يرجى استخدام بريد آخر' });
+    const userRes = await pool.query('SELECT is_verified FROM users WHERE id = $1', [userId]);
+    if (userRes.rows[0]?.is_verified !== true) {
+      res.status(403).json({ error: 'يرجى تفعيل حسابك برمز التحقق قبل تقديم طلب تسجيل شركة' });
+      return;
+    }
+
+    const ownedCompany = await pool.query('SELECT 1 FROM companies WHERE user_id = $1 LIMIT 1', [userId]);
+    if (ownedCompany.rows.length > 0) {
+      res.status(409).json({ error: 'حسابك مرتبط بشركة بالفعل' });
       return;
     }
 
     const activeRequest = await pool.query(
-      'SELECT 1 FROM company_requests WHERE LOWER(email) = $1 AND status = ANY($2)',
-      [email, ACTIVE_STATUSES]
+      'SELECT 1 FROM company_requests WHERE user_id = $1 AND status = ANY($2)',
+      [userId, ACTIVE_STATUSES]
     );
     if (activeRequest.rows.length > 0) {
-      res.status(409).json({ error: 'يوجد طلب قيد المراجعة بهذا البريد الإلكتروني' });
+      res.status(409).json({ error: 'لديك طلب قيد المراجعة بالفعل' });
       return;
     }
 
-    const passwordHash = await argon2.hash(password);
-    const id = generate16CharId();
-    await pool.query(
+    const created = await pool.query(
       `INSERT INTO company_requests (
-        id, company_name, governorate, city, phone, email, address, license_number, tax_number,
-        license_doc_url, logo_url, password_hash
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        id, user_id, company_name, governorate, city, phone, email, address, license_number, tax_number,
+        license_doc_url, logo_url
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      RETURNING ${APPLICANT_COLUMNS}`,
       [
-        id, companyName.trim(), governorate.trim(), city.trim(), phone.trim(), email, address.trim(),
-        licenseNumber.trim(), taxNumber?.trim() || null,
-        saveImage(req, licenseImage, 'documents'), saveImage(req, logoImage, 'companies'), passwordHash,
+        generate16CharId(), userId, companyName.trim(), governorate.trim(), city.trim(), phone.trim(),
+        email.trim().toLowerCase(), address.trim(), licenseNumber.trim(), taxNumber?.trim() || null,
+        await saveImage(req, licenseImage, 'documents', userId),
+        await saveImage(req, logoImage, 'companies', userId),
       ]
     );
 
-    res.status(201).json({ success: true, message: 'تم إرسال طلب تسجيل الشركة بنجاح', data: { id } });
+    res.status(201).json({ success: true, message: 'تم إرسال طلب تسجيل الشركة بنجاح', data: created.rows[0] });
   } catch (error: any) {
     if (error instanceof InvalidImageError) {
       res.status(400).json({ error: error.message });
@@ -125,7 +131,7 @@ export const createCompanyRequest = async (req: Request, res: Response): Promise
     }
     // Two submissions raced past the check above and the partial unique index caught the second
     if (error.code === '23505') {
-      res.status(409).json({ error: 'يوجد طلب قيد المراجعة بهذا البريد الإلكتروني' });
+      res.status(409).json({ error: 'لديك طلب قيد المراجعة بالفعل' });
       return;
     }
     console.error('Error creating company request:', error);
@@ -133,12 +139,70 @@ export const createCompanyRequest = async (req: Request, res: Response): Promise
   }
 };
 
+export const getMyCompanyRequest = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const result = await pool.query(
+      `SELECT ${APPLICANT_COLUMNS} FROM company_requests WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [String(req.user!.id)]
+    );
+    res.json({ success: true, data: result.rows[0] || null });
+  } catch (error: any) {
+    console.error('Error fetching my company request:', error);
+    res.status(500).json({ error: 'فشل جلب طلب تسجيل الشركة' });
+  }
+};
+
+// The applicant's answer to "تعليق": a clearer document sends the request back to the review queue.
+export const resubmitMyCompanyRequestDocument = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = String(req.user!.id);
+    const image = decodeImage(req.body.licenseDoc);
+
+    const heldRequest = await pool.query(
+      `SELECT id FROM company_requests WHERE user_id = $1 AND status = 'on_hold' ORDER BY created_at DESC LIMIT 1`,
+      [userId]
+    );
+    if (heldRequest.rows.length === 0) {
+      res.status(409).json({ error: 'لا يوجد طلب بانتظار استكمال المستندات' });
+      return;
+    }
+
+    const updated = await pool.query(
+      `UPDATE company_requests
+       SET license_doc_url = $1, status = 'pending', status_reason = NULL, reviewed_by = NULL, reviewed_at = NULL
+       WHERE id = $2 AND user_id = $3 AND status = 'on_hold'
+       RETURNING ${APPLICANT_COLUMNS}`,
+      [await saveImage(req, image, 'documents', userId), heldRequest.rows[0].id, userId]
+    );
+    if (updated.rows.length === 0) {
+      res.status(409).json({ error: 'لا يوجد طلب بانتظار استكمال المستندات' });
+      return;
+    }
+
+    res.json({ success: true, message: 'تم رفع المستند وإعادة الطلب للمراجعة', data: updated.rows[0] });
+  } catch (error: any) {
+    if (error instanceof InvalidImageError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    console.error('Error resubmitting company request document:', error);
+    res.status(500).json({ error: 'فشل رفع المستند' });
+  }
+};
+
+const ADMIN_SELECT = `
+  SELECT cr.id, cr.status, cr.status_reason, cr.company_name, cr.governorate, cr.city, cr.phone, cr.email, cr.address,
+         cr.license_number, cr.tax_number, cr.license_doc_url, cr.logo_url, cr.company_id, cr.reviewed_by, cr.reviewed_at,
+         cr.created_at, cr.user_id, u.name AS owner_name, u.email AS owner_email
+  FROM company_requests cr
+  LEFT JOIN users u ON cr.user_id = u.id`;
+
 export const getCompanyRequests = async (req: Request, res: Response): Promise<void> => {
   try {
     const { status } = req.query;
     const result = status
-      ? await pool.query(`SELECT ${PUBLIC_COLUMNS} FROM company_requests WHERE status = $1 ORDER BY created_at DESC`, [String(status)])
-      : await pool.query(`SELECT ${PUBLIC_COLUMNS} FROM company_requests ORDER BY created_at DESC`);
+      ? await pool.query(`${ADMIN_SELECT} WHERE cr.status = $1 ORDER BY cr.created_at DESC`, [String(status)])
+      : await pool.query(`${ADMIN_SELECT} ORDER BY cr.created_at DESC`);
     res.json({ success: true, data: result.rows });
   } catch (error: any) {
     console.error('Error fetching company requests:', error);
@@ -146,25 +210,16 @@ export const getCompanyRequests = async (req: Request, res: Response): Promise<v
   }
 };
 
-// Runs inside the review transaction, so a failure leaves neither a user nor a company behind.
-const createCompanyFromRequest = async (client: PoolClient, request: any) => {
-  const existingUser = await client.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [request.email]);
-  const linkedExistingAccount = existingUser.rows.length > 0;
-  let userId: string;
+class ReviewConflictError extends Error {}
 
-  if (linkedExistingAccount) {
-    // The address gained an account after the request was sent (customer app or Google).
-    // That account's password stays: the one in this request never proved ownership of the email.
-    userId = existingUser.rows[0].id;
-  } else {
-    // Role stays 'user': 'owner' means platform owner here and would open the admin routes.
-    // is_verified = false is what makes the first login ask for the OTP.
-    userId = generate16CharId();
-    await client.query(
-      `INSERT INTO users (id, name, email, password_hash, phone, role, balance, is_verified)
-       VALUES ($1, $2, $3, $4, $5, 'user', 0.00, false)`,
-      [userId, request.company_name, request.email, request.password_hash, request.phone]
-    );
+// Runs inside the review transaction, so a failure leaves no company behind.
+const createCompanyFromRequest = async (client: PoolClient, request: any) => {
+  if (!request.user_id) {
+    throw new ReviewConflictError('هذا الطلب قديم وغير مرتبط بحساب، يرجى رفضه ليعيد صاحبه التقديم من حسابه');
+  }
+  const ownedCompany = await client.query('SELECT 1 FROM companies WHERE user_id = $1 LIMIT 1', [request.user_id]);
+  if (ownedCompany.rows.length > 0) {
+    throw new ReviewConflictError('صاحب هذا الطلب مرتبط بشركة أخرى بالفعل');
   }
 
   const governorateName = String(request.governorate).replace(/^محافظة\s+/, '').trim();
@@ -175,19 +230,20 @@ const createCompanyFromRequest = async (client: PoolClient, request: any) => {
     .filter((part, index) => index === 0 || !request.address.includes(part))
     .join('، ');
 
+  // The account keeps role 'user': 'owner' means platform owner here and would open the admin routes
   const companyId = generate16CharId();
   await client.query(
     `INSERT INTO companies (
-      id, user_id, city_id, name, description, short_description, phone, address, logo_url,
+      id, user_id, city_id, name, description, short_description, phone, contact_email, address, logo_url,
       commercial_register_url, license_number, tax_number, field_verified, verified, rating, reviews_count, public_id
-    ) VALUES ($1, $2, $3, $4, '', '', $5, $6, $7, $8, $9, $10, false, false, 0.0, 0, $11)`,
+    ) VALUES ($1, $2, $3, $4, '', '', $5, $6, $7, $8, $9, $10, $11, false, false, 0.0, 0, $12)`,
     [
-      companyId, userId, cityId, request.company_name, request.phone, fullAddress, request.logo_url,
+      companyId, request.user_id, cityId, request.company_name, request.phone, request.email, fullAddress, request.logo_url,
       request.license_doc_url, request.license_number, request.tax_number, generateRandomToken('cmp'),
     ]
   );
 
-  return { companyId, cityId, linkedExistingAccount };
+  return { companyId, cityId };
 };
 
 export const updateCompanyRequestStatus = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -198,38 +254,36 @@ export const updateCompanyRequestStatus = async (req: AuthRequest, res: Response
     res.status(400).json({ error: 'حالة الطلب غير صالحة' });
     return;
   }
+  if (reason && reason.length > MAX_REASON_LENGTH) {
+    res.status(400).json({ error: 'السبب طويل جدًا' });
+    return;
+  }
 
   const client = await pool.connect();
+  let inTransaction = false;
   let released = false;
   try {
     await client.query('BEGIN');
+    inTransaction = true;
 
     const requestRes = await client.query('SELECT * FROM company_requests WHERE id = $1 FOR UPDATE', [String(req.params.id)]);
-    if (requestRes.rows.length === 0) {
-      await client.query('ROLLBACK');
-      res.status(404).json({ error: 'الطلب غير موجود' });
-      return;
-    }
-
     const request = requestRes.rows[0];
+    if (!request) throw new ReviewConflictError('الطلب غير موجود');
     if (!ACTIVE_STATUSES.includes(request.status)) {
-      await client.query('ROLLBACK');
-      res.status(409).json({ error: 'تم البت في هذا الطلب مسبقًا ولا يمكن تغيير حالته' });
-      return;
+      throw new ReviewConflictError('تم البت في هذا الطلب مسبقًا ولا يمكن تغيير حالته');
     }
 
     const approval = status === 'approved' ? await createCompanyFromRequest(client, request) : null;
 
-    const updated = await client.query(
+    await client.query(
       `UPDATE company_requests
-       SET status = $1::varchar, status_reason = $2, company_id = $3, reviewed_by = $4, reviewed_at = CURRENT_TIMESTAMP,
-           password_hash = CASE WHEN $1::varchar = 'approved' THEN NULL ELSE password_hash END
-       WHERE id = $5
-       RETURNING ${PUBLIC_COLUMNS}`,
+       SET status = $1, status_reason = $2, company_id = $3, reviewed_by = $4, reviewed_at = CURRENT_TIMESTAMP
+       WHERE id = $5`,
       [status, status === 'on_hold' || status === 'rejected' ? reason : null, approval?.companyId || null, req.user?.email || null, request.id]
     );
 
     await client.query('COMMIT');
+    inTransaction = false;
     client.release();
     released = true;
 
@@ -241,39 +295,24 @@ export const updateCompanyRequestStatus = async (req: AuthRequest, res: Response
     await logAudit(
       req.user?.email || 'admin@sdra.com',
       'مراجعة طلب تسجيل شركة',
-      `تم تغيير حالة طلب شركة "${request.company_name}" (${request.email}) إلى: ${status}${reason ? ` - السبب: ${reason}` : ''}`,
+      `تم تغيير حالة طلب شركة "${request.company_name}" إلى: ${status}${reason ? ` - السبب: ${reason}` : ''}`,
       req.ip,
       req.user?.email || 'المسؤول'
     );
 
-    await sendStatusEmail(request, status, reason, !!approval?.linkedExistingAccount);
+    const updated = await pool.query(`${ADMIN_SELECT} WHERE cr.id = $1`, [request.id]);
+    await sendStatusEmail(updated.rows[0].owner_email || request.email, request.company_name, status, reason);
 
-    res.json({
-      success: true,
-      message: 'تم تحديث حالة الطلب بنجاح',
-      data: { ...updated.rows[0], linked_existing_account: !!approval?.linkedExistingAccount },
-    });
+    res.json({ success: true, message: 'تم تحديث حالة الطلب بنجاح', data: updated.rows[0] });
   } catch (error: any) {
-    if (!released) await client.query('ROLLBACK').catch(() => {});
+    if (inTransaction) await client.query('ROLLBACK').catch(() => {});
+    if (error instanceof ReviewConflictError) {
+      res.status(409).json({ error: error.message });
+      return;
+    }
     console.error('Error updating company request status:', error);
     res.status(500).json({ error: 'فشل تحديث حالة الطلب' });
   } finally {
     if (!released) client.release();
   }
-};
-
-// Tells an applicant with the right password why they cannot sign in yet. Null keeps the normal "wrong credentials" answer.
-export const getCompanyRequestLoginMessage = async (email: string, password: string): Promise<string | null> => {
-  const result = await pool.query(
-    'SELECT status, status_reason, password_hash FROM company_requests WHERE LOWER(email) = LOWER($1) ORDER BY created_at DESC LIMIT 1',
-    [email]
-  );
-  const request = result.rows[0];
-  if (!request?.password_hash || !(await argon2.verify(request.password_hash, password))) return null;
-
-  const reason = request.status_reason ? ` السبب: ${request.status_reason}` : '';
-  if (request.status === 'on_hold') return `طلب تسجيل شركتك معلّق حاليًا.${reason}`;
-  if (request.status === 'rejected') return `تم رفض طلب تسجيل شركتك.${reason} يمكنك تقديم طلب جديد.`;
-  if (ACTIVE_STATUSES.includes(request.status)) return 'طلب تسجيل شركتك قيد المراجعة، وسيمكنك الدخول بعد قبوله.';
-  return null;
 };

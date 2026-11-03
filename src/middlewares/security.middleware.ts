@@ -21,6 +21,15 @@ export const authLimiter = rateLimit({
   message: { error: 'Too many authentication attempts, please try again later.' },
 });
 
+// Each reset request can send an email or run argon2, so it gets a tighter limit than other auth routes
+export const passwordResetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'محاولات كثيرة، يرجى المحاولة بعد 15 دقيقة' },
+});
+
 // Interface for Authenticated Request
 export interface AuthRequest extends Request {
   user?: {

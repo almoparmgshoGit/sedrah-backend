@@ -35,7 +35,7 @@ export const requireModulePermission = (moduleName: string) => {
       }
 
       // Super admins and owners always have full access
-      if (req.user.role === 'super_admin' || (req.user.role as string) === 'owner' || req.user.email === 'admin@sdra.com') {
+      if (req.user.role === 'super_admin' || (req.user.role as string) === 'owner') {
         return next();
       }
 

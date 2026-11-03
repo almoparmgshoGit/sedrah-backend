@@ -31,10 +31,12 @@ import couponsRouter from './routes/coupons.routes';
 import permissionsRouter from './routes/permissions.routes';
 import path from 'path';
 import { AnyZodObject } from 'zod';
+import { UPLOAD_CATEGORIES, SENSITIVE_UPLOAD_CATEGORIES, canAccessUpload } from './utils/uploadAccess';
 
 // Initialize Pino logger for secure, structured auditing
 const logger = pino({
   level: env.NODE_ENV === 'production' ? 'info' : 'debug',
+  redact: ['req.headers.authorization', 'req.headers.cookie'],
   transport: env.NODE_ENV !== 'production' ? { target: 'pino-pretty' } : undefined,
 });
 
@@ -191,54 +193,81 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // 4. Pino HTTP Request Logger Middleware
-app.use(pinoHttp({ logger }));
+app.use(pinoHttp({
+  logger,
+  serializers: {
+    req: (req: any) => ({ ...req, url: String(req.url || '').replace(/([?&]token=)[^&]*/, '$1[REDACTED]') }),
+  },
+}));
 
 // 5. Global Rate Limiter
 app.use('/api/', globalLimiter);
 
 // Secure Uploads Access Middleware for sensitive folders (receipts, chats, profiles, documents)
 const baseUploadDir = path.join(__dirname, '../uploads');
-app.get('/uploads/:category/:filename', (req: Request, res: Response): void => {
-  const { category, filename } = req.params;
-  const rawCat = Array.isArray(category) ? category[0] : category;
-  const rawFile = Array.isArray(filename) ? filename[0] : filename;
-  const safeCategory = path.basename(String(rawCat || ''));
-  const safeFilename = path.basename(String(rawFile || ''));
-  const filePath = path.join(baseUploadDir, safeCategory, safeFilename);
+const INLINE_UPLOAD_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif', '.svg', '.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac'];
 
-  if (!fs.existsSync(filePath)) {
-    res.status(404).json({ error: 'الملف غير موجود' });
-    return;
-  }
+app.get('/uploads/:category/:filename', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const category = String(req.params.category || '');
+    const filename = String(req.params.filename || '');
 
-  const sensitiveFolders = ['receipts', 'chats', 'profiles', 'documents'];
-  if (sensitiveFolders.includes(safeCategory)) {
-    const authHeader = req.headers.authorization;
-    const queryToken = req.query.token as string;
-    let token = queryToken;
-    if (!token && authHeader && authHeader.startsWith('Bearer ')) {
-      token = authHeader.split(' ')[1];
+    // Exact folder match: blocks "..", and case variants on case-insensitive file systems
+    if (!UPLOAD_CATEGORIES.includes(category) || /[/\\:]/.test(filename) || filename.startsWith('.')) {
+      res.status(404).json({ error: 'الملف غير موجود' });
+      return;
     }
 
-    let isAuthorized = false;
-    if (token) {
-      try {
-        const decoded = jwt.verify(token, env.JWT_SECRET) as any;
-        isAuthorized = decoded.role !== 'guest' && decoded.aud !== 'sdra-guest';
-      } catch (e) {
-        isAuthorized = false;
+    if (SENSITIVE_UPLOAD_CATEGORIES.includes(category)) {
+      const authHeader = req.headers.authorization;
+      let token = typeof req.query.token === 'string' ? req.query.token : '';
+      if (!token && authHeader && authHeader.startsWith('Bearer ')) {
+        token = authHeader.split(' ')[1];
+      }
+
+      let isAuthorized = false;
+      if (token) {
+        try {
+          const decoded = jwt.verify(token, env.JWT_SECRET) as any;
+          if (decoded.role !== 'guest' && decoded.aud !== 'sdra-guest') {
+            isAuthorized = await canAccessUpload(String(decoded.id), filename);
+          }
+        } catch (e) {
+          isAuthorized = false;
+        }
+      }
+
+      if (!isAuthorized) {
+        res.status(403).json({ error: 'غير مصرح بالوصول إلى هذا المستند الحساس. يتطلب تسجيل دخول صالح وتوكن مصادقة.' });
+        return;
       }
     }
 
-    if (!isAuthorized) {
-      res.status(403).json({ error: 'غير مصرح بالوصول إلى هذا المستند الحساس. يتطلب تسجيل دخول صالح وتوكن مصادقة.' });
+    const filePath = path.join(baseUploadDir, category, filename);
+    if (!fs.existsSync(filePath)) {
+      res.status(404).json({ error: 'الملف غير موجود' });
       return;
     }
-  }
 
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-  res.sendFile(filePath);
+    // Uploaded content is never allowed to run scripts on the API origin
+    const ext = path.extname(filename).toLowerCase();
+    if (ext === '.pdf') {
+      res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; object-src 'self'");
+    } else {
+      res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'; sandbox");
+      if (!INLINE_UPLOAD_EXTENSIONS.includes(ext)) {
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Disposition', 'attachment');
+      }
+    }
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.sendFile(filePath);
+  } catch (error) {
+    logger.error(error);
+    res.status(500).json({ error: 'تعذر جلب الملف' });
+  }
 });
 
 // Zod Validation Middleware Factory

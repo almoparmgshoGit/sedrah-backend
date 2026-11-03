@@ -1,8 +1,6 @@
 import { Response } from 'express';
-import jwt from 'jsonwebtoken';
 import { AuthRequest } from '../middlewares/security.middleware';
 import { pool } from '../config/db';
-import { env } from '../config/env';
 import { generate16CharId } from '../utils/formatId';
 import { logAudit } from '../utils/auditLogger';
 import { sendPushToUsers, sendPushToAllTokens } from '../utils/pushNotification';
@@ -66,30 +64,9 @@ export const markNotificationAsRead = async (req: AuthRequest, res: Response): P
  */
 export const registerPushToken = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { token, userId, platform, projectId } = req.body;
-    let effectiveUserId: string | null = null;
-
-    if (userId) {
-      const cleanUserId = String(userId).trim().replace(/^usr_/, '');
-      const uMatch = await pool.query('SELECT id FROM users WHERE id = $1 OR public_id = $1', [cleanUserId]);
-      if (uMatch.rows.length > 0) {
-        effectiveUserId = uMatch.rows[0].id;
-      }
-    }
-
-    if (!effectiveUserId && req.user?.id) {
-      effectiveUserId = req.user.id;
-    }
-
-    if (!effectiveUserId && req.headers?.authorization?.startsWith('Bearer ')) {
-      try {
-        const tokenStr = req.headers.authorization.split(' ')[1];
-        const decoded = jwt.verify(tokenStr, env.JWT_SECRET) as any;
-        if (decoded?.id) {
-          effectiveUserId = String(decoded.id);
-        }
-      } catch (err) {}
-    }
+    const { token, platform, projectId } = req.body;
+    // The owner is always the logged-in user; a user id in the body is ignored
+    const effectiveUserId: string | null = req.user?.id ? String(req.user.id) : null;
 
     if (!token || typeof token !== 'string') {
       res.status(400).json({ error: 'التوكن مطلوب وصالح' });

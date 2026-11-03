@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import multer from 'multer';
 import { authenticate, AuthRequest } from '../middlewares/security.middleware';
+import { getPublicServerUrl, recordUpload } from '../utils/uploadAccess';
 
 const router = Router();
 
@@ -23,28 +24,35 @@ const AUDIO_MIME_TYPES = [
 ];
 const AUDIO_EXTENSIONS = ['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac'];
 
-const IMAGE_MIME_TYPES = [
-  'image/jpeg',
-  'image/jpg',
-  'image/png',
-  'image/x-png',
-  'image/pjpeg',
-  'image/webp',
-  'image/gif',
-  'image/bmp',
-  'image/svg+xml',
-  'image/heic',
-  'image/heif',
-];
+// Extension stored for each accepted type. SVG is excluded because it can carry scripts.
+const MIME_EXTENSIONS: Record<string, string> = {
+  'image/jpeg': '.jpg',
+  'image/jpg': '.jpg',
+  'image/pjpeg': '.jpg',
+  'image/png': '.png',
+  'image/x-png': '.png',
+  'image/webp': '.webp',
+  'image/gif': '.gif',
+  'image/bmp': '.bmp',
+  'image/heic': '.heic',
+  'image/heif': '.heif',
+  'application/pdf': '.pdf',
+  'audio/mpeg': '.mp3',
+  'audio/mp3': '.mp3',
+  'audio/wav': '.wav',
+  'audio/wave': '.wav',
+  'audio/x-wav': '.wav',
+  'audio/ogg': '.ogg',
+  'audio/mp4': '.m4a',
+  'audio/x-m4a': '.m4a',
+  'audio/m4a': '.m4a',
+  'audio/aac': '.aac',
+  'audio/flac': '.flac',
+  // Some devices send no real type; the extension check still applies
+  'application/octet-stream': '.png',
+};
 
-const ALLOWED_MIME_TYPES = [
-  ...IMAGE_MIME_TYPES,
-  'application/pdf',
-  'application/octet-stream',
-  ...AUDIO_MIME_TYPES,
-];
-
-const ALLOWED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.heic', '.heif', '.bmp', '.svg', '.pdf', ...AUDIO_EXTENSIONS];
+const ALLOWED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.heic', '.heif', '.bmp', '.pdf', ...AUDIO_EXTENSIONS];
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -60,7 +68,7 @@ const storage = multer.diskStorage({
     const randomPrefix = Date.now() + '-' + Math.round(Math.random() * 1e9);
     const originalExt = path.extname(file.originalname).toLowerCase();
     const category = (req.query.category as string) || '';
-    let safeExt = (originalExt && originalExt.length < 10) ? originalExt : '.png';
+    let safeExt = ALLOWED_EXTENSIONS.includes(originalExt) ? originalExt : (MIME_EXTENSIONS[file.mimetype.toLowerCase()] || '.png');
     if (category === 'sounds') {
       safeExt = AUDIO_EXTENSIONS.includes(originalExt) ? originalExt : '.mp3';
     }
@@ -91,11 +99,11 @@ const upload = multer({
       return;
     }
 
-    const isImage = mime.startsWith('image/') || IMAGE_MIME_TYPES.includes(mime) || ALLOWED_EXTENSIONS.includes(ext);
-    const isPdf = mime.includes('pdf') || ext === '.pdf';
-    const isAllowed = isImage || isPdf || ALLOWED_MIME_TYPES.includes(mime) || ALLOWED_EXTENSIONS.includes(ext) || mime === 'application/octet-stream';
+    // Both must pass: a declared type alone cannot smuggle a file such as x.html
+    const isAllowedMime = Boolean(MIME_EXTENSIONS[mime]);
+    const isAllowedExt = ALLOWED_EXTENSIONS.includes(ext) || (!ext && mime !== 'application/octet-stream');
 
-    if (isAllowed) {
+    if (isAllowedMime && isAllowedExt) {
       cb(null, true);
     } else {
       cb(new Error('نوع الملف غير مدعوم، يُسمح بالصور و PDF والملفات الصوتية فقط'));
@@ -115,7 +123,7 @@ const uploadHandler = (req: any, res: any, next: any) => {
   });
 };
 
-router.post('/', authenticate, uploadHandler, (req: AuthRequest, res: Response): void => {
+router.post('/', authenticate, uploadHandler, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     if (!req.file) {
       res.status(400).json({ error: 'لم يتم إرسال أي ملف' });
@@ -125,18 +133,18 @@ router.post('/', authenticate, uploadHandler, (req: AuthRequest, res: Response):
     const subFolder = ['chats', 'companies', 'receipts', 'profiles', 'sounds', 'documents'].includes(category) ? category : 'general';
     const filename = req.file.filename;
 
-    const host = req.get('host') || `${req.hostname || 'localhost'}:${process.env.PORT || 5000}`;
-    const protocol = req.protocol || 'http';
-    const fileUrl = `${protocol}://${host}/uploads/${subFolder}/${filename}`;
+    await recordUpload(filename, subFolder, String(req.user!.id));
+
+    const fileUrl = `${getPublicServerUrl(req)}/uploads/${subFolder}/${filename}`;
 
     res.status(201).json({ success: true, url: fileUrl, filename });
   } catch (error: any) {
     console.error('Error uploading file:', error);
-    res.status(500).json({ error: error.message || 'فشل رفع الملف' });
+    res.status(500).json({ error: 'فشل رفع الملف' });
   }
 });
 
-router.post('/base64', authenticate, (req: AuthRequest, res: Response): void => {
+router.post('/base64', authenticate, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { image, originalName } = req.body;
     if (!image || typeof image !== 'string') {
@@ -164,21 +172,13 @@ router.post('/base64', authenticate, (req: AuthRequest, res: Response): void => 
     }
 
     const mime = matches[1].toLowerCase();
-    const isImage = mime.startsWith('image/') || IMAGE_MIME_TYPES.includes(mime);
-    const isPdf = mime.includes('pdf');
+    const ext = MIME_EXTENSIONS[mime];
 
-    if (!isImage && !isPdf && !ALLOWED_MIME_TYPES.includes(mime)) {
+    if (!ext) {
       res.status(400).json({ error: 'نوع الملف غير مدعوم، يُسمح بالصور و PDF فقط' });
       return;
     }
 
-    let ext = 'png';
-    if (mime.includes('pdf')) ext = 'pdf';
-    else if (mime.includes('jpeg') || mime.includes('jpg')) ext = 'jpg';
-    else if (mime.includes('png')) ext = 'png';
-    else if (mime.includes('webp')) ext = 'webp';
-    else if (mime.includes('gif')) ext = 'gif';
-    else if (mime.includes('svg')) ext = 'svg';
     const buffer = Buffer.from(matches[2], 'base64');
 
     if (buffer.length > 10 * 1024 * 1024) {
@@ -187,15 +187,16 @@ router.post('/base64', authenticate, (req: AuthRequest, res: Response): void => 
     }
 
     const randomPrefix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    const safeBaseName = originalName ? path.basename(originalName).replace(/[^a-zA-Z0-9_\u0600-\u06FF.-]/g, '_') : `upload.${ext}`;
-    const filename = `${randomPrefix}-${safeBaseName}`;
+    // The stored extension always comes from the validated type, never from the client's file name
+    const cleanName = typeof originalName === 'string' ? originalName : '';
+    const safeBaseName = path.basename(cleanName, path.extname(cleanName)).replace(/[^a-zA-Z0-9_\u0600-\u06FF-]/g, '_') || 'upload';
+    const filename = `${randomPrefix}-${safeBaseName}${ext}`;
     const filePath = path.join(uploadDir, filename);
 
     fs.writeFileSync(filePath, buffer);
+    await recordUpload(filename, subFolder, String(req.user!.id));
 
-    const host = req.get('host') || `${req.hostname || 'localhost'}:${process.env.PORT || 5000}`;
-    const protocol = req.protocol || 'http';
-    const fileUrl = `${protocol}://${host}/uploads/${subFolder}/${filename}`;
+    const fileUrl = `${getPublicServerUrl(req)}/uploads/${subFolder}/${filename}`;
 
     res.status(201).json({ success: true, url: fileUrl });
   } catch (error: any) {

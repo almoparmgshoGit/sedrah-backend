@@ -12,6 +12,7 @@ const envSchema = z.object({
   JWT_EXPIRES_IN: z.string().default('7d'),
   CORS_ORIGIN: z.string().default('*'),
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required for PostgreSQL connection'),
+  PUBLIC_SERVER_URL: z.string().url().optional(),
 });
 
 const parseEnv = () => {

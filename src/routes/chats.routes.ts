@@ -26,7 +26,7 @@ router.get('/:companyName/messages', authenticate, chatsController.getChatMessag
 router.post('/:companyName/messages', authenticate, chatsController.sendMessage);
 router.patch('/:companyName/read', authenticate, chatsController.markAsRead);
 router.get('/:companyName/appointment', authenticate, chatsController.getAppointment);
-router.post('/:companyName/appointment', authenticate, chatsController.setAppointment);
+router.post('/:companyName/appointment', supportStaff, chatsController.setAppointment);
 router.patch('/:companyName/appointment/confirm', authenticate, chatsController.confirmAppointment);
 router.patch('/:companyName/appointment/reject', authenticate, chatsController.rejectAppointment);
 

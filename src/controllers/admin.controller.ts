@@ -9,6 +9,8 @@ import { replaceEmailPlaceholders } from '../utils/mailer';
 import { createAndSendNotification } from '../utils/notificationHelper';
 
 const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
+// Both bypass every module permission, so only a super admin can grant or touch them
+const FULL_ACCESS_ROLES = ['super_admin', 'owner'];
 
 // Roles and permissions are only changeable by people who manage staff
 const canManageStaff = async (req: AuthRequest): Promise<boolean> => {
@@ -192,7 +194,7 @@ export const createUserByAdmin = async (req: AuthRequest, res: Response): Promis
       res.status(403).json({ error: 'ليس لديك صلاحية منح أدوار أو صلاحيات إدارية' });
       return;
     }
-    if (role === 'super_admin' && req.user?.role !== 'super_admin') {
+    if (FULL_ACCESS_ROLES.includes(role) && req.user?.role !== 'super_admin') {
       res.status(403).json({ error: 'منح دور المشرف العام متاح للمشرف العام فقط' });
       return;
     }
@@ -200,7 +202,7 @@ export const createUserByAdmin = async (req: AuthRequest, res: Response): Promis
       res.status(409).json({ error: 'هذا البريد مسجل مسبقاً' });
       return;
     }
-    if (existing.rows.length > 0 && existing.rows[0].role === 'super_admin' && req.user?.role !== 'super_admin') {
+    if (existing.rows.length > 0 && FULL_ACCESS_ROLES.includes(existing.rows[0].role) && req.user?.role !== 'super_admin') {
       res.status(403).json({ error: 'لا يمكن تعديل حساب مشرف عام' });
       return;
     }
@@ -319,14 +321,20 @@ export const updateUserByAdmin = async (req: AuthRequest, res: Response): Promis
 
     const { name, email, phone, role, country, city, permissions, permission_group_id } = req.body;
 
-    const currentRes = await pool.query('SELECT role, permissions, permission_group_id FROM users WHERE id = $1', [internalUserId]);
+    const currentRes = await pool.query('SELECT role, email, permissions, permission_group_id FROM users WHERE id = $1', [internalUserId]);
     const current = currentRes.rows[0] || {};
     const changesStaffAccess = (role !== undefined && role !== current.role) || permissions !== undefined || permission_group_id !== undefined;
     if (changesStaffAccess && !(await canManageStaff(req))) {
       res.status(403).json({ error: 'ليس لديك صلاحية تعديل الأدوار أو الصلاحيات' });
       return;
     }
-    if ((role === 'super_admin' || current.role === 'super_admin') && req.user?.role !== 'super_admin') {
+    // Changing a staff member's email is a route to taking over their account
+    const changesStaffEmail = email !== undefined && email !== current.email && STAFF_ROLES.includes(current.role);
+    if (changesStaffEmail && !(await canManageStaff(req))) {
+      res.status(403).json({ error: 'تعديل بريد المشرفين يتطلب صلاحية إدارة المشرفين' });
+      return;
+    }
+    if ((FULL_ACCESS_ROLES.includes(role) || FULL_ACCESS_ROLES.includes(current.role)) && req.user?.role !== 'super_admin') {
       res.status(403).json({ error: 'تعديل حسابات المشرف العام متاح للمشرف العام فقط' });
       return;
     }
@@ -401,7 +409,7 @@ export const banUserByAdmin = async (req: AuthRequest, res: Response): Promise<v
       res.status(403).json({ error: 'حظر المشرفين يتطلب صلاحية إدارة المشرفين' });
       return;
     }
-    if (targetRes.rows[0]?.role === 'super_admin' && req.user?.role !== 'super_admin') {
+    if (FULL_ACCESS_ROLES.includes(targetRes.rows[0]?.role) && req.user?.role !== 'super_admin') {
       res.status(403).json({ error: 'لا يمكن حظر مشرف عام' });
       return;
     }
@@ -497,7 +505,7 @@ export const deleteUserByAdmin = async (req: AuthRequest, res: Response): Promis
       res.status(403).json({ error: 'حذف المشرفين يتطلب صلاحية إدارة المشرفين' });
       return;
     }
-    if (targetRes.rows[0]?.role === 'super_admin' && req.user?.role !== 'super_admin') {
+    if (FULL_ACCESS_ROLES.includes(targetRes.rows[0]?.role) && req.user?.role !== 'super_admin') {
       res.status(403).json({ error: 'لا يمكن حذف مشرف عام' });
       return;
     }

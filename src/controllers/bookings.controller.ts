@@ -3,6 +3,7 @@ import { pool } from '../config/db';
 import { parseIdOrToken, generate16CharId } from '../utils/formatId';
 import { suggestAppointmentForBooking } from '../utils/appointmentEngine';
 import { createAndSendNotification } from '../utils/notificationHelper';
+import { resolveUserUpload } from '../utils/uploadAccess';
 
 // Mirrors the room pricing shown in the app, so the charged total never comes from the client
 const calculateBookingTotal = (pkg: any, roomType: string, adults: number, children: number): number => {
@@ -278,7 +279,6 @@ export const updateBookingReceipt = async (req: Request, res: Response): Promise
     const bookingId = req.params.id;
     const { receiptUrl, receipt_url, paidAmount } = req.body || {};
     const parsedPaidAmount = Number(paidAmount) > 0 ? Number(paidAmount) : null;
-    const finalReceiptUrl = receiptUrl || receipt_url || null;
 
     if (!userId) {
       res.status(401).json({ error: 'غير مصرح' });
@@ -296,6 +296,12 @@ export const updateBookingReceipt = async (req: Request, res: Response): Promise
     }
 
     const bookingRecord = bookingCheck.rows[0];
+
+    const finalReceiptUrl = await resolveUserUpload(receiptUrl || receipt_url, req, String(userId), bookingRecord.receipt_url);
+    if (finalReceiptUrl === false) {
+      res.status(400).json({ error: 'رابط الإيصال غير صالح' });
+      return;
+    }
 
     // Enforce stage sequencing: Stage 1 (Visit company) must be completed before uploading receipt
     const stageCheck = await pool.query(

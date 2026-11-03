@@ -6,6 +6,10 @@ import { createAndSendNotification } from '../utils/notificationHelper';
 import { sendPushToUsers } from '../utils/pushNotification';
 import { generate16CharId } from '../utils/formatId';
 import { logAudit } from '../utils/auditLogger';
+import { normalizeUploadUrl, resolveUserUpload } from '../utils/uploadAccess';
+
+const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
+const INVALID_ATTACHMENT_ERROR = 'رابط المرفق غير صالح';
 
 const PLATFORM_DESK_NAME = 'إدارة منصة سدرة الرسمية';
 const TICKET_STATUSES = ['new', 'open', 'in_progress', 'resolved', 'closed'];
@@ -308,6 +312,12 @@ export const chatsController = {
         return;
       }
 
+      const safeImageUri = await resolveUserUpload(imageUri, req, userId);
+      if (safeImageUri === false) {
+        res.status(400).json({ error: INVALID_ATTACHMENT_ERROR });
+        return;
+      }
+
       // Universal identifier resolver: supports chat ID, company ID, and company name
       const resolved = await resolveChatTarget(identifier, chatIdQuery, userId, isAdmin);
       let chatId = resolved.chatId;
@@ -350,7 +360,7 @@ export const chatsController = {
       const msgRes = await pool.query(
         `INSERT INTO messages (id, chat_id, user_id, company_name, company_id, sender, text, image_uri, time, status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-        [generate16CharId(), chatId, userId, targetCompanyName, targetCompanyId || null, 'user', message || '[صورة مرفقة]', imageUri || null, timeStr, 'sent']
+        [generate16CharId(), chatId, userId, targetCompanyName, targetCompanyId || null, 'user', message || '[صورة مرفقة]', safeImageUri, timeStr, 'sent']
       );
 
       // Update chat last message & updated_at
@@ -438,6 +448,10 @@ export const chatsController = {
       }
 
       const resolved = await resolveChatTarget(identifier, chatIdQuery, userId, isAdmin);
+      if (resolved.chat && resolved.chat.user_id !== userId && !STAFF_ROLES.includes(req.user?.role as string)) {
+        res.status(403).json({ error: 'غير مصرح لك بعرض موعد هذه المحادثة' });
+        return;
+      }
       const targetChatId = resolved.chatId;
       const targetCompanyName = resolved.companyName;
 
@@ -600,7 +614,11 @@ export const chatsController = {
       }
 
       const resolved = await resolveChatTarget(identifier, chatId, userId, isAdmin);
-      const targetChatId = chatId || resolved.chatId;
+      if (resolved.chat && resolved.chat.user_id !== userId && !isAdmin) {
+        res.status(403).json({ error: 'غير مصرح لك بتأكيد موعد هذه المحادثة' });
+        return;
+      }
+      const targetChatId = resolved.chatId;
       const targetCompanyName = resolved.companyName;
 
       const updateRes = await pool.query(
@@ -768,6 +786,12 @@ export const chatsController = {
         return;
       }
 
+      const safeImageUri = normalizeUploadUrl(imageUri, req);
+      if (safeImageUri === false) {
+        res.status(400).json({ error: INVALID_ATTACHMENT_ERROR });
+        return;
+      }
+
       const chatRes = await pool.query('SELECT * FROM chats WHERE id = $1', [chatId]);
       if (chatRes.rows.length === 0) {
         res.status(404).json({ error: 'المحادثة غير موجودة' });
@@ -785,7 +809,7 @@ export const chatsController = {
       const msgRes = await pool.query(
         `INSERT INTO messages (id, chat_id, user_id, company_name, sender, text, image_uri, time, status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-        [generate16CharId(), chatId, chat.user_id, chat.company_name, 'company', message || '[صورة مرفقة]', imageUri || null, timeStr, 'received']
+        [generate16CharId(), chatId, chat.user_id, chat.company_name, 'company', message || '[صورة مرفقة]', safeImageUri, timeStr, 'received']
       );
 
       // The first staff member to reply takes ownership of an unassigned ticket
@@ -953,6 +977,12 @@ export const chatsController = {
         return;
       }
 
+      const safeAttachmentUrl = await resolveUserUpload(attachmentUrl, req, userId);
+      if (safeAttachmentUrl === false) {
+        res.status(400).json({ error: INVALID_ATTACHMENT_ERROR });
+        return;
+      }
+
       const ticketNumber = await generateTicketNumber();
       const companyName = PLATFORM_DESK_NAME;
       const timeStr = new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' });
@@ -973,7 +1003,7 @@ export const chatsController = {
           ticketNumber,
           ticketType || 'general',
           description,
-          attachmentUrl || null,
+          safeAttachmentUrl,
           title,
           bookingReference || null,
           'new',
@@ -986,7 +1016,7 @@ export const chatsController = {
       const msgRes = await pool.query(
         `INSERT INTO messages (id, chat_id, user_id, company_name, sender, text, image_uri, time, status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-        [generate16CharId(), chatId, userId, companyName, 'user', description, attachmentUrl || null, timeStr, 'sent']
+        [generate16CharId(), chatId, userId, companyName, 'user', description, safeAttachmentUrl, timeStr, 'sent']
       );
 
       if (io) {
@@ -1206,23 +1236,28 @@ export const chatsController = {
         return;
       }
 
-      let targetChatId = chatId;
-      if (!targetChatId && identifier) {
-        const chatMatch = await pool.query('SELECT id FROM chats WHERE id = $1 OR company_name = $2 ORDER BY updated_at DESC LIMIT 1', [identifier, identifier]);
-        if (chatMatch.rows.length > 0) targetChatId = chatMatch.rows[0].id;
+      const resolved = await resolveChatTarget(identifier, chatId, userId, isAdmin);
+      if (resolved.chat && resolved.chat.user_id !== userId && !isAdmin) {
+        res.status(403).json({ error: 'غير مصرح لك برفض موعد هذه المحادثة' });
+        return;
       }
+      const targetChatId = resolved.chatId;
+      const targetUserId = resolved.chat?.user_id || userId;
 
       const updateRes = await pool.query(
         `UPDATE interview_appointments
          SET status = 'rejected'
-         WHERE chat_id = $1 OR user_id = $2
+         WHERE user_id = $1 AND (chat_id = $2 OR company_name = $3)
          RETURNING *`,
-        [targetChatId || null, userId]
+        [targetUserId, targetChatId || null, resolved.companyName]
       );
 
       await pool.query(
-        `UPDATE bookings SET appointment_status = 'rejected' WHERE user_id = $1 AND appointment_status != 'cancelled'`,
-        [userId]
+        `UPDATE bookings b
+         SET appointment_status = 'rejected'
+         FROM packages p, companies c
+         WHERE b.package_id = p.id AND p.company_id = c.id AND b.user_id = $1 AND (c.name = $2 OR c.id = $3) AND b.appointment_status != 'cancelled'`,
+        [targetUserId, resolved.companyName, resolved.companyId || -1]
       );
 
       if (io && targetChatId) {

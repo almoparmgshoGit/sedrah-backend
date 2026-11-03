@@ -320,6 +320,20 @@ export const initDB = async () => {
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE;');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_code VARCHAR(10);');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMP;');
+    await pool.query('ALTER TABLE users ALTER COLUMN otp_code TYPE VARCHAR(64);');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_attempts INT DEFAULT 0;');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_locked_until TIMESTAMP;');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_last_sent_at TIMESTAMP;');
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS uploaded_files (
+        filename VARCHAR(512) PRIMARY KEY,
+        category VARCHAR(50) NOT NULL,
+        user_id VARCHAR(64) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_uploaded_files_user ON uploaded_files(user_id);');
 
     // 2. Cities table
     await pool.query(`
@@ -971,11 +985,6 @@ export const initDB = async () => {
         [generate16CharId(), 'مالك النظام', 'admin@sdra.com', passwordHash, null, 'super_admin', 0.00, true, allPerms]
       );
       console.log('✅ Default super_admin owner created: admin@sdra.com');
-    } else if (adminCheck.rows.length > 0) {
-      await pool.query(
-        `UPDATE users SET name = $1, role = 'super_admin', is_verified = true, permissions = $2 WHERE email = $3`,
-        ['مالك النظام', allPerms, 'admin@sdra.com']
-      );
     }
     // Also mark all admin/super_admin accounts as verified by default
     await pool.query(`UPDATE users SET is_verified = true WHERE role IN ('admin', 'super_admin')`);

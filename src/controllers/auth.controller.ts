@@ -8,6 +8,7 @@ import { AuthRequest } from '../middlewares/security.middleware';
 import { safeParseArray } from '../middlewares/permission.middleware';
 import { formatUserId, generate16CharId } from '../utils/formatId';
 import { sendPlatformEmail } from '../utils/mailer';
+import { resolveUserUpload } from '../utils/uploadAccess';
 
 export const issueTokenPair = async (
   user: { id: string; email: string; role: string; permissions?: string[] },
@@ -171,18 +172,31 @@ export const logoutUser = async (req: Request, res: Response): Promise<void> => 
   }
 };
 
-const generateAndSendOtp = async (email: string, userName?: string): Promise<{ code: string; expiresAt: Date }> => {
-  const code = Math.floor(100000 + Math.random() * 900000).toString();
+const OTP_MAX_ATTEMPTS = 5;
+const OTP_LOCK_MS = 15 * 60 * 1000;
+const OTP_RESEND_COOLDOWN_MS = 60 * 1000;
+
+const hashOtp = (email: string, code: string): string =>
+  crypto.createHmac('sha256', env.JWT_SECRET).update(`${email.toLowerCase()}:${code}`).digest('hex');
+
+const generateAndSendOtp = async (email: string, userName?: string): Promise<void> => {
+  const stateRes = await pool.query(
+    'SELECT otp_last_sent_at, otp_locked_until FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1',
+    [email]
+  );
+  const state = stateRes.rows[0];
+  const isLocked = state?.otp_locked_until && new Date(state.otp_locked_until) > new Date();
+  const sentRecently = state?.otp_last_sent_at && Date.now() - new Date(state.otp_last_sent_at).getTime() < OTP_RESEND_COOLDOWN_MS;
+  if (isLocked || sentRecently) return;
+
+  const code = crypto.randomInt(100000, 1000000).toString();
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
+  // otp_attempts is deliberately not reset here, so requesting a new code cannot buy more guesses
   await pool.query(
-    `UPDATE users SET otp_code = $1, otp_expires_at = $2 WHERE LOWER(email) = LOWER($3)`,
-    [code, expiresAt, email]
+    `UPDATE users SET otp_code = $1, otp_expires_at = $2, otp_last_sent_at = $3 WHERE LOWER(email) = LOWER($4)`,
+    [hashOtp(email, code), expiresAt, new Date(), email]
   );
-
-  console.log(`🔑 ==========================================`);
-  console.log(`🔑 [OTP Code for ${email}]: ${code}`);
-  console.log(`🔑 ==========================================`);
 
   try {
     await sendPlatformEmail({
@@ -208,8 +222,6 @@ const generateAndSendOtp = async (email: string, userName?: string): Promise<{ c
   } catch (emailErr) {
     console.error('[Mailer] Error sending OTP email:', emailErr);
   }
-
-  return { code, expiresAt };
 };
 
 export const register = async (req: Request, res: Response): Promise<void> => {
@@ -223,7 +235,9 @@ export const register = async (req: Request, res: Response): Promise<void> => {
 
     if (existingUserResult.rows.length > 0) {
       user = existingUserResult.rows[0];
-      if (user.is_verified) {
+      // An approved company stays unverified until its first login; registering must not overwrite its password
+      const ownedCompany = await pool.query('SELECT 1 FROM companies WHERE user_id = $1 LIMIT 1', [user.id]);
+      if (user.is_verified || ownedCompany.rows.length > 0) {
         res.status(400).json({ error: 'البريد الإلكتروني مسجل مسبقاً' });
         return;
       }
@@ -245,12 +259,6 @@ export const register = async (req: Request, res: Response): Promise<void> => {
       );
       user = newUserResult.rows[0];
     }
-
-    // Auto-link any pending companies created for this email
-    await pool.query(
-      `UPDATE companies SET user_id = $1, pending_owner_email = NULL WHERE LOWER(pending_owner_email) = $2`,
-      [user.id, cleanEmail]
-    );
 
     // Generate & send OTP code to email
     await generateAndSendOtp(cleanEmail, name);
@@ -280,13 +288,12 @@ export const sendOtp = async (req: Request, res: Response): Promise<void> => {
     const cleanEmail = email.trim().toLowerCase();
 
     const userRes = await pool.query('SELECT * FROM users WHERE LOWER(email) = $1', [cleanEmail]);
-    if (userRes.rows.length === 0) {
-      res.status(404).json({ error: 'الحساب غير موجود' });
-      return;
-    }
-
     const user = userRes.rows[0];
-    await generateAndSendOtp(cleanEmail, user.name);
+
+    // OTP only activates new accounts. The reply is identical either way, so it does not reveal who has an account.
+    if (user && user.is_verified === false) {
+      await generateAndSendOtp(cleanEmail, user.name);
+    }
 
     res.json({
       success: true,
@@ -304,31 +311,60 @@ export const verifyOtp = async (req: Request, res: Response): Promise<void> => {
     const cleanEmail = email.trim().toLowerCase();
     const cleanOtp = String(otp).trim();
 
-    const userRes = await pool.query('SELECT * FROM users WHERE LOWER(email) = $1', [cleanEmail]);
-    if (userRes.rows.length === 0) {
-      res.status(404).json({ error: 'الحساب غير موجود' });
-      return;
-    }
-
+    const userRes = await pool.query('SELECT id, is_verified FROM users WHERE LOWER(email) = $1', [cleanEmail]);
     const user = userRes.rows[0];
 
-    if (!user.otp_code || user.otp_code !== cleanOtp) {
+    // A code can never open a session on an already active account
+    if (!user || user.is_verified !== false) {
       res.status(400).json({ error: 'رمز التحقق غير صحيح' });
       return;
     }
 
-    if (user.otp_expires_at && new Date() > new Date(user.otp_expires_at)) {
-      res.status(400).json({ error: 'انتهت صلاحية رمز التحقق' });
+    // The attempt is counted before comparing, so parallel guesses cannot exceed the limit
+    const now = new Date();
+    const attemptRes = await pool.query(
+      `UPDATE users SET otp_attempts = COALESCE(otp_attempts, 0) + 1, otp_locked_until = NULL
+       WHERE id = $1 AND COALESCE(otp_attempts, 0) < $2 AND (otp_locked_until IS NULL OR otp_locked_until <= $3)
+       RETURNING otp_code, otp_expires_at, otp_attempts`,
+      [user.id, OTP_MAX_ATTEMPTS, now]
+    );
+
+    if (attemptRes.rows.length === 0) {
+      res.status(429).json({ error: 'محاولات كثيرة غير صحيحة، يرجى المحاولة لاحقاً' });
+      return;
+    }
+
+    const attempt = attemptRes.rows[0];
+    const submitted = Buffer.from(hashOtp(cleanEmail, cleanOtp));
+    const stored = Buffer.from(String(attempt.otp_code || ''));
+    const isCodeValid = stored.length === submitted.length && crypto.timingSafeEqual(stored, submitted);
+    const isExpired = Boolean(attempt.otp_expires_at) && now > new Date(attempt.otp_expires_at);
+
+    if (!isCodeValid || isExpired) {
+      if (attempt.otp_attempts >= OTP_MAX_ATTEMPTS) {
+        await pool.query(
+          'UPDATE users SET otp_attempts = 0, otp_code = NULL, otp_expires_at = NULL, otp_locked_until = $1 WHERE id = $2',
+          [new Date(Date.now() + OTP_LOCK_MS), user.id]
+        );
+      }
+      res.status(400).json({ error: isCodeValid ? 'انتهت صلاحية رمز التحقق' : 'رمز التحقق غير صحيح' });
       return;
     }
 
     // Verify user and clear OTP
     const updatedUserRes = await pool.query(
-      `UPDATE users SET is_verified = true, otp_code = NULL, otp_expires_at = NULL WHERE id = $1 RETURNING id, name, email, phone, role, balance`,
+      `UPDATE users SET is_verified = true, otp_code = NULL, otp_expires_at = NULL, otp_attempts = 0, otp_locked_until = NULL
+       WHERE id = $1 RETURNING id, name, email, phone, role, balance`,
       [user.id]
     );
 
     const verifiedUser = updatedUserRes.rows[0];
+
+    // Companies are linked only now that the email is proven to belong to this user
+    await pool.query(
+      `UPDATE companies SET user_id = $1, pending_owner_email = NULL WHERE LOWER(pending_owner_email) = $2`,
+      [verifiedUser.id, cleanEmail]
+    );
 
     const clientType = (verifiedUser.role === 'admin' || verifiedUser.role === 'super_admin') ? 'admin' : (verifiedUser.role === 'owner' ? 'company' : 'customer');
     const { accessToken, refreshToken } = await issueTokenPair(verifiedUser, clientType, req.headers['user-agent'], req.ip);
@@ -358,7 +394,10 @@ export const login = async (req: Request, res: Response): Promise<void> => {
   try {
     const { email, password } = req.body;
 
-    const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    const userResult = await pool.query(
+      'SELECT * FROM users WHERE LOWER(email) = LOWER($1) ORDER BY (email = $1) DESC LIMIT 1',
+      [email.trim()]
+    );
     if (userResult.rows.length === 0) {
       res.status(401).json({ error: 'البريد الإلكتروني أو كلمة المرور غير صحيحة' });
       return;
@@ -477,11 +516,19 @@ export const updateUserProfile = async (req: AuthRequest, res: Response): Promis
       return;
     }
 
-    const { name, phone, email, country, city, avatar } = req.body;
+    // Email is not editable here: it is the account identity and changing it needs proof of ownership
+    const { name, phone, country, city, avatar } = req.body;
+
+    const currentRes = await pool.query('SELECT avatar FROM users WHERE id = $1', [userId]);
+    const safeAvatar = await resolveUserUpload(avatar, req, String(userId), currentRes.rows[0]?.avatar);
+    if (safeAvatar === false) {
+      res.status(400).json({ error: 'رابط الصورة غير صالح' });
+      return;
+    }
 
     const result = await pool.query(
-      `UPDATE users SET name = COALESCE($1, name), phone = COALESCE($2, phone), email = COALESCE($3, email), country = COALESCE($4, country), city = COALESCE($5, city), avatar = COALESCE($6, avatar) WHERE id = $7 RETURNING id, name, email, phone, role, balance, country, city, avatar, created_at`,
-      [name, phone, email, country, city, avatar, userId]
+      `UPDATE users SET name = COALESCE($1, name), phone = COALESCE($2, phone), country = COALESCE($3, country), city = COALESCE($4, city), avatar = COALESCE($5, avatar) WHERE id = $6 RETURNING id, name, email, phone, role, balance, country, city, avatar, created_at`,
+      [name, phone, country, city, safeAvatar, userId]
     );
 
     if (result.rows.length === 0) {
@@ -706,11 +753,11 @@ export const googleLogin = async (req: Request, res: Response): Promise<void> =>
 
     if (userResult.rows.length === 0) {
       isNewUser = true;
-      const randomPasswordHash = await argon2.hash(Math.random().toString(36) + 'GoogleAuth');
+      const randomPasswordHash = await argon2.hash(crypto.randomBytes(32).toString('hex'));
       const newUserId = generate16CharId();
       const insertRes = await pool.query(
-        `INSERT INTO users (id, name, email, password_hash, role, balance)
-         VALUES ($1, $2, $3, $4, 'user', 0.00)
+        `INSERT INTO users (id, name, email, password_hash, role, balance, is_verified)
+         VALUES ($1, $2, $3, $4, 'user', 0.00, true)
          RETURNING id, name, email, phone, role, balance`,
         [newUserId, name || email.split('@')[0], email, randomPasswordHash]
       );
@@ -722,6 +769,15 @@ export const googleLogin = async (req: Request, res: Response): Promise<void> =>
       );
     } else {
       user = userResult.rows[0];
+
+      // Google proved the email. A password set on a never-verified account may be someone else's, so it is replaced.
+      if (user.is_verified === false) {
+        const randomPasswordHash = await argon2.hash(crypto.randomBytes(32).toString('hex'));
+        await pool.query(
+          'UPDATE users SET is_verified = true, password_hash = $1, otp_code = NULL, otp_expires_at = NULL WHERE id = $2',
+          [randomPasswordHash, user.id]
+        );
+      }
     }
 
     // Resolve permissions (direct + permission group)

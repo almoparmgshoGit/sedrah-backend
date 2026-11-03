@@ -3,6 +3,26 @@ import { pool } from '../config/db';
 import { generate16CharId } from '../utils/formatId';
 import { createAndSendNotification } from '../utils/notificationHelper';
 
+const MAX_ORDER_LINES = 50;
+const MAX_ITEM_QUANTITY = 100;
+
+// Mirrors the fee published by getGovernorates, so the charged amount never comes from the client
+const calculateShippingFee = async (client: any, governorateId: unknown): Promise<number> => {
+  const settingsRes = await client.query("SELECT key, value FROM settings WHERE key IN ('shipping_mode', 'unified_shipping_fee')");
+  const settings: Record<string, string> = {};
+  for (const row of settingsRes.rows) settings[row.key] = row.value;
+
+  if ((settings['shipping_mode'] || 'unified') === 'unified') {
+    return parseFloat(settings['unified_shipping_fee'] ?? '50') || 0;
+  }
+
+  const govRes = governorateId
+    ? await client.query('SELECT shipping_fee FROM governorates WHERE id = $1', [String(governorateId)])
+    : { rows: [] };
+  const fee = govRes.rows[0]?.shipping_fee;
+  return fee !== null && fee !== undefined ? parseFloat(fee) : 50;
+};
+
 function generateOrderNumber(): string {
   const randomHex = Math.floor(100000 + Math.random() * 900000).toString(16).toUpperCase();
   return `ORD-${randomHex}`;
@@ -153,11 +173,22 @@ export const createOrder = async (req: any, res: Response) => {
       city_id,
       notes,
       items,
-      shipping_fee = 0,
     } = req.body;
 
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ success: false, message: 'السلة فارغة' });
+    }
+
+    if (items.length > MAX_ORDER_LINES) {
+      return res.status(400).json({ success: false, message: 'عدد المنتجات في الطلب كبير جداً' });
+    }
+
+    const hasInvalidQuantity = items.some((item: any) => {
+      const qty = item?.quantity === undefined ? 1 : Number(item.quantity);
+      return !Number.isInteger(qty) || qty < 1 || qty > MAX_ITEM_QUANTITY;
+    });
+    if (hasInvalidQuantity) {
+      return res.status(400).json({ success: false, message: 'كمية المنتج غير صالحة' });
     }
 
     if (!customer_name || !customer_phone || !customer_address) {
@@ -199,7 +230,7 @@ export const createOrder = async (req: any, res: Response) => {
 
       const prod = prodRes.rows[0];
       const itemPrice = parseFloat(prod.discount_price || prod.price);
-      const qty = parseInt(item.quantity, 10) || 1;
+      const qty = item.quantity === undefined ? 1 : Number(item.quantity);
       const itemTotal = itemPrice * qty;
 
       subtotal += itemTotal;
@@ -217,13 +248,19 @@ export const createOrder = async (req: any, res: Response) => {
         total_price: itemTotal,
       });
 
-      if (prod.stock >= qty) {
-        await client.query('UPDATE store_products SET stock = stock - $1 WHERE id = $2', [qty, prod.id]);
+      // Atomic so concurrent orders cannot both take the last unit
+      const stockRes = await client.query(
+        'UPDATE store_products SET stock = stock - $1 WHERE id = $2 AND stock >= $1 RETURNING id',
+        [qty, prod.id]
+      );
+      if (stockRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: `الكمية المطلوبة من "${prod.name}" غير متوفرة` });
       }
     }
 
     const orderNumber = generateOrderNumber();
-    const finalShippingFee = parseFloat(shipping_fee) || 0;
+    const finalShippingFee = await calculateShippingFee(client, governorate_id);
     const grandTotal = subtotal + finalShippingFee;
 
     const orderRes = await client.query(
@@ -293,7 +330,8 @@ export const createOrder = async (req: any, res: Response) => {
     });
   } catch (error: any) {
     await client.query('ROLLBACK');
-    return res.status(500).json({ success: false, message: error.message || 'حدث خطأ أثناء إنشاء الطلب' });
+    console.error('Error creating order:', error);
+    return res.status(500).json({ success: false, message: 'حدث خطأ أثناء إنشاء الطلب' });
   } finally {
     client.release();
   }

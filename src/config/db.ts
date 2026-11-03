@@ -1007,6 +1007,34 @@ export const initDB = async () => {
       CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family_id);
     `);
 
+    // Company registration requests: password_hash moves to users on approval, only then is an account created
+    await pool.query(`
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS license_number VARCHAR(100);
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS tax_number VARCHAR(100);
+      CREATE TABLE IF NOT EXISTS company_requests (
+        id VARCHAR(16) PRIMARY KEY,
+        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+        status_reason TEXT,
+        company_name VARCHAR(255) NOT NULL,
+        governorate VARCHAR(255) NOT NULL,
+        city VARCHAR(255) NOT NULL,
+        phone VARCHAR(50) NOT NULL,
+        email VARCHAR(255) NOT NULL,
+        address TEXT NOT NULL,
+        license_number VARCHAR(100) NOT NULL,
+        tax_number VARCHAR(100),
+        license_doc_url TEXT,
+        logo_url TEXT,
+        password_hash VARCHAR(255),
+        company_id VARCHAR(16) REFERENCES companies(id) ON DELETE SET NULL,
+        reviewed_by VARCHAR(255),
+        reviewed_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_company_requests_active_email
+        ON company_requests (LOWER(email)) WHERE status IN ('pending', 'under_review', 'on_hold');
+    `);
+
     console.log('✅ Database tables initialized successfully with 16-character secure alphanumeric IDs.');
   } catch (error) {
     console.error('❌ Error initializing database tables:', error);

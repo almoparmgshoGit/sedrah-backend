@@ -31,6 +31,22 @@ export const loginSchema = z.object({
   }),
 });
 
+export const companyRequestSchema = z.object({
+  body: z.object({
+    companyName: z.string().trim().min(2).max(255),
+    governorate: z.string().trim().min(1).max(255),
+    city: z.string().trim().min(1).max(255),
+    phone: z.string().trim().min(5).max(50),
+    email: z.string().trim().email('Invalid email address format').max(255),
+    address: z.string().trim().min(1).max(1000),
+    licenseNumber: z.string().trim().min(1).max(100),
+    taxNumber: z.string().trim().max(100).nullish(),
+    password: z.string().min(8, 'Password must be at least 8 characters long').max(128),
+    licenseDoc: z.string().nullish(),
+    logo: z.string().nullish(),
+  }),
+});
+
 // Strict validation schema for user profile update (Preventing Mass Assignment of role or balance)
 export const updateProfileSchema = z.object({
   body: z.object({

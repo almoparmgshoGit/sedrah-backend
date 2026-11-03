@@ -10,7 +10,8 @@ import pinoHttp from 'pino-http';
 import { env } from './config/env';
 import { pool } from './config/db';
 import { globalLimiter, authLimiter, authenticate, verifyOwnershipOrAdmin, AuthRequest } from './middlewares/security.middleware';
-import { registerSchema, loginSchema, updateProfileSchema, sendOtpSchema, verifyOtpSchema } from './validators/auth.validator';
+import { registerSchema, loginSchema, updateProfileSchema, sendOtpSchema, verifyOtpSchema, companyRequestSchema } from './validators/auth.validator';
+import { createCompanyRequest } from './controllers/companyRequests.controller';
 import { register, login, sendOtp, verifyOtp, getUserProfile, updateUserProfile, getCurrentUser, updateMyProfile, getProfileStatus, googleLogin, deleteMyAccount, generateGuestToken, handleRefreshToken, logoutUser } from './controllers/auth.controller';
 import { getPublicSettings } from './controllers/admin.controller';
 import citiesRouter from './routes/cities.routes';
@@ -305,6 +306,7 @@ app.post('/api/auth/login', authLimiter, validate(loginSchema), login);
 app.post('/api/auth/google', authLimiter, googleLogin);
 app.post('/api/auth/guest-token', generateGuestToken);
 app.post('/api/auth/refresh-token', handleRefreshToken);
+app.post('/api/company-requests', authLimiter, validate(companyRequestSchema), createCompanyRequest);
 
 // Default Deny: All other /api/* routes require a valid JWT token (Guest, Customer, Company, or Admin)
 app.use('/api', authenticate);

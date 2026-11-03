@@ -49,6 +49,7 @@ import {
   linkCompanyToCity
 } from '../controllers/cities.controller';
 import { createCompanyFull, getCompanyAdminDetails, createCompanyPackage, updateCompany } from '../controllers/companies.controller';
+import { getCompanyRequests, updateCompanyRequestStatus } from '../controllers/companyRequests.controller';
 import { updatePackageByAdmin, deletePackageByAdmin, updatePackageStatusByAdmin } from '../controllers/packages.controller';
 import { sendNotificationByAdmin, getAllAdminNotifications, getPushTokenStats, deleteNotification } from '../controllers/notifications.controller';
 import { authenticate, authorize, idempotencyMiddleware } from '../middlewares/security.middleware';
@@ -72,6 +73,9 @@ router.patch('/bookings/:id/status', idempotencyMiddleware, requireModulePermiss
 router.patch('/bookings/:id/receipt-review', idempotencyMiddleware, requireModulePermission('bookings'), reviewBookingReceiptByAdmin);
 router.patch('/bookings/:id/stages/:stageId', idempotencyMiddleware, requireModulePermission('bookings'), updateTripStageByAdmin);
 router.get('/bookings/:id/stages', requireModulePermission('bookings'), getBookingStagesByAdmin);
+
+router.get('/company-requests', requireModulePermission('companies'), getCompanyRequests);
+router.patch('/company-requests/:id/status', idempotencyMiddleware, requireModulePermission('companies'), updateCompanyRequestStatus);
 
 router.get('/companies', requireModulePermission('companies'), getAllCompanies);
 router.post('/companies', idempotencyMiddleware, requireModulePermission('companies'), createCompanyFull);

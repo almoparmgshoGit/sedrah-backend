@@ -8,6 +8,7 @@ import { AuthRequest } from '../middlewares/security.middleware';
 import { safeParseArray } from '../middlewares/permission.middleware';
 import { formatUserId, generate16CharId } from '../utils/formatId';
 import { sendPlatformEmail } from '../utils/mailer';
+import { getCompanyRequestLoginMessage } from './companyRequests.controller';
 import { resolveUserUpload } from '../utils/uploadAccess';
 
 export const issueTokenPair = async (
@@ -399,6 +400,11 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       [email.trim()]
     );
     if (userResult.rows.length === 0) {
+      const requestMessage = await getCompanyRequestLoginMessage(email.trim(), password);
+      if (requestMessage) {
+        res.status(403).json({ error: requestMessage });
+        return;
+      }
       res.status(401).json({ error: 'البريد الإلكتروني أو كلمة المرور غير صحيحة' });
       return;
     }

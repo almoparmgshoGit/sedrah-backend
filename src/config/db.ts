@@ -968,7 +968,7 @@ export const initDB = async () => {
       const passwordHash = await argon2.hash(process.env.ADMIN_INITIAL_PASSWORD);
       await pool.query(
         `INSERT INTO users (id, name, email, password_hash, phone, role, balance, is_verified, permissions) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [generate16CharId(), 'مالك النظام', 'admin@sdra.com', passwordHash, '+966 50 000 0000', 'super_admin', 0.00, true, allPerms]
+        [generate16CharId(), 'مالك النظام', 'admin@sdra.com', passwordHash, null, 'super_admin', 0.00, true, allPerms]
       );
       console.log('✅ Default super_admin owner created: admin@sdra.com');
     } else if (adminCheck.rows.length > 0) {
@@ -997,17 +997,6 @@ export const initDB = async () => {
       CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
       CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family_id);
     `);
-
-    // Ensure default test user exists
-    const testUserCheck = await pool.query('SELECT id FROM users WHERE email = $1', ['test@example.com']);
-    if (testUserCheck.rows.length === 0 && env.NODE_ENV !== 'production') {
-      const passwordHash = await argon2.hash('password123');
-      await pool.query(
-        `INSERT INTO users (id, name, email, password_hash, phone, role, balance, permissions) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [generate16CharId(), 'مستخدم تجريبي', 'test@example.com', passwordHash, '+201012345678', 'user', 0.00, JSON.stringify([])]
-      );
-      console.log('✅ Default test user created: test@example.com / password123');
-    }
 
     console.log('✅ Database tables initialized successfully with 16-character secure alphanumeric IDs.');
   } catch (error) {

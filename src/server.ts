@@ -9,7 +9,7 @@ import pino from 'pino';
 import pinoHttp from 'pino-http';
 import { env } from './config/env';
 import { pool } from './config/db';
-import { globalLimiter, authLimiter, authenticate, authorize, verifyOwnershipOrAdmin, AuthRequest } from './middlewares/security.middleware';
+import { globalLimiter, authLimiter, authenticate, verifyOwnershipOrAdmin, AuthRequest } from './middlewares/security.middleware';
 import { registerSchema, loginSchema, updateProfileSchema, sendOtpSchema, verifyOtpSchema } from './validators/auth.validator';
 import { register, login, sendOtp, verifyOtp, getUserProfile, updateUserProfile, getCurrentUser, updateMyProfile, getProfileStatus, googleLogin, deleteMyAccount, generateGuestToken, handleRefreshToken, logoutUser } from './controllers/auth.controller';
 import { getPublicSettings } from './controllers/admin.controller';
@@ -347,17 +347,6 @@ app.put(
   authenticate,
   verifyOwnershipOrAdmin,
   updateUserProfile
-);
-
-// Admin-only Route Example (RBAC demonstration)
-app.get(
-  '/api/admin/audit-logs',
-  authenticate,
-  authorize(['admin', 'super_admin']),
-  (req: AuthRequest, res: Response) => {
-    logger.info({ adminId: req.user?.id }, 'Admin accessed audit logs');
-    res.json({ message: 'Secure audit logs accessed successfully', logs: [] });
-  }
 );
 
 // 6. Global Secure Error Handler (Preventing stack trace leakage in production)

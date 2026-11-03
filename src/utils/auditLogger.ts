@@ -19,7 +19,7 @@ export async function logAudit(
         adminName || adminEmail || 'المسؤول',
         action,
         details || '',
-        ipAddress || '127.0.0.1',
+        ipAddress || null,
         beforeData ? (typeof beforeData === 'string' ? beforeData : JSON.stringify(beforeData, null, 2)) : null,
         afterData ? (typeof afterData === 'string' ? afterData : JSON.stringify(afterData, null, 2)) : null,
       ]

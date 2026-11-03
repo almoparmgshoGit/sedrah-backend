@@ -889,15 +889,7 @@ export const toggleHideReviewByAdmin = async (req: AuthRequest, res: Response): 
 
 export const getAuditLogs = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    let result = await pool.query('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 200');
-    if (result.rows.length === 0) {
-      await pool.query(
-        `INSERT INTO audit_logs (id, admin_email, admin_name, action, details, ip_address, before_data, after_data)
-         VALUES ($1, 'admin@sdra.com', 'مالك النظام', 'تهيئة نظام التدقيق', 'تم تفعيل نظام تسجيل النشاط والأمان بنجاح', '127.0.0.1', $2, $3)`,
-        [generate16CharId(), JSON.stringify({ status: 'initializing' }), JSON.stringify({ status: 'active' })]
-      );
-      result = await pool.query('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 200');
-    }
+    const result = await pool.query('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 200');
     res.json(result.rows);
   } catch (error: any) {
     console.error('Error fetching audit logs:', error);

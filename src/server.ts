@@ -15,6 +15,7 @@ import { createCompanyRequest, getMyCompanyRequest, resubmitMyCompanyRequestDocu
 import { register, login, sendOtp, verifyOtp, forgotPassword, resetPassword, getUserProfile, updateUserProfile, getCurrentUser, updateMyProfile, getProfileStatus, googleLogin, deleteMyAccount, generateGuestToken, handleRefreshToken, logoutUser } from './controllers/auth.controller';
 import { getPublicSettings } from './controllers/admin.controller';
 import citiesRouter from './routes/cities.routes';
+import companyWorkspaceRouter from './routes/company.routes';
 import governoratesRouter from './routes/governorates.routes';
 import companiesRouter from './routes/companies.routes';
 import searchRouter from './routes/search.routes';
@@ -334,6 +335,9 @@ app.use('/api/admin/permission-groups', permissionsRouter);
 
 // Companies Routes
 app.use('/api/companies', companiesRouter);
+
+// The signed-in company owner's own workspace
+app.use('/api/company', companyWorkspaceRouter);
 
 // Search & Filter Routes
 app.use('/api/search', searchRouter);

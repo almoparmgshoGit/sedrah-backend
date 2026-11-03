@@ -1007,6 +1007,17 @@ export const initDB = async () => {
       CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family_id);
     `);
 
+    // A company's private notes about its clients, never returned to the client
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS company_client_notes (
+        company_id VARCHAR(16) REFERENCES companies(id) ON DELETE CASCADE,
+        user_id VARCHAR(16) REFERENCES users(id) ON DELETE CASCADE,
+        note TEXT NOT NULL DEFAULT '',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (company_id, user_id)
+      );
+    `);
+
     // Kept out of the users table so reset codes can never leak through a SELECT * on users
     await pool.query(`
       CREATE TABLE IF NOT EXISTS password_resets (

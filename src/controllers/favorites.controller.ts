@@ -56,12 +56,18 @@ export const getUserFavorites = async (req: Request, res: Response): Promise<voi
 
     const favoritesResult = await pool.query(
       `
-      SELECT f.id as favorite_id, f.company_id, f.package_id, f.product_id, f.product_name, f.product_price, f.product_image,
+      SELECT f.id as favorite_id, f.company_id, f.package_id, f.product_id,
+             COALESCE(sp.name, f.product_name) as product_name,
+             COALESCE(COALESCE(sp.discount_price, sp.price)::TEXT, f.product_price) as product_price,
+             COALESCE(sp.image_url, f.product_image) as product_image,
              c.name as company_name, c.logo_url as company_logo, c.rating as company_rating, c.reviews_count, c.verified,
              p.title as package_title, p.price as package_price, p.duration as package_duration, p.image_url as package_image
       FROM favorites f
       LEFT JOIN companies c ON f.company_id = c.id
       LEFT JOIN packages p ON f.package_id = p.id
+      -- Product details come from the store; the app only sends the product id when favoriting
+      LEFT JOIN store_products sp ON f.product_id IS NOT NULL
+        AND (sp.id = f.product_id OR sp.public_id = f.product_id OR sp.custom_id = f.product_id)
       WHERE f.user_id = $1
       ORDER BY f.created_at DESC
       `,

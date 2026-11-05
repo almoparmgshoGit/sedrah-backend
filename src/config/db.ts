@@ -898,6 +898,7 @@ export const initDB = async () => {
 
     await pool.query(`
       ALTER TABLE cities ADD COLUMN IF NOT EXISTS public_id VARCHAR(50);
+      ALTER TABLE cities ADD COLUMN IF NOT EXISTS banner_url TEXT;
       ALTER TABLE store_categories ADD COLUMN IF NOT EXISTS public_id VARCHAR(50);
       ALTER TABLE store_products ADD COLUMN IF NOT EXISTS public_id VARCHAR(50);
       ALTER TABLE store_banners ADD COLUMN IF NOT EXISTS public_id VARCHAR(50);

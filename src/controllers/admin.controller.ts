@@ -818,6 +818,7 @@ export const getAllCities = async (req: AuthRequest, res: Response): Promise<voi
         c.id,
         c.name,
         c.image_url,
+        c.banner_url,
         c.description,
         c.created_at,
         COALESCE(comp.total_companies, 0)::INTEGER AS total_companies,

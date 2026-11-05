@@ -10,6 +10,7 @@ export const getCities = async (req: Request, res: Response): Promise<void> => {
         c.id,
         c.name,
         c.image_url,
+        c.banner_url,
         c.description,
         c.created_at,
         COALESCE(comp.total_companies, 0)::INTEGER AS total_companies,
@@ -62,15 +63,17 @@ export const getCityById = async (req: Request, res: Response): Promise<void> =>
 export const updateCity = async (req: Request, res: Response): Promise<void> => {
   try {
     const cityId = req.params.id;
-    const { name, image_url, description } = req.body;
+    const { name, image_url, description, banner_url } = req.body;
 
+    // banner_url: undefined keeps the current banner, '' removes it
     const result = await pool.query(
       `UPDATE cities SET
          name = COALESCE($1, name),
          image_url = COALESCE($2, image_url),
-         description = COALESCE($3, description)
+         description = COALESCE($3, description),
+         banner_url = CASE WHEN $5::text IS NULL THEN banner_url ELSE NULLIF($5::text, '') END
        WHERE id = $4 RETURNING *`,
-      [name, image_url, description, cityId]
+      [name, image_url, description, cityId, banner_url === undefined ? null : banner_url]
     );
 
     if (result.rows.length === 0) {

@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import crypto from 'crypto';
 import { pool } from '../config/db';
 import { parseIdOrToken, generate16CharId } from '../utils/formatId';
 import { suggestAppointmentForBooking } from '../utils/appointmentEngine';
@@ -32,6 +33,25 @@ const calculateBookingTotal = (pkg: any, roomType: string, adults: number, child
   return adults * adult + children * child;
 };
 
+const ROOM_TYPES = ['quad', 'triple', 'double', 'single'];
+const MAX_TRAVELERS = 50;
+
+const cleanText = (value: unknown, maxLength: number): string | null => {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  return text ? text.slice(0, maxLength) : null;
+};
+
+// Booking codes are typed by customers when linking a booking, so they stay short but come from a secure source
+const generateBookingReference = async (): Promise<string> => {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const ref = `SDR-${crypto.randomInt(100000, 1000000)}`;
+    const exists = await pool.query('SELECT 1 FROM bookings WHERE booking_reference = $1', [ref]);
+    if (exists.rows.length === 0) return ref;
+  }
+  return `SDR-${crypto.randomInt(10000000, 100000000)}`;
+};
+
 export const createBooking = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = (req as any).user?.id || (req as any).user?.userId;
@@ -40,9 +60,32 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
-    const { packageId, travelersCount, bookingMethod, roomType, childrenCount, notes } = req.body;
+    const { packageId, bookingMethod, notes } = req.body || {};
     if (!packageId) {
       res.status(400).json({ error: 'بيانات الحجز غير مكتملة' });
+      return;
+    }
+
+    const travelersCount = req.body.travelersCount === undefined ? 2 : Number(req.body.travelersCount);
+    const childrenCount = req.body.childrenCount === undefined ? 0 : Number(req.body.childrenCount);
+    if (!Number.isInteger(travelersCount) || travelersCount < 1 || travelersCount > MAX_TRAVELERS
+      || !Number.isInteger(childrenCount) || childrenCount < 0 || childrenCount >= travelersCount) {
+      res.status(400).json({ error: 'عدد المسافرين غير صالح (يجب أن يكون هناك بالغ واحد على الأقل)' });
+      return;
+    }
+
+    const roomType = req.body.roomType === undefined ? 'quad' : String(req.body.roomType);
+    if (!ROOM_TYPES.includes(roomType)) {
+      res.status(400).json({ error: 'نوع الغرفة غير صالح' });
+      return;
+    }
+
+    const customerName = cleanText(req.body.customerName, 255);
+    const customerPhone = cleanText(req.body.customerPhone, 50);
+    const governorate = cleanText(req.body.governorate, 255);
+    const district = cleanText(req.body.district, 255);
+    if (customerPhone && !/^\+?[0-9\s-]{7,20}$/.test(customerPhone)) {
+      res.status(400).json({ error: 'رقم الهاتف غير صالح' });
       return;
     }
 
@@ -53,16 +96,20 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       resolvedPackageId = pkgRes.rows.length > 0 ? pkgRes.rows[0].id : parsedPkg.value;
     }
 
-    const pkgRes = await pool.query('SELECT company_id, price, room_prices FROM packages WHERE id = $1', [resolvedPackageId]);
+    // Only packages the customer can see in the app can be booked
+    const pkgRes = await pool.query(
+      `SELECT company_id, price, room_prices FROM packages WHERE id = $1 AND (status = 'active' OR status IS NULL)`,
+      [resolvedPackageId]
+    );
     if (pkgRes.rows.length === 0) {
-      res.status(404).json({ error: 'الباقة غير موجودة' });
+      res.status(404).json({ error: 'الباقة غير موجودة أو غير متاحة للحجز حالياً' });
       return;
     }
     const companyId = pkgRes.rows[0].company_id;
 
-    const childrenTotal = Math.max(Number(childrenCount) || 0, 0);
-    const adultsTotal = Math.max((Number(travelersCount) || 2) - childrenTotal, 1);
-    const totalPrice = calculateBookingTotal(pkgRes.rows[0], roomType || 'quad', adultsTotal, childrenTotal);
+    const childrenTotal = childrenCount;
+    const adultsTotal = travelersCount - childrenCount;
+    const totalPrice = calculateBookingTotal(pkgRes.rows[0], roomType, adultsTotal, childrenTotal);
 
     // Suggest appointment for booking
     let suggestedAppt = await suggestAppointmentForBooking(companyId);
@@ -75,7 +122,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       };
     }
 
-    const bookingRef = 'SDR-' + Math.floor(100000 + Math.random() * 900000);
+    const bookingRef = await generateBookingReference();
 
     // Fetch commission settings
     const settingsRes = await pool.query('SELECT key, value FROM settings WHERE key IN (\'commission_system_enabled\', \'commission_method\', \'commission_percentage\', \'adult_commission_rate\', \'child_commission_rate\', \'fixed_commission_amount\', \'platform_commission_fee\')');
@@ -91,8 +138,9 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
 
     if (commissionEnabled) {
       const total = Number(totalPrice) || 0;
-      const countAdults = Number(travelersCount) || 1;
-      const countChildren = Number(childrenCount) || 0;
+      // travelersCount already includes the children
+      const countAdults = adultsTotal;
+      const countChildren = childrenTotal;
 
       if (commissionMethod === 'per_individual') {
         const adultRate = Number(settingsMap['adult_commission_rate'] || 5);
@@ -112,31 +160,6 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
     }
 
     const newBookingId = generate16CharId();
-    const result = await pool.query(
-      `INSERT INTO bookings (id, user_id, package_id, booking_reference, status, booking_method, room_type, travelers_count, children_count, total_price, notes, appointment_date, appointment_time, appointment_status, commission_amount, commission_method_used, commission_rate_used)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING *`,
-      [
-        newBookingId,
-        userId,
-        resolvedPackageId,
-        bookingRef,
-        'new',
-        bookingMethod || 'sidra',
-        roomType || 'quad',
-        travelersCount || 2,
-        childrenCount || 0,
-        totalPrice,
-        notes || '',
-        suggestedAppt ? suggestedAppt.date : null,
-        suggestedAppt ? suggestedAppt.time : null,
-        suggestedAppt ? 'suggested' : 'none',
-        commissionAmount,
-        commissionMethod,
-        rateUsedDesc
-      ]
-    );
-
-    const bookingId = result.rows[0].id;
     const currentDate = new Date().toLocaleDateString('ar-EG', { month: 'long', day: 'numeric', year: 'numeric' });
 
     const apptSubtitle = suggestedAppt
@@ -155,11 +178,59 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       { order: 8, title: 'اكتملت الرحلة بسلام', subtitle: 'عمرة مقبولة وذنب مغفور', status: 'pending', date: 'العودة' },
     ];
 
-    for (const st of defaultStages) {
-      await pool.query(
-        `INSERT INTO trip_stages (id, booking_id, stage_order, title, subtitle, status, stage_date) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [generate16CharId(), bookingId, st.order, st.title, st.subtitle, st.status, st.date]
+    // The booking and its stages are saved together, so a failure never leaves a booking without stages
+    const client = await pool.connect();
+    let result: any;
+    try {
+      await client.query('BEGIN');
+      result = await client.query(
+        `INSERT INTO bookings (id, user_id, package_id, booking_reference, status, booking_method, room_type, travelers_count, children_count, total_price, notes, appointment_date, appointment_time, appointment_status, commission_amount, commission_method_used, commission_rate_used, customer_name, customer_phone, governorate, district)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) RETURNING *`,
+        [
+          newBookingId,
+          userId,
+          resolvedPackageId,
+          bookingRef,
+          'new',
+          cleanText(bookingMethod, 50) || 'sidra',
+          roomType,
+          travelersCount,
+          childrenCount,
+          totalPrice,
+          cleanText(notes, 2000) || '',
+          suggestedAppt ? suggestedAppt.date : null,
+          suggestedAppt ? suggestedAppt.time : null,
+          suggestedAppt ? 'suggested' : 'none',
+          commissionAmount,
+          commissionMethod,
+          rateUsedDesc,
+          customerName,
+          customerPhone,
+          governorate,
+          district,
+        ]
       );
+
+      for (const st of defaultStages) {
+        await client.query(
+          `INSERT INTO trip_stages (id, booking_id, stage_order, title, subtitle, status, stage_date) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [generate16CharId(), newBookingId, st.order, st.title, st.subtitle, st.status, st.date]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      client.release();
+    }
+
+    // Fill missing profile details from the booking form, never overwriting what the customer already saved
+    if (customerName || customerPhone || governorate) {
+      await pool.query(
+        `UPDATE users SET name = COALESCE(NULLIF(name, ''), $1), phone = COALESCE(NULLIF(phone, ''), $2), city = COALESCE(NULLIF(city, ''), $3) WHERE id = $4`,
+        [customerName, customerPhone, governorate, userId]
+      ).catch(() => {});
     }
 
     // Create real notification and send push for booking creation
@@ -171,7 +242,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       icon: 'checkmark-circle-outline',
       iconBg: 'bg-emerald-50 border-emerald-100',
       iconColor: '#059669',
-      data: { type: 'booking_created', bookingRef, bookingId },
+      data: { type: 'booking_created', bookingRef, bookingId: newBookingId },
     });
 
     res.status(201).json({
@@ -193,25 +264,18 @@ export const getUserBookings = async (req: Request, res: Response): Promise<void
       return;
     }
 
-    // Auto-fix bookings that were incorrectly marked completed without receipt approval
-    await pool.query(`
-      UPDATE bookings
-      SET status = 'receipt_review'
-      WHERE receipt_approved = FALSE AND (status = 'completed' OR status = 'confirmed')
-    `);
-
-    // Auto-update completed bookings ONLY when confirmed and all stages are completed
+    // Only this customer's own bookings are touched; listing must never change other customers' data
     await pool.query(`
       UPDATE bookings b
       SET status = 'completed'
-      WHERE b.status = 'confirmed' AND b.receipt_approved = TRUE
+      WHERE b.user_id = $1 AND b.status = 'confirmed' AND b.receipt_approved = TRUE
       AND NOT EXISTS (
         SELECT 1 FROM trip_stages ts WHERE ts.booking_id = b.id AND ts.status != 'completed'
       )
       AND EXISTS (
         SELECT 1 FROM trip_stages ts WHERE ts.booking_id = b.id
       )
-    `);
+    `, [String(userId)]);
 
     const result = await pool.query(
       `
@@ -297,9 +361,30 @@ export const updateBookingReceipt = async (req: Request, res: Response): Promise
 
     const bookingRecord = bookingCheck.rows[0];
 
+    if (bookingRecord.status === 'cancelled' || bookingRecord.status === 'completed') {
+      res.status(400).json({ error: 'لا يمكن رفع إيصال لحجز ملغي أو مكتمل' });
+      return;
+    }
+    if (bookingRecord.receipt_approved === true || bookingRecord.status === 'confirmed') {
+      res.status(400).json({ error: 'تم اعتماد إيصال هذا الحجز بالفعل' });
+      return;
+    }
+    if (bookingRecord.receipt_status === 'rejected' && bookingRecord.allow_retry === false) {
+      res.status(400).json({ error: 'تم إغلاق هذا الحجز ولا يمكن إعادة رفع الإيصال، يرجى التواصل مع الدعم' });
+      return;
+    }
+    if (paidAmount !== undefined && paidAmount !== null && paidAmount !== '' && (!(Number(paidAmount) > 0) || Number(paidAmount) > 99999999)) {
+      res.status(400).json({ error: 'المبلغ المدفوع غير صالح' });
+      return;
+    }
+
     const finalReceiptUrl = await resolveUserUpload(receiptUrl || receipt_url, req, String(userId), bookingRecord.receipt_url);
     if (finalReceiptUrl === false) {
       res.status(400).json({ error: 'رابط الإيصال غير صالح' });
+      return;
+    }
+    if (!finalReceiptUrl) {
+      res.status(400).json({ error: 'يرجى إرفاق صورة أو ملف الإيصال' });
       return;
     }
 

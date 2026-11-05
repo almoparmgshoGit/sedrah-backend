@@ -13,12 +13,41 @@ export const globalLimiter = rateLimit({
   message: { error: 'Too many requests from this IP, please try again after 15 minutes.' },
 });
 
+// Routes that send email or create accounts (register, send OTP, company requests)
 export const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Generous limit on auth attempts in development
+  max: 50,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many authentication attempts, please try again later.' },
+  message: { error: 'محاولات كثيرة، يرجى المحاولة بعد 15 دقيقة' },
+});
+
+// Credential checks: only failed attempts count, so users sharing one network are not locked out by each other's logins
+export const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  skipSuccessfulRequests: true,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'محاولات دخول خاطئة كثيرة، يرجى المحاولة بعد 15 دقيقة' },
+});
+
+// Token issuing endpoints that any client can call without credentials
+export const sessionLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'طلبات كثيرة، يرجى المحاولة لاحقاً' },
+});
+
+// Booking codes are short, so guessing them is throttled
+export const bookingLinkLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'محاولات كثيرة لربط الحجز، يرجى المحاولة بعد 15 دقيقة' },
 });
 
 // Each reset request can send an email or run argon2, so it gets a tighter limit than other auth routes
@@ -74,7 +103,7 @@ export const authenticate = async (req: AuthRequest, res: Response, next: NextFu
   const token = authHeader.split(' ')[1];
 
   try {
-    const rawDecoded = jwt.verify(token, env.JWT_SECRET) as any;
+    const rawDecoded = jwt.verify(token, env.JWT_SECRET, { algorithms: ['HS256'] }) as any;
 
     const role = rawDecoded.role;
     const aud = rawDecoded.aud;
@@ -160,10 +189,12 @@ import crypto from 'crypto';
 const processingKeys = new Set<string>();
 
 export const idempotencyMiddleware = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
-  const idempotencyKey = req.headers['x-idempotency-key'] as string;
-  if (!idempotencyKey) {
+  const clientKey = req.headers['x-idempotency-key'];
+  if (!clientKey || typeof clientKey !== 'string' || clientKey.length > 100) {
     return next();
   }
+  // Scoped to the caller, so one user can never replay or block another user's request
+  const idempotencyKey = `${req.user?.id || 'anon'}:${clientKey}`;
 
   // 1. Race condition check: If another identical request is currently executing in-flight, block concurrent duplicate
   if (processingKeys.has(idempotencyKey)) {
@@ -200,6 +231,11 @@ export const idempotencyMiddleware = async (req: AuthRequest, res: Response, nex
     const originalJson = res.json.bind(res);
     res.json = (body: any) => {
       const status = res.statusCode;
+      // Only successful results are replayed; a failed attempt can be retried with the same key
+      if (status >= 400) {
+        cleanup();
+        return originalJson(body);
+      }
       pool.query(
         'INSERT INTO idempotency_keys (key, user_id, request_hash, response_status, response_body) VALUES ($1, $2, $3, $4, $5::jsonb) ON CONFLICT (key) DO NOTHING',
         [idempotencyKey, userId, requestHash, status, JSON.stringify(body)]

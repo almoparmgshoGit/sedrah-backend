@@ -534,7 +534,7 @@ export const getAllBookings = async (req: AuthRequest, res: Response): Promise<v
     await pool.query(`
       UPDATE bookings b
       SET status = 'completed'
-      WHERE b.status != 'cancelled' AND b.status != 'completed'
+      WHERE b.status != 'cancelled' AND b.status != 'completed' AND b.receipt_approved = TRUE
       AND NOT EXISTS (
         SELECT 1 FROM trip_stages ts WHERE ts.booking_id = b.id AND ts.status != 'completed'
       )
@@ -543,7 +543,8 @@ export const getAllBookings = async (req: AuthRequest, res: Response): Promise<v
       )
     `);
     const result = await pool.query(`
-      SELECT b.*, u.name as customer_name, p.title as package_title, c.name as company_name
+      SELECT b.*, COALESCE(b.customer_name, u.name) as customer_name, COALESCE(b.customer_phone, u.phone) as customer_phone,
+             p.title as package_title, c.name as company_name
       FROM bookings b
       LEFT JOIN users u ON b.user_id = u.id
       LEFT JOIN packages p ON b.package_id = p.id
@@ -730,7 +731,7 @@ export const updateTripStageByAdmin = async (req: AuthRequest, res: Response): P
     await pool.query(`
       UPDATE bookings b
       SET status = 'completed'
-      WHERE b.id = $1 AND b.status != 'cancelled'
+      WHERE b.id = $1 AND b.status != 'cancelled' AND b.receipt_approved = TRUE
       AND NOT EXISTS (
         SELECT 1 FROM trip_stages ts WHERE ts.booking_id = b.id AND ts.status != 'completed'
       )

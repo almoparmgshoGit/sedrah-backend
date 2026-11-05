@@ -358,10 +358,21 @@ export const addCompanyReview = async (req: AuthRequest, res: Response): Promise
 
     const companyId = compRes.rows[0].id;
     const userId = req.user?.id;
-    const { rating, comment } = req.body;
+    const rating = Number(req.body?.rating);
+    const comment = typeof req.body?.comment === 'string' ? req.body.comment.trim() : '';
 
     if (!userId) {
       res.status(401).json({ error: 'يجب تسجيل الدخول لإضافة تقييم' });
+      return;
+    }
+
+    // An out-of-range value would distort the company's average rating for everyone
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      res.status(400).json({ error: 'التقييم يجب أن يكون من 1 إلى 5 نجوم' });
+      return;
+    }
+    if (comment.length > 1000) {
+      res.status(400).json({ error: 'التعليق طويل جداً (الحد الأقصى 1000 حرف)' });
       return;
     }
 

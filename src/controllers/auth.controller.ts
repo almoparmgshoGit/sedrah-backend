@@ -63,8 +63,8 @@ export const generateGuestToken = async (req: Request, res: Response): Promise<v
 
 export const handleRefreshToken = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { refreshToken, clientType = 'customer' } = req.body || {};
-    if (!refreshToken || typeof refreshToken !== 'string' || !refreshToken.includes('.')) {
+    const { refreshToken } = req.body || {};
+    if (!refreshToken || typeof refreshToken !== 'string' || !refreshToken.includes('.') || refreshToken.length > 200) {
       res.status(401).json({ error: 'Refresh token missing or malformed' });
       return;
     }
@@ -79,6 +79,8 @@ export const handleRefreshToken = async (req: Request, res: Response): Promise<v
     }
 
     const tokenRow = tokenRes.rows[0];
+    // The session type was fixed when the session was created; the client cannot change it on refresh
+    const clientType: string = tokenRow.client_type || 'customer';
 
     // Reuse detection: if token is already revoked, revoke the entire family!
     if (tokenRow.is_revoked) {
@@ -161,10 +163,22 @@ export const handleRefreshToken = async (req: Request, res: Response): Promise<v
 
 export const logoutUser = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { refreshToken } = req.body || {};
-    if (refreshToken && typeof refreshToken === 'string' && refreshToken.includes('.')) {
-      const [tokenId] = refreshToken.split('.');
-      await pool.query('UPDATE refresh_tokens SET is_revoked = TRUE WHERE id = $1', [tokenId]);
+    const { refreshToken, pushToken } = req.body || {};
+    if (refreshToken && typeof refreshToken === 'string' && refreshToken.includes('.') && refreshToken.length <= 200) {
+      const [tokenId, rawToken] = refreshToken.split('.');
+      const tokenHash = crypto.createHash('sha256').update(rawToken || '').digest('hex');
+      const tokenRes = await pool.query('SELECT user_id, token_hash FROM refresh_tokens WHERE id = $1', [tokenId]);
+      const tokenRow = tokenRes.rows[0];
+
+      // Only the holder of the full refresh token can end that session
+      if (tokenRow && tokenRow.token_hash === tokenHash) {
+        await pool.query('UPDATE refresh_tokens SET is_revoked = TRUE WHERE id = $1', [tokenId]);
+
+        // Stop this device receiving the signed-out account's notifications
+        if (pushToken && typeof pushToken === 'string' && pushToken.length <= 255) {
+          await pool.query('DELETE FROM push_tokens WHERE token = $1 AND user_id = $2', [pushToken, tokenRow.user_id]);
+        }
+      }
     }
     res.json({ success: true, message: 'تم تسجيل الخروج بنجاح' });
   } catch (error: any) {
@@ -575,6 +589,8 @@ export const resetPassword = async (req: Request, res: Response): Promise<void> 
   }
 };
 
+const MAX_FAILED_LOGINS = 10;
+
 export const login = async (req: Request, res: Response): Promise<void> => {
   try {
     const { email, password } = req.body;
@@ -590,6 +606,12 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 
     const user = userResult.rows[0];
 
+    // Per-account lockout: guessing one account's password from many addresses is stopped too
+    if (user.login_locked_until && new Date(user.login_locked_until) > new Date()) {
+      res.status(429).json({ error: 'تم إيقاف تسجيل الدخول لهذا الحساب مؤقتاً بسبب محاولات خاطئة متكررة، يرجى المحاولة بعد 15 دقيقة أو استعادة كلمة المرور' });
+      return;
+    }
+
     // Verify password safely (handles both argon2 hash and legacy/unhashed passwords)
     let validPassword = false;
     if (!user.password_hash || !user.password_hash.startsWith('$')) {
@@ -603,8 +625,19 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     }
 
     if (!validPassword) {
+      await pool.query(
+        `UPDATE users
+         SET failed_login_attempts = CASE WHEN COALESCE(failed_login_attempts, 0) + 1 >= $2 THEN 0 ELSE COALESCE(failed_login_attempts, 0) + 1 END,
+             login_locked_until = CASE WHEN COALESCE(failed_login_attempts, 0) + 1 >= $2 THEN NOW() + INTERVAL '15 minutes' ELSE login_locked_until END
+         WHERE id = $1`,
+        [user.id, MAX_FAILED_LOGINS]
+      );
       res.status(401).json({ error: 'البريد الإلكتروني أو كلمة المرور غير صحيحة' });
       return;
+    }
+
+    if (user.failed_login_attempts || user.login_locked_until) {
+      await pool.query('UPDATE users SET failed_login_attempts = 0, login_locked_until = NULL WHERE id = $1', [user.id]);
     }
 
     // Admins and Super Admins bypass OTP verification; regular users must be verified
@@ -1013,8 +1046,68 @@ export const deleteMyAccount = async (req: AuthRequest, res: Response): Promise<
       res.status(401).json({ error: 'غير مصرح' });
       return;
     }
-    const userId = req.user.id;
-    await pool.query('DELETE FROM users WHERE id = $1', [userId]);
+    const userId = String(req.user.id);
+
+    const userRes = await pool.query('SELECT role FROM users WHERE id = $1', [userId]);
+    const role = userRes.rows[0]?.role;
+    const ownsCompany = await pool.query('SELECT 1 FROM companies WHERE user_id = $1 LIMIT 1', [userId]);
+    // Deleting these accounts would cascade into a whole company or remove platform staff
+    if (ownsCompany.rows.length > 0 || ['admin', 'super_admin', 'support', 'moderator', 'owner'].includes(role)) {
+      res.status(409).json({ error: 'لا يمكن حذف حساب مرتبط بشركة أو بإدارة المنصة من التطبيق، يرجى التواصل مع الدعم' });
+      return;
+    }
+
+    // Paid or in-progress bookings are financial records the company and the platform must keep
+    const activeBookings = await pool.query(
+      `SELECT 1 FROM bookings
+       WHERE user_id = $1 AND status IN ('receipt_review', 'confirmed')
+       LIMIT 1`,
+      [userId]
+    );
+    if (activeBookings.rows.length > 0) {
+      res.status(409).json({ error: 'لديك حجز قيد المراجعة أو مؤكد، لا يمكن حذف الحساب قبل انتهائه أو إلغائه. يرجى التواصل مع الدعم' });
+      return;
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const records = await client.query(
+        `SELECT
+           EXISTS (SELECT 1 FROM bookings WHERE user_id = $1 AND (receipt_url IS NOT NULL OR status = 'completed')) AS has_bookings,
+           EXISTS (SELECT 1 FROM store_orders WHERE user_id = $1) AS has_orders`,
+        [userId]
+      );
+      const { has_bookings, has_orders } = records.rows[0];
+
+      if (has_bookings || has_orders) {
+        // Keep the records but remove everything that identifies the person, and lock the account
+        await client.query(
+          `UPDATE users SET name = 'مستخدم محذوف', email = $2, phone = NULL, address = NULL, city = NULL, country = NULL,
+             avatar = NULL, password_hash = $3, status = 'inactive', otp_code = NULL
+           WHERE id = $1`,
+          [userId, `deleted-${userId}@deleted.invalid`, `deleted:${crypto.randomBytes(32).toString('hex')}`]
+        );
+        await client.query(
+          `UPDATE bookings SET customer_name = NULL, customer_phone = NULL, governorate = NULL, district = NULL WHERE user_id = $1`,
+          [userId]
+        );
+        await client.query('UPDATE store_orders SET user_id = NULL WHERE user_id = $1', [userId]);
+        await client.query('DELETE FROM push_tokens WHERE user_id = $1', [userId]);
+        await client.query('DELETE FROM favorites WHERE user_id = $1', [userId]);
+        await client.query('DELETE FROM notifications WHERE user_id = $1', [userId]);
+        await client.query('UPDATE refresh_tokens SET is_revoked = TRUE WHERE user_id = $1', [userId]);
+      } else {
+        await client.query('DELETE FROM users WHERE id = $1', [userId]);
+      }
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      client.release();
+    }
+
     res.json({
       success: true,
       message: 'تم حذف حسابك بنجاح',

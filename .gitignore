@@ -18,6 +18,9 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
+# customer uploads (receipts, documents, chat and profile images) must never be committed
+/uploads/
+
 # local env files
 .env
 .env.local

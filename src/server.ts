@@ -9,7 +9,7 @@ import pino from 'pino';
 import pinoHttp from 'pino-http';
 import { env } from './config/env';
 import { pool } from './config/db';
-import { globalLimiter, authLimiter, passwordResetLimiter, authenticate, verifyOwnershipOrAdmin, AuthRequest } from './middlewares/security.middleware';
+import { globalLimiter, authLimiter, loginLimiter, sessionLimiter, passwordResetLimiter, authenticate, verifyOwnershipOrAdmin, AuthRequest } from './middlewares/security.middleware';
 import { registerSchema, loginSchema, updateProfileSchema, sendOtpSchema, verifyOtpSchema, forgotPasswordSchema, resetPasswordSchema, companyRequestSchema, companyRequestDocumentSchema } from './validators/auth.validator';
 import { createCompanyRequest, getMyCompanyRequest, resubmitMyCompanyRequestDocument } from './controllers/companyRequests.controller';
 import { register, login, sendOtp, verifyOtp, forgotPassword, resetPassword, getUserProfile, updateUserProfile, getCurrentUser, updateMyProfile, getProfileStatus, googleLogin, deleteMyAccount, generateGuestToken, handleRefreshToken, logoutUser } from './controllers/auth.controller';
@@ -45,6 +45,25 @@ const logger = pino({
 const app = express();
 app.disable('x-powered-by');
 
+// Behind nginx every request arrives from the proxy; without this all users would share one rate-limit bucket
+const parseTrustProxy = (value: string): boolean | number | string => {
+  const clean = value.trim();
+  if (clean === 'true') return true;
+  if (clean === 'false') return false;
+  if (/^\d+$/.test(clean)) return parseInt(clean, 10);
+  return clean;
+};
+app.set('trust proxy', parseTrustProxy(env.TRUST_PROXY));
+
+// Browser origins allowed to call the API. Native apps send no Origin header and are always allowed.
+const allowedOrigins = env.CORS_ORIGIN.split(',').map(o => o.trim().replace(/\/+$/, '')).filter(Boolean);
+const allowAnyOrigin = allowedOrigins.length === 0 || allowedOrigins.includes('*');
+if (allowAnyOrigin && env.NODE_ENV === 'production') {
+  logger.warn('CORS_ORIGIN is "*": any website can call the API. Set it to the admin and company panel origins.');
+}
+const isOriginAllowed = (origin: string | undefined): boolean =>
+  !origin || allowAnyOrigin || allowedOrigins.includes(origin.replace(/\/+$/, ''));
+
 // Deep Link Verification Endpoints (Android App Links & iOS Universal Links)
 app.get('/.well-known/assetlinks.json', (req: Request, res: Response) => {
   res.setHeader('Content-Type', 'application/json');
@@ -78,8 +97,14 @@ app.get(['/.well-known/apple-app-site-association', '/apple-app-site-association
 });
 
 // Non-app browser fallback redirect page for shared links
+const SHARE_PATH = /^\/(company|package|product)\/[A-Za-z0-9_.~%-]{1,200}\/?$/;
 app.get(['/company/*', '/package/*', '/product/*'], (req: Request, res: Response) => {
   const reqPath = req.path;
+  // The path is written into HTML and a script, so only plain id characters are accepted
+  if (!SHARE_PATH.test(reqPath)) {
+    res.status(404).json({ error: 'Not Found' });
+    return;
+  }
   const deepLinkUrl = `sdra:/${reqPath}`;
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -122,16 +147,17 @@ app.get('/', (req: Request, res: Response) => {
 const server = http.createServer(app);
 const io = new SocketIOServer(server, {
   cors: {
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    origin: (origin, callback) => callback(null, isOriginAllowed(origin)),
+    methods: ['GET', 'POST'],
   },
+  maxHttpBufferSize: 1e6,
 });
 
 const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
 
 io.use((socket, next) => {
   try {
-    const decoded = jwt.verify(String(socket.handshake.auth?.token || ''), env.JWT_SECRET) as any;
+    const decoded = jwt.verify(String(socket.handshake.auth?.token || ''), env.JWT_SECRET, { algorithms: ['HS256'] }) as any;
     if (decoded.role === 'guest' || decoded.aud === 'sdra-guest') return next(new Error('Unauthorized'));
     socket.data.user = decoded;
     next();
@@ -169,30 +195,35 @@ io.on('connection', (socket) => {
 export { io };
 
 // 1. Security HTTP Headers (Helmet)
+// The API serves JSON; the only HTML it serves is the share-link page with its small inline redirect script
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
   contentSecurityPolicy: {
     directives: {
-      defaultSrc: ["'self'", "*"],
-      imgSrc: ["'self'", "data:", "blob:", "https:", "http:"],
-      scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
-      styleSrc: ["'self'", "'unsafe-inline'", "https:"],
-      connectSrc: ["'self'", "*", "https:", "http:", "ws:", "wss:"],
+      defaultSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      connectSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      frameAncestors: ["'none'"],
     },
   },
 }));
 
-// 2. Strict CORS Configuration
+// 2. CORS: only the configured browser origins (see CORS_ORIGIN). Auth uses bearer tokens, never cookies.
 app.use(cors({
-  origin: (origin, callback) => callback(null, true),
+  origin: (origin, callback) => callback(null, isOriginAllowed(origin)),
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Idempotency-Key', 'x-idempotency-key'],
-  credentials: true,
+  credentials: !allowAnyOrigin,
 }));
 
-// 3. Request Body Parser with size limits to prevent DoS (payload too large)
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+// 3. Request body size limits. Large bodies are accepted only where files are sent as base64.
+app.use('/api/upload', express.json({ limit: '20mb' }));
+app.use('/api/company-requests', express.json({ limit: '20mb' }));
+app.use(express.json({ limit: '5mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
 // 4. Pino HTTP Request Logger Middleware
 app.use(pinoHttp({
@@ -230,7 +261,7 @@ app.get('/uploads/:category/:filename', async (req: Request, res: Response): Pro
       let isAuthorized = false;
       if (token) {
         try {
-          const decoded = jwt.verify(token, env.JWT_SECRET) as any;
+          const decoded = jwt.verify(token, env.JWT_SECRET, { algorithms: ['HS256'] }) as any;
           if (decoded.role !== 'guest' && decoded.aud !== 'sdra-guest') {
             isAuthorized = await canAccessUpload(String(decoded.id), filename);
           }
@@ -302,13 +333,15 @@ app.get('/api/public/settings', getPublicSettings);
 // Public Session Creation Routes (No Token Required)
 app.post('/api/auth/register', authLimiter, validate(registerSchema), register);
 app.post('/api/auth/send-otp', authLimiter, validate(sendOtpSchema), sendOtp);
-app.post('/api/auth/verify-otp', authLimiter, validate(verifyOtpSchema), verifyOtp);
-app.post('/api/auth/login', authLimiter, validate(loginSchema), login);
+app.post('/api/auth/verify-otp', loginLimiter, validate(verifyOtpSchema), verifyOtp);
+app.post('/api/auth/login', loginLimiter, validate(loginSchema), login);
 app.post('/api/auth/forgot-password', passwordResetLimiter, validate(forgotPasswordSchema), forgotPassword);
 app.post('/api/auth/reset-password', passwordResetLimiter, validate(resetPasswordSchema), resetPassword);
-app.post('/api/auth/google', authLimiter, googleLogin);
-app.post('/api/auth/guest-token', generateGuestToken);
-app.post('/api/auth/refresh-token', handleRefreshToken);
+app.post('/api/auth/google', loginLimiter, googleLogin);
+app.post('/api/auth/guest-token', sessionLimiter, generateGuestToken);
+app.post('/api/auth/refresh-token', sessionLimiter, handleRefreshToken);
+// Logout is proven by the refresh token itself, so it works even after the access token has expired
+app.post('/api/auth/logout', sessionLimiter, logoutUser);
 
 // Default Deny: All other /api/* routes require a valid JWT token (Guest, Customer, Company, or Admin)
 app.use('/api', authenticate);
@@ -318,7 +351,6 @@ app.post('/api/company-requests', authLimiter, validate(companyRequestSchema), c
 app.get('/api/company-requests/my', getMyCompanyRequest);
 app.post('/api/company-requests/my/document', authLimiter, validate(companyRequestDocumentSchema), resubmitMyCompanyRequestDocument);
 
-app.post('/api/auth/logout', logoutUser);
 app.get('/api/auth/me', getCurrentUser);
 app.put('/api/auth/profile', updateMyProfile);
 app.get('/api/auth/profile-status', getProfileStatus);
@@ -392,6 +424,14 @@ app.put(
 
 // 6. Global Secure Error Handler (Preventing stack trace leakage in production)
 app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+  if (err?.type === 'entity.too.large') {
+    res.status(413).json({ error: 'حجم البيانات المرسلة أكبر من المسموح' });
+    return;
+  }
+  if (err?.type === 'entity.parse.failed') {
+    res.status(400).json({ error: 'صيغة البيانات المرسلة غير صالحة' });
+    return;
+  }
   logger.error(err);
   const statusCode = err.status || 500;
   res.status(statusCode).json({

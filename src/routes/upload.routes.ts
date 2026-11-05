@@ -54,6 +54,32 @@ const MIME_EXTENSIONS: Record<string, string> = {
 
 const ALLOWED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.heic', '.heif', '.bmp', '.pdf', ...AUDIO_EXTENSIONS];
 
+const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
+
+// Recognises a file by its first bytes, so a script or web page renamed to .jpg or .pdf is rejected
+const detectFileKind = (head: Buffer): 'image' | 'pdf' | null => {
+  const hex = head.subarray(0, 12).toString('hex');
+  const ascii = head.subarray(0, 12).toString('latin1');
+  if (hex.startsWith('ffd8ff')) return 'image'; // JPEG
+  if (hex.startsWith('89504e470d0a1a0a')) return 'image'; // PNG
+  if (ascii.startsWith('GIF87a') || ascii.startsWith('GIF89a')) return 'image';
+  if (ascii.startsWith('RIFF') && ascii.slice(8, 12) === 'WEBP') return 'image';
+  if (ascii.startsWith('BM')) return 'image';
+  if (ascii.slice(4, 8) === 'ftyp' && /^(heic|heix|hevc|hevx|mif1|msf1|heif|avif)/.test(ascii.slice(8, 12))) return 'image';
+  if (ascii.startsWith('%PDF-')) return 'pdf';
+  return null;
+};
+
+// Audio is checked by type and extension only; it is served with a sandbox policy and never executed
+const isContentAllowed = (head: Buffer, mime: string, ext: string): boolean => {
+  if (mime.startsWith('audio/') || AUDIO_EXTENSIONS.includes(ext)) return true;
+  const kind = detectFileKind(head);
+  if (!kind) return false;
+  return ext === '.pdf' ? kind === 'pdf' : kind === 'image';
+};
+
+const isStaff = (req: any): boolean => STAFF_ROLES.includes(String(req.user?.role || ''));
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const category = (req.query.category as string) || 'general';
@@ -90,6 +116,10 @@ const upload = multer({
 
     // إذا كان المجلد المستهدف هو قسم الصوتيات (sounds)، لا نقبل أي شيء غير الملفات الصوتية حصراً
     if (category === 'sounds') {
+      if (!isStaff(req)) {
+        cb(new Error('غير مصرح برفع ملفات إلى هذا القسم'));
+        return;
+      }
       const isAudio = AUDIO_MIME_TYPES.includes(mime) || AUDIO_EXTENSIONS.includes(ext) || mime.startsWith('audio/');
       if (isAudio && (AUDIO_EXTENSIONS.includes(ext) || ext === '.mp3')) {
         cb(null, true);
@@ -133,6 +163,20 @@ router.post('/', authenticate, uploadHandler, async (req: AuthRequest, res: Resp
     const subFolder = ['chats', 'companies', 'receipts', 'profiles', 'sounds', 'documents'].includes(category) ? category : 'general';
     const filename = req.file.filename;
 
+    // The declared type is only a claim; the stored bytes must really be that kind of file
+    const fd = fs.openSync(req.file.path, 'r');
+    const head = Buffer.alloc(16);
+    try {
+      fs.readSync(fd, head, 0, 16, 0);
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (!isContentAllowed(head, String(req.file.mimetype || '').toLowerCase(), path.extname(filename).toLowerCase())) {
+      fs.unlink(req.file.path, () => {});
+      res.status(400).json({ error: 'محتوى الملف لا يطابق نوعه، يُسمح بالصور و PDF فقط' });
+      return;
+    }
+
     await recordUpload(filename, subFolder, String(req.user!.id));
 
     const fileUrl = `${getPublicServerUrl(req)}/uploads/${subFolder}/${filename}`;
@@ -160,6 +204,10 @@ router.post('/base64', authenticate, async (req: AuthRequest, res: Response): Pr
 
     const category = (req.query.category as string) || 'general';
     const subFolder = ['chats', 'companies', 'receipts', 'profiles', 'sounds', 'documents'].includes(category) ? category : 'general';
+    if (subFolder === 'sounds' && !isStaff(req)) {
+      res.status(403).json({ error: 'غير مصرح برفع ملفات إلى هذا القسم' });
+      return;
+    }
     const uploadDir = path.join(baseUploadDir, subFolder);
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true });
@@ -183,6 +231,11 @@ router.post('/base64', authenticate, async (req: AuthRequest, res: Response): Pr
 
     if (buffer.length > 10 * 1024 * 1024) {
       res.status(400).json({ error: 'حجم الملف يتجاوز الحد المسموح (10 ميجابايت)' });
+      return;
+    }
+
+    if (!isContentAllowed(buffer.subarray(0, 16), mime, ext)) {
+      res.status(400).json({ error: 'محتوى الملف لا يطابق نوعه، يُسمح بالصور و PDF فقط' });
       return;
     }
 

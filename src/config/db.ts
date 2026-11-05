@@ -5,7 +5,8 @@ import argon2 from 'argon2';
 
 export const pool = new Pool({
   connectionString: env.DATABASE_URL,
-  ssl: {
+  // SSL stays on by default (hosted Postgres); "sslmode=disable" in the URL turns it off for a local database
+  ssl: /[?&]sslmode=disable\b/.test(env.DATABASE_URL) ? false : {
     rejectUnauthorized: false,
   },
 });
@@ -324,6 +325,8 @@ export const initDB = async () => {
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_attempts INT DEFAULT 0;');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_locked_until TIMESTAMP;');
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_last_sent_at TIMESTAMP;');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INT DEFAULT 0;');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS login_locked_until TIMESTAMP;');
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS uploaded_files (
@@ -974,6 +977,11 @@ export const initDB = async () => {
     );
 
     await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(10, 2);');
+    // Contact and address details the customer enters on the booking form
+    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS customer_name VARCHAR(255);');
+    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(50);');
+    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS governorate VARCHAR(255);');
+    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS district VARCHAR(255);');
 
     // Ensure default admin user exists and is verified
     const allPerms = JSON.stringify(['users','companies','packages','bookings','store','notifications','support','reviews','admins','audit_logs','settings']);

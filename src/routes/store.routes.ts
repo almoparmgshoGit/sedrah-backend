@@ -8,7 +8,7 @@ import {
   getUserOrders,
   getOrderDetails,
 } from '../controllers/store.controller';
-import { authenticate } from '../middlewares/security.middleware';
+import { authenticate, idempotencyMiddleware } from '../middlewares/security.middleware';
 
 const router = Router();
 
@@ -17,7 +17,7 @@ router.get('/products', getProducts);
 router.get('/products/:id', getProductById);
 router.get('/banners', getBanners);
 
-router.post('/orders', authenticate, createOrder);
+router.post('/orders', authenticate, idempotencyMiddleware, createOrder);
 router.get('/orders', authenticate, getUserOrders);
 router.get('/orders/:orderIdentifier', authenticate, getOrderDetails);
 

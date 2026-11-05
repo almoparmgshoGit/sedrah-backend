@@ -88,7 +88,8 @@ const ORDER_COLUMNS = `
   b.id, b.booking_reference, b.status, b.room_type, b.travelers_count, b.children_count, b.total_price, b.paid_amount,
   b.notes, b.created_at, b.receipt_url, b.receipt_status, b.rejection_reason, b.cancellation_reason,
   b.appointment_date, b.appointment_time, b.appointment_status, b.user_id,
-  u.name AS client_name, u.phone AS client_phone, u.city AS client_city,
+  COALESCE(b.customer_name, u.name) AS client_name, COALESCE(b.customer_phone, u.phone) AS client_phone,
+  COALESCE(b.governorate, u.city) AS client_city, b.district AS client_district,
   p.id AS package_id, p.title AS package_title, p.duration AS package_duration, p.image_url AS package_image,
   p.departure_date, p.return_date, p.hotel_makkah, p.hotel_madinah,
   (${ORDER_STATE_SQL}) AS order_state,
@@ -597,7 +598,7 @@ export const completeCompanyStage = async (req: CompanyRequest, res: Response): 
       [booking.id, stage.stage_order + 1]
     );
     await pool.query(
-      `UPDATE bookings b SET status = 'completed' WHERE b.id = $1 AND b.status <> 'cancelled'
+      `UPDATE bookings b SET status = 'completed' WHERE b.id = $1 AND b.status <> 'cancelled' AND b.receipt_approved = TRUE
        AND NOT EXISTS (SELECT 1 FROM trip_stages ts WHERE ts.booking_id = b.id AND ts.status <> 'completed')`,
       [booking.id]
     );

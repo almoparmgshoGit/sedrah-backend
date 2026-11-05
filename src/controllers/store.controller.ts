@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import crypto from 'crypto';
 import { pool } from '../config/db';
 import { generate16CharId } from '../utils/formatId';
 import { createAndSendNotification } from '../utils/notificationHelper';
@@ -24,27 +25,35 @@ const calculateShippingFee = async (client: any, governorateId: unknown): Promis
 };
 
 function generateOrderNumber(): string {
-  const randomHex = Math.floor(100000 + Math.random() * 900000).toString(16).toUpperCase();
-  return `ORD-${randomHex}`;
+  return `ORD-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 }
+
+const parseJsonArray = (value: any): any[] => {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'string' || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+};
+
+// Same rule as the product screen: a color with its own price overrides the product price
+const resolveItemPrice = (product: any, color: unknown): number => {
+  const colorName = typeof color === 'object' && color !== null ? (color as any).name : color;
+  if (colorName) {
+    const match = parseJsonArray(product.colors).find((c: any) => (typeof c === 'object' && c !== null ? c.name : c) === colorName);
+    const colorPrice = match && typeof match === 'object' ? Number(match.price) : 0;
+    if (colorPrice > 0) return colorPrice;
+  }
+  return parseFloat(product.discount_price || product.price);
+};
 
 export const getCategories = async (_req: Request, res: Response) => {
   try {
-    await pool.query(`DELETE FROM store_categories a USING store_categories b WHERE a.id > b.id AND a.name = b.name;`).catch(() => {});
-
-    const DEFAULT_CATS = [
-      { name: 'ملابس الإحرام', icon: 'shirt-outline', sort_order: 1 },
-      { name: 'ملابس النساء', icon: 'woman-outline', sort_order: 2 },
-      { name: 'مستلزمات العمرة', icon: 'home-outline', sort_order: 3 },
-      { name: 'مستلزمات السفر', icon: 'briefcase-outline', sort_order: 4 },
-    ];
-    for (const cat of DEFAULT_CATS) {
-      await pool.query(
-        'INSERT INTO store_categories (id, name, icon, sort_order) VALUES ($1, $2, $3, $4) ON CONFLICT (name) DO NOTHING',
-        [generate16CharId(), cat.name, cat.icon, cat.sort_order]
-      );
-    }
-
+    // Default categories are seeded once at startup when the table is empty, never on read,
+    // so categories the admin deletes or renames stay that way
     const result = await pool.query(
       `SELECT * FROM store_categories WHERE is_active = TRUE ORDER BY sort_order ASC, created_at ASC`
     );
@@ -191,8 +200,13 @@ export const createOrder = async (req: any, res: Response) => {
       return res.status(400).json({ success: false, message: 'كمية المنتج غير صالحة' });
     }
 
-    if (!customer_name || !customer_phone || !customer_address) {
+    if (!customer_name || !customer_phone || !customer_address
+      || typeof customer_name !== 'string' || typeof customer_phone !== 'string' || typeof customer_address !== 'string') {
       return res.status(400).json({ success: false, message: 'يرجى إكمال بيانات العميل (الاسم، الهاتف، العنوان)' });
+    }
+    if (customer_name.length > 255 || customer_address.length > 1000 || (notes && String(notes).length > 2000)
+      || !/^\+?[0-9\s-]{7,20}$/.test(customer_phone.trim())) {
+      return res.status(400).json({ success: false, message: 'بيانات العميل غير صالحة، تأكد من رقم الهاتف والعنوان' });
     }
 
     await client.query('BEGIN');
@@ -229,7 +243,7 @@ export const createOrder = async (req: any, res: Response) => {
       }
 
       const prod = prodRes.rows[0];
-      const itemPrice = parseFloat(prod.discount_price || prod.price);
+      const itemPrice = resolveItemPrice(prod, item.color);
       const qty = item.quantity === undefined ? 1 : Number(item.quantity);
       const itemTotal = itemPrice * qty;
 
@@ -286,19 +300,6 @@ export const createOrder = async (req: any, res: Response) => {
 
     const createdOrder = orderRes.rows[0];
 
-    if (userId) {
-      await createAndSendNotification({
-        userId,
-        title: 'طلب متجر جديد',
-        subtitle: `تم استلام طلبك بنجاح برقم #${orderNumber}`,
-        category: 'store',
-        icon: 'bag-outline',
-        iconBg: '#ECFDF5',
-        iconColor: '#059669',
-        data: { type: 'order_created', orderNumber, orderId: createdOrder.id },
-      });
-    }
-
     for (const item of preparedItems) {
       await client.query(
         `INSERT INTO store_order_items (id, order_id, product_id, product_name, price, quantity, size, color, total_price)
@@ -318,6 +319,20 @@ export const createOrder = async (req: any, res: Response) => {
     }
 
     await client.query('COMMIT');
+
+    // Sent only after the order is committed, so a failed order never produces a "received" notification
+    if (userId) {
+      await createAndSendNotification({
+        userId,
+        title: 'طلب متجر جديد',
+        subtitle: `تم استلام طلبك بنجاح برقم #${orderNumber}`,
+        category: 'store',
+        icon: 'bag-outline',
+        iconBg: '#ECFDF5',
+        iconColor: '#059669',
+        data: { type: 'order_created', orderNumber, orderId: createdOrder.id },
+      });
+    }
 
     return res.status(201).json({
       success: true,

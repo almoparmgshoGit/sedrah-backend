@@ -7,6 +7,7 @@ import { createAndSendNotification } from '../utils/notificationHelper';
 import { logAudit } from '../utils/auditLogger';
 import { resolveUserUpload } from '../utils/uploadAccess';
 import { reviewBookingReceiptByAdmin, updateBookingStatusByAdmin } from './admin.controller';
+import { expireOverdueAppointmentsThrottled, isPastAppointmentDay, localToday, markAppointmentAttended } from '../utils/appointmentLifecycle';
 
 export interface CompanyRequest extends AuthRequest {
   company?: any;
@@ -506,6 +507,8 @@ export const acceptCompanyOrder = async (req: CompanyRequest, res: Response): Pr
       `UPDATE trip_stages SET status = 'current' WHERE booking_id = $1 AND stage_order = 2 AND status = 'pending'`,
       [booking.id]
     );
+    // Accepting the order is the visit itself, so the appointment counts as attended
+    await markAppointmentAttended(booking.user_id, req.company.name, booking.id);
 
     await createAndSendNotification({
       userId: booking.user_id,
@@ -836,7 +839,8 @@ export const sendCompanyChatMessage = async (req: CompanyRequest, res: Response)
 
 // ───── Appointments ─────
 
-const APPOINTMENT_COLUMNS = `a.id, a.user_id, a.chat_id, a.title, a.appointment_date, a.appointment_time, a.location, a.notes, a.status, u.name AS client_name, u.phone AS client_phone`;
+const APPOINTMENT_COLUMNS = `a.id, a.user_id, a.chat_id, a.title, a.appointment_date, a.appointment_time, a.location, a.notes, a.status,
+  a.status_reason, a.attended_at, u.name AS client_name, u.phone AS client_phone`;
 
 const findOwnAppointment = async (req: CompanyRequest) => {
   const result = await pool.query(
@@ -874,6 +878,7 @@ const announceAppointment = async (req: CompanyRequest, appointment: any, title:
 
 export const getCompanyAppointments = async (req: CompanyRequest, res: Response): Promise<void> => {
   try {
+    await expireOverdueAppointmentsThrottled();
     const result = await pool.query(
       `SELECT ${APPOINTMENT_COLUMNS} FROM interview_appointments a LEFT JOIN users u ON a.user_id = u.id
        WHERE a.company_name = $1 ORDER BY a.appointment_date DESC, a.appointment_time DESC LIMIT 300`,
@@ -890,6 +895,10 @@ export const createCompanyAppointment = async (req: CompanyRequest, res: Respons
   try {
     const { id: companyId, name: companyName, address } = req.company;
     const { userId, appointmentDate, appointmentTime, location, title, notes, chatId } = req.body;
+    if (isPastAppointmentDay(appointmentDate)) {
+      res.status(400).json({ error: 'لا يمكن تحديد موعد في تاريخ مضى' });
+      return;
+    }
     if (!(await isCompanyClient(companyId, companyName, userId))) {
       res.status(404).json({ error: 'العميل غير موجود' });
       return;
@@ -910,8 +919,14 @@ export const createCompanyAppointment = async (req: CompanyRequest, res: Respons
         appointmentDate, appointmentTime, location || address || 'مقر الشركة', notes || '',
       ]
     );
+    // A new proposal replaces any older open one, so the customer only ever has one to answer
     await pool.query(
-      `UPDATE bookings b SET appointment_date = $1, appointment_time = $2, appointment_status = 'suggested'
+      `UPDATE interview_appointments SET status = 'cancelled', status_changed_at = NOW(), status_reason = 'تم استبداله بموعد جديد'
+       WHERE company_name = $1 AND user_id = $2 AND status IN ('pending', 'suggested', 'confirmed') AND id <> $3`,
+      [companyName, userId, inserted.rows[0].id]
+    );
+    await pool.query(
+      `UPDATE bookings b SET appointment_date = $1, appointment_time = $2, appointment_status = 'suggested', appointment_reminder_sent_at = NULL
        FROM packages p WHERE b.package_id = p.id AND p.company_id = $3 AND b.user_id = $4 AND b.status = 'new'`,
       [appointmentDate, appointmentTime, companyId, userId]
     );
@@ -933,16 +948,67 @@ export const rescheduleCompanyAppointment = async (req: CompanyRequest, res: Res
       return;
     }
     const { appointmentDate, appointmentTime, location, notes } = req.body;
+    if (existing.status === 'attended') {
+      res.status(409).json({ error: 'حضر العميل هذا الموعد بالفعل، أنشئ موعداً جديداً إذا لزم الأمر' });
+      return;
+    }
+    if (isPastAppointmentDay(appointmentDate)) {
+      res.status(400).json({ error: 'لا يمكن تحديد موعد في تاريخ مضى' });
+      return;
+    }
+    // A missed or expired appointment can be given a new date; it then waits for the customer's confirmation again
     const updated = await pool.query(
       `UPDATE interview_appointments SET appointment_date = $1, appointment_time = $2, location = COALESCE($3, location),
-         notes = COALESCE($4, notes), status = 'pending' WHERE id = $5 RETURNING *`,
+         notes = COALESCE($4, notes), status = 'pending', status_reason = NULL, status_changed_at = NOW(), reminder_sent_at = NULL
+       WHERE id = $5 RETURNING *`,
       [appointmentDate, appointmentTime, location || null, notes ?? null, existing.id]
+    );
+    await pool.query(
+      `UPDATE bookings b SET appointment_date = $1, appointment_time = $2, appointment_status = 'suggested', appointment_reminder_sent_at = NULL
+       FROM packages p, companies c
+       WHERE b.package_id = p.id AND p.company_id = c.id AND c.name = $3 AND b.user_id = $4 AND b.status = 'new'`,
+      [appointmentDate, appointmentTime, req.company.name, existing.user_id]
     );
     await announceAppointment(req, updated.rows[0], 'تغيير موعد المقابلة', `غيّرت ${req.company.name} الموعد إلى ${appointmentDate} الساعة ${appointmentTime}`);
     res.json({ success: true, message: 'تم إرسال الموعد الجديد للعميل', data: updated.rows[0] });
   } catch (error) {
     console.error('Reschedule appointment error:', error);
     res.status(500).json({ error: 'تعذر تغيير الموعد' });
+  }
+};
+
+// The company confirms the customer came. Also corrects an appointment that was closed as missed by mistake.
+export const markCompanyAppointmentAttended = async (req: CompanyRequest, res: Response): Promise<void> => {
+  try {
+    const existing = await findOwnAppointment(req);
+    if (!existing) {
+      res.status(404).json({ error: 'الموعد غير موجود' });
+      return;
+    }
+    if (!['pending', 'suggested', 'confirmed', 'missed', 'expired'].includes(existing.status)) {
+      res.status(409).json({ error: 'لا يمكن تسجيل الحضور لموعد ملغي أو مرفوض أو مسجل مسبقاً' });
+      return;
+    }
+    if (String(existing.appointment_date || '').slice(0, 10) > localToday()) {
+      res.status(400).json({ error: 'لا يمكن تسجيل الحضور قبل يوم الموعد' });
+      return;
+    }
+    const updated = await pool.query(
+      `UPDATE interview_appointments SET status = 'attended', attended_at = NOW(), status_changed_at = NOW(), status_reason = NULL
+       WHERE id = $1 RETURNING *`,
+      [existing.id]
+    );
+    await pool.query(
+      `UPDATE bookings b SET appointment_status = 'attended'
+       FROM packages p WHERE b.package_id = p.id AND p.company_id = $1 AND b.user_id = $2 AND b.status = 'new'
+         AND b.appointment_status IN ('pending', 'suggested', 'confirmed', 'missed', 'expired')`,
+      [req.company.id, existing.user_id]
+    );
+    if (io && existing.chat_id) io.to(`chat_${existing.chat_id}`).emit('appointment_updated', updated.rows[0]);
+    res.json({ success: true, message: 'تم تسجيل حضور العميل', data: { ...existing, ...updated.rows[0] } });
+  } catch (error) {
+    console.error('Mark appointment attended error:', error);
+    res.status(500).json({ error: 'تعذر تسجيل الحضور' });
   }
 };
 
@@ -957,7 +1023,10 @@ export const cancelCompanyAppointment = async (req: CompanyRequest, res: Respons
       res.status(409).json({ error: 'هذا الموعد ملغي بالفعل' });
       return;
     }
-    const updated = await pool.query(`UPDATE interview_appointments SET status = 'cancelled' WHERE id = $1 RETURNING *`, [existing.id]);
+    const updated = await pool.query(
+      `UPDATE interview_appointments SET status = 'cancelled', status_changed_at = NOW(), status_reason = $2 WHERE id = $1 RETURNING *`,
+      [existing.id, req.body.reason || 'ألغت الشركة الموعد']
+    );
     await announceAppointment(req, updated.rows[0], 'إلغاء موعد المقابلة', `ألغت ${req.company.name} موعد ${existing.appointment_date}. السبب: ${req.body.reason}`);
     res.json({ success: true, message: 'تم إلغاء الموعد وإبلاغ العميل', data: updated.rows[0] });
   } catch (error) {

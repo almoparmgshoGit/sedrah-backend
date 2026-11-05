@@ -720,6 +720,14 @@ export const initDB = async () => {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    // Appointment lifecycle: why and when the status last changed, attendance and the day-of reminder
+    await pool.query(`
+      ALTER TABLE interview_appointments ADD COLUMN IF NOT EXISTS status_reason TEXT;
+      ALTER TABLE interview_appointments ADD COLUMN IF NOT EXISTS status_changed_at TIMESTAMP;
+      ALTER TABLE interview_appointments ADD COLUMN IF NOT EXISTS attended_at TIMESTAMP;
+      ALTER TABLE interview_appointments ADD COLUMN IF NOT EXISTS reminder_sent_at TIMESTAMP;
+      ALTER TABLE bookings ADD COLUMN IF NOT EXISTS appointment_reminder_sent_at TIMESTAMP;
+    `);
 
     // 13. Governorate & Centers tables
     await pool.query(`

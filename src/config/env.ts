@@ -19,6 +19,10 @@ const envSchema = z.object({
   PUBLIC_SERVER_URL: z.string().url().optional(),
   // Which proxies may set X-Forwarded-For. The default trusts only private and loopback addresses (nginx on the same host or network).
   TRUST_PROXY: z.string().default('loopback, linklocal, uniquelocal'),
+  // Local time zone of the platform: decides when an appointment day has ended
+  APP_TIMEZONE: z.string().default('Africa/Cairo').refine((tz) => {
+    try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return true; } catch { return false; }
+  }, 'APP_TIMEZONE must be a valid IANA time zone such as Africa/Cairo'),
 });
 
 const parseEnv = () => {

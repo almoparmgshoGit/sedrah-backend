@@ -34,6 +34,7 @@ import permissionsRouter from './routes/permissions.routes';
 import path from 'path';
 import { AnyZodObject } from 'zod';
 import { UPLOAD_CATEGORIES, SENSITIVE_UPLOAD_CATEGORIES, canAccessUpload } from './utils/uploadAccess';
+import { startAppointmentScheduler } from './utils/appointmentLifecycle';
 
 // Initialize Pino logger for secure, structured auditing
 const logger = pino({
@@ -442,6 +443,8 @@ app.use((err: any, req: Request, res: Response, next: NextFunction) => {
 // Start Server
 server.listen(env.PORT, '0.0.0.0', () => {
   logger.info(`🚀 Secure Sdra Backend running on port ${env.PORT} in ${env.NODE_ENV} mode`);
+  // Closes appointments the customer did not attend once their day ends, and sends day-of reminders
+  startAppointmentScheduler();
 });
 
 export default app;

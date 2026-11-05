@@ -7,6 +7,7 @@ import { sendPushToUsers } from '../utils/pushNotification';
 import { generate16CharId } from '../utils/formatId';
 import { logAudit } from '../utils/auditLogger';
 import { normalizeUploadUrl, resolveUserUpload } from '../utils/uploadAccess';
+import { expireOverdueAppointmentsThrottled, isPastAppointmentDay, localToday } from '../utils/appointmentLifecycle';
 
 const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
 const INVALID_ATTACHMENT_ERROR = 'رابط المرفق غير صالح';
@@ -455,6 +456,9 @@ export const chatsController = {
       const targetChatId = resolved.chatId;
       const targetCompanyName = resolved.companyName;
 
+      // Close anything whose day already ended, so the customer never sees a stale "confirmed" date
+      await expireOverdueAppointmentsThrottled();
+
       let apptRes;
       if (targetChatId) {
         apptRes = await pool.query(
@@ -533,6 +537,11 @@ export const chatsController = {
         return;
       }
 
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(appointmentDate || '')) || isPastAppointmentDay(appointmentDate)) {
+        res.status(400).json({ error: 'يرجى اختيار تاريخ صحيح للموعد (اليوم أو بعده)' });
+        return;
+      }
+
       const resolved = await resolveChatTarget(identifier, chatId, targetUserId, isAdmin);
       const finalChatId = chatId || resolved.chatId;
       const targetCompanyName = resolved.companyName;
@@ -557,12 +566,12 @@ export const chatsController = {
 
       const appt = insertRes.rows[0];
 
-      // Update active booking if exists
+      // Update the booking that is still waiting for this visit
       await pool.query(
         `UPDATE bookings b
-         SET appointment_date = $1, appointment_time = $2, appointment_status = 'confirmed'
+         SET appointment_date = $1, appointment_time = $2, appointment_status = 'confirmed', appointment_reminder_sent_at = NULL
          FROM packages p, companies c
-         WHERE b.package_id = p.id AND p.company_id = c.id AND b.user_id = $3 AND (c.name = $4 OR c.id = $5) AND b.status != 'cancelled'`,
+         WHERE b.package_id = p.id AND p.company_id = c.id AND b.user_id = $3 AND (c.name = $4 OR c.id = $5) AND b.status = 'new'`,
         [appointmentDate, appointmentTime || '10:00 ص', targetUserId, targetCompanyName, resolved.companyId || -1]
       );
 
@@ -621,28 +630,54 @@ export const chatsController = {
       const targetChatId = resolved.chatId;
       const targetCompanyName = resolved.companyName;
 
-      const updateRes = await pool.query(
-        `UPDATE interview_appointments
-         SET status = 'confirmed'
-         WHERE user_id = $1 AND (company_name = $2 OR chat_id = $3)
-         RETURNING *`,
-        [userId, targetCompanyName, targetChatId || -1]
-      );
+      await expireOverdueAppointmentsThrottled();
 
-      // Also update in bookings
-      await pool.query(
-        `UPDATE bookings b
-         SET appointment_status = 'confirmed'
-         FROM packages p, companies c
-         WHERE b.package_id = p.id AND p.company_id = c.id AND b.user_id = $1 AND (c.name = $2 OR c.id = $3)`,
-        [userId, targetCompanyName, resolved.companyId || -1]
+      // Only the latest proposal still awaiting a reply; old, cancelled or missed ones stay as they are
+      const pending = await pool.query(
+        `SELECT * FROM interview_appointments
+         WHERE user_id = $1 AND (company_name = $2 OR chat_id = $3) AND status IN ('pending', 'suggested')
+         ORDER BY created_at DESC LIMIT 1`,
+        [userId, targetCompanyName, targetChatId || '']
       );
+      const proposal = pending.rows[0];
 
-      if (io && targetChatId) {
-        io.to(`chat_${targetChatId}`).emit('appointment_updated', { status: 'confirmed' });
+      if (proposal && isPastAppointmentDay(proposal.appointment_date)) {
+        res.status(400).json({ error: 'انتهى يوم هذا الموعد ولا يمكن تأكيده. اطلب من الشركة تحديد موعد جديد' });
+        return;
       }
 
-      res.status(200).json({ success: true, message: 'تم تأكيد الموعد بنجاح', data: updateRes.rows[0] || { status: 'confirmed' } });
+      let updated: any = null;
+      if (proposal) {
+        const updateRes = await pool.query(
+          `UPDATE interview_appointments SET status = 'confirmed', status_changed_at = NOW(), status_reason = NULL
+           WHERE id = $1 RETURNING *`,
+          [proposal.id]
+        );
+        updated = updateRes.rows[0];
+      }
+
+      // The booking's own suggested date, when the company has not sent a separate proposal
+      const bookingRes = await pool.query(
+        `UPDATE bookings b
+         SET appointment_status = 'confirmed', appointment_reminder_sent_at = NULL
+         FROM packages p, companies c
+         WHERE b.package_id = p.id AND p.company_id = c.id AND b.user_id = $1 AND (c.name = $2 OR c.id = $3)
+           AND b.status = 'new' AND b.appointment_status IN ('pending', 'suggested')
+           AND (b.appointment_date IS NULL OR b.appointment_date >= $4::date)
+         RETURNING b.id`,
+        [userId, targetCompanyName, resolved.companyId || '', localToday()]
+      );
+
+      if (!updated && bookingRes.rows.length === 0) {
+        res.status(409).json({ error: 'لا يوجد موعد بانتظار التأكيد' });
+        return;
+      }
+
+      if (io && targetChatId) {
+        io.to(`chat_${targetChatId}`).emit('appointment_updated', updated || { status: 'confirmed' });
+      }
+
+      res.status(200).json({ success: true, message: 'تم تأكيد الموعد بنجاح', data: updated || { status: 'confirmed' } });
     } catch (error: any) {
       console.error('Error in confirmAppointment:', error);
       res.status(500).json({ error: 'فشل تأكيد موعد المقابلة' });
@@ -1244,24 +1279,36 @@ export const chatsController = {
       const targetChatId = resolved.chatId;
       const targetUserId = resolved.chat?.user_id || userId;
 
+      // Only the latest appointment that is still open can be declined
       const updateRes = await pool.query(
         `UPDATE interview_appointments
-         SET status = 'rejected'
-         WHERE user_id = $1 AND (chat_id = $2 OR company_name = $3)
+         SET status = 'rejected', status_changed_at = NOW(), status_reason = 'رفض العميل الموعد'
+         WHERE id = (
+           SELECT id FROM interview_appointments
+           WHERE user_id = $1 AND (chat_id = $2 OR company_name = $3) AND status IN ('pending', 'suggested', 'confirmed')
+           ORDER BY created_at DESC LIMIT 1
+         )
          RETURNING *`,
-        [targetUserId, targetChatId || null, resolved.companyName]
+        [targetUserId, targetChatId || '', resolved.companyName]
       );
 
-      await pool.query(
+      const bookingRes = await pool.query(
         `UPDATE bookings b
          SET appointment_status = 'rejected'
          FROM packages p, companies c
-         WHERE b.package_id = p.id AND p.company_id = c.id AND b.user_id = $1 AND (c.name = $2 OR c.id = $3) AND b.appointment_status != 'cancelled'`,
-        [targetUserId, resolved.companyName, resolved.companyId || -1]
+         WHERE b.package_id = p.id AND p.company_id = c.id AND b.user_id = $1 AND (c.name = $2 OR c.id = $3)
+           AND b.status = 'new' AND b.appointment_status IN ('pending', 'suggested', 'confirmed')
+         RETURNING b.id`,
+        [targetUserId, resolved.companyName, resolved.companyId || '']
       );
 
+      if (updateRes.rows.length === 0 && bookingRes.rows.length === 0) {
+        res.status(409).json({ error: 'لا يوجد موعد مفتوح يمكن رفضه' });
+        return;
+      }
+
       if (io && targetChatId) {
-        io.to(`chat_${targetChatId}`).emit('appointment_updated', { status: 'rejected' });
+        io.to(`chat_${targetChatId}`).emit('appointment_updated', updateRes.rows[0] || { status: 'rejected' });
       }
 
       res.status(200).json({ success: true, message: 'تم رفض الموعد بنجاح', data: updateRes.rows[0] || null });

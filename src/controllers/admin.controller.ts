@@ -7,6 +7,7 @@ import argon2 from 'argon2';
 import nodemailer from 'nodemailer';
 import { replaceEmailPlaceholders } from '../utils/mailer';
 import { createAndSendNotification } from '../utils/notificationHelper';
+import { markAppointmentAttended } from '../utils/appointmentLifecycle';
 
 const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
 // Both bypass every module permission, so only a super admin can grant or touch them
@@ -705,6 +706,18 @@ export const updateTripStageByAdmin = async (req: AuthRequest, res: Response): P
        WHERE id = $6 AND booking_id = $7 RETURNING *`,
       [status, traveler_name, document_url, document_number, details, stageId, id]
     );
+
+    // Completing the visit stage means the customer came, so the appointment counts as attended
+    if (targetStage.stage_order === 1 && status === 'completed') {
+      const owner = await pool.query(
+        `SELECT b.user_id, c.name AS company_name FROM bookings b
+         JOIN packages p ON b.package_id = p.id JOIN companies c ON p.company_id = c.id WHERE b.id = $1`,
+        [id]
+      );
+      if (owner.rows[0]?.user_id) {
+        await markAppointmentAttended(owner.rows[0].user_id, owner.rows[0].company_name, String(id)).catch(() => {});
+      }
+    }
 
     // If stage is cancelled (or stage 1 cancelled), auto-cancel the entire booking!
     if (status === 'cancelled') {

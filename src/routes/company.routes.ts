@@ -52,5 +52,6 @@ router.get('/appointments', company.getCompanyAppointments as any);
 router.post('/appointments', body(schemas.appointmentSchema), company.createCompanyAppointment as any);
 router.put('/appointments/:id', body(schemas.rescheduleAppointmentSchema), company.rescheduleCompanyAppointment as any);
 router.post('/appointments/:id/cancel', body(schemas.cancelAppointmentSchema), company.cancelCompanyAppointment as any);
+router.post('/appointments/:id/attended', company.markCompanyAppointmentAttended as any);
 
 export default router;

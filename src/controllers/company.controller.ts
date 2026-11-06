@@ -7,6 +7,7 @@ import { createAndSendNotification } from '../utils/notificationHelper';
 import { logAudit } from '../utils/auditLogger';
 import { normalizeUploadUrl, resolveUserUpload } from '../utils/uploadAccess';
 import { readTravelers, saveTravelers, TravelerError, travelersComplete } from '../utils/bookingTravelers';
+import { FORM_FIELDS, MAX_CUSTOM_QUESTIONS, METHOD_LABELS, parseBookingForm } from '../utils/bookingForm';
 import { updateBookingStatusByAdmin } from './admin.controller';
 import {
   CompanyAccess,
@@ -61,8 +62,8 @@ export const can = (...permissions: string[]) => (req: CompanyRequest, res: Resp
 // Fields a member sees only with the matching permission. Removing them from every response keeps
 // the rule in one place instead of in each endpoint.
 const AMOUNT_FIELDS = ['total_price', 'paid_amount', 'receipt_verified_amount'];
-const CONTACT_FIELDS = ['client_phone', 'customer_phone'];
-const PASSPORT_FIELDS = ['passport_number', 'passport_image_url', 'birth_date', 'passport_expiry'];
+const CONTACT_FIELDS = ['client_phone', 'customer_phone', 'customer_whatsapp', 'customer_email'];
+const PASSPORT_FIELDS = ['passport_number', 'passport_image_url', 'birth_date', 'passport_expiry', 'national_id'];
 
 const stripFields = (value: any, fields: Set<string>): any => {
   if (Array.isArray(value)) return value.map((item) => stripFields(item, fields));
@@ -168,6 +169,7 @@ const ORDER_COLUMNS = `
   b.id, b.booking_reference, b.status, b.room_type, b.travelers_count, b.children_count, b.total_price, b.paid_amount,
   b.notes, b.created_at, b.receipt_url, b.receipt_status, b.rejection_reason, b.cancellation_reason, b.cancelled_by,
   b.allow_retry, b.receipt_submitted_at, b.receipt_reviewed_at, b.receipt_uploaded_by,
+  b.booking_method, b.customer_whatsapp, b.customer_email, b.national_id, b.custom_answers,
   b.appointment_date, b.appointment_time, b.appointment_status, b.user_id,
   COALESCE(b.customer_name, u.name) AS client_name, COALESCE(b.customer_phone, u.phone) AS client_phone,
   COALESCE(b.governorate, u.city) AS client_city, b.district AS client_district,
@@ -1618,5 +1620,41 @@ export const requestOrderTravelers = async (req: CompanyRequest, res: Response):
   } catch (error) {
     console.error('Request travelers error:', error);
     res.status(500).json({ error: 'تعذر إرسال الطلب' });
+  }
+};
+
+// ───── Booking form ─────
+
+export const getCompanyBookingForm = async (req: CompanyRequest, res: Response): Promise<void> => {
+  const form = parseBookingForm(req.company.booking_form);
+  res.json({
+    success: true,
+    data: {
+      ...form,
+      available_fields: FORM_FIELDS.map(({ key, label, default: fallback }) => ({ key, label, default: fallback })),
+      method_labels: METHOD_LABELS,
+      max_custom: MAX_CUSTOM_QUESTIONS,
+      contact: { whatsapp: req.company.whatsapp || null, phone: req.company.phone || req.company.landline_phone || null, address: req.company.address || null },
+    },
+  });
+};
+
+export const updateCompanyBookingForm = async (req: CompanyRequest, res: Response): Promise<void> => {
+  try {
+    // Parsing drops unknown fields and modes, so only valid settings are stored
+    const form = parseBookingForm(req.body);
+    await pool.query('UPDATE companies SET booking_form = $1 WHERE id = $2', [JSON.stringify(form), req.company.id]);
+    const off = (['whatsapp', 'phone', 'office'] as const).filter((method) => !form.methods[method]).map((method) => METHOD_LABELS[method]);
+    await activity(
+      req,
+      'booking_form_updated',
+      `عدّل نموذج الحجز (${form.custom.length} سؤال إضافي${off.length ? ` · أوقف: ${off.join('، ')}` : ''})`,
+      'company',
+      req.company.id
+    );
+    res.json({ success: true, message: 'تم حفظ نموذج الحجز', data: form });
+  } catch (error) {
+    console.error('Booking form error:', error);
+    res.status(500).json({ error: 'تعذر حفظ نموذج الحجز' });
   }
 };

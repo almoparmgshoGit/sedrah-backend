@@ -3,6 +3,8 @@ import { pool } from '../config/db';
 import { formatPackageId, formatCompanyId, parseIdOrToken } from '../utils/formatId';
 import { enrichPackage, PACKAGE_EXTRA_COLUMNS } from '../utils/packageInfo';
 import { notifyCompanyTeam } from '../utils/companyAccess';
+import { BOOKING_METHODS, FORM_FIELDS, METHOD_LABELS, parseBookingForm } from '../utils/bookingForm';
+import { availableVisitSlots } from '../utils/appointmentEngine';
 
 const STATUS_LABELS: Record<string, string> = { active: 'منشورة', paused: 'موقوفة', hidden: 'مخفية' };
 
@@ -297,5 +299,64 @@ export const updatePackageStatusByAdmin = async (req: Request, res: Response): P
   } catch (error: any) {
     console.error('Error updating package status:', error);
     res.status(500).json({ error: 'فشل تغيير حالة الباقة' });
+  }
+};
+
+/**
+ * Everything the customer app needs before booking a package: the booking methods the company accepts,
+ * the fields its form asks for, its contact details for WhatsApp and calls, and the free visit times.
+ */
+export const getPackageBookingOptions = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const rawId = String(req.params.id);
+    const parsed = parseIdOrToken(rawId);
+    const result = await pool.query(
+      `SELECT p.id, p.title, p.company_id, c.name AS company_name, c.phone, c.whatsapp, c.landline_phone, c.address,
+         c.google_maps_url, c.booking_form, ci.name AS city_name
+       FROM packages p JOIN companies c ON p.company_id = c.id LEFT JOIN cities ci ON c.city_id = ci.id
+       WHERE (p.id = $1 OR p.public_id = $2) AND (p.status = 'active' OR p.status IS NULL)`,
+      [parsed.value, rawId]
+    );
+    const pkg = result.rows[0];
+    if (!pkg) {
+      res.status(404).json({ error: 'الباقة غير موجودة أو غير متاحة للحجز حالياً' });
+      return;
+    }
+    const form = parseBookingForm(pkg.booking_form);
+    const whatsapp = String(pkg.whatsapp || '').trim();
+    const phone = String(pkg.phone || pkg.landline_phone || '').trim();
+    // A method needs the contact detail it relies on
+    const methods = BOOKING_METHODS.filter((method) => {
+      if (!form.methods[method]) return false;
+      if (method === 'whatsapp') return Boolean(whatsapp);
+      if (method === 'phone') return Boolean(phone);
+      if (method === 'office') return Boolean(pkg.address);
+      return true;
+    }).map((key) => ({ key, label: METHOD_LABELS[key] }));
+
+    res.json({
+      success: true,
+      data: {
+        package_id: pkg.id,
+        package_title: pkg.title,
+        methods,
+        form: {
+          fields: FORM_FIELDS.map((field) => ({ key: field.key, label: field.label, mode: form.fields[field.key] })).filter((field) => field.mode !== 'hidden'),
+          custom: form.custom,
+        },
+        company: {
+          name: pkg.company_name,
+          phone: phone || null,
+          whatsapp: whatsapp || null,
+          address: pkg.address || null,
+          city: pkg.city_name || null,
+          google_maps_url: pkg.google_maps_url || null,
+        },
+        visit_slots: await availableVisitSlots(pkg.company_id),
+      },
+    });
+  } catch (error: any) {
+    console.error('Error fetching booking options:', error);
+    res.status(500).json({ error: 'تعذر تحميل خيارات الحجز' });
   }
 };

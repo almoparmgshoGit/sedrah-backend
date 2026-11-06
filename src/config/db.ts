@@ -1108,6 +1108,13 @@ export const initDB = async () => {
     // Each official company document has its own review status and rejection reason
     await pool.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS documents_review TEXT;');
 
+    // The fields a company asks for when booking through the app, and the booking methods it accepts
+    await pool.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS booking_form TEXT;');
+    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS customer_whatsapp VARCHAR(50);');
+    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS customer_email VARCHAR(255);');
+    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS national_id VARCHAR(30);');
+    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS custom_answers TEXT;');
+
     // Settling the commission a company owes the platform
     await pool.query(`
       CREATE TABLE IF NOT EXISTS company_settlements (

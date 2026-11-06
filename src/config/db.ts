@@ -1089,6 +1089,10 @@ export const initDB = async () => {
     // Each official company document has its own review status and rejection reason
     await pool.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS documents_review TEXT;');
 
+    // The travelers' names, entered by the company from the papers handed over at its office;
+    // every trip document (visa, ticket, hotel) is attached to one of these names
+    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS traveler_names TEXT;');
+
     // Settling the commission a company owes the platform
     await pool.query(`
       CREATE TABLE IF NOT EXISTS company_settlements (

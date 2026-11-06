@@ -162,7 +162,7 @@ const ORDER_STATE_KEYS = ['new', 'pending_payment', 'under_review', 'confirmed',
 const ORDER_COLUMNS = `
   b.id, b.booking_reference, b.status, b.room_type, b.travelers_count, b.children_count, b.total_price, b.paid_amount,
   b.notes, b.created_at, b.receipt_url, b.receipt_status, b.rejection_reason, b.cancellation_reason, b.cancelled_by,
-  b.allow_retry, b.receipt_submitted_at, b.receipt_reviewed_at, b.receipt_uploaded_by,
+  b.allow_retry, b.receipt_submitted_at, b.receipt_reviewed_at, b.receipt_uploaded_by, b.traveler_names,
   b.appointment_date, b.appointment_time, b.appointment_status, b.user_id,
   COALESCE(b.customer_name, u.name) AS client_name, COALESCE(b.customer_phone, u.phone) AS client_phone,
   COALESCE(b.governorate, u.city) AS client_city, b.district AS client_district,
@@ -702,7 +702,18 @@ const readOrder = async (bookingId: string, companyId: string) => {
      FROM trip_stages WHERE booking_id = $1 ORDER BY stage_order`,
     [bookingId]
   );
-  return { ...order.rows[0], stages: stages.rows };
+  const row = order.rows[0];
+  return row ? { ...row, traveler_names: parseTravelerNames(row.traveler_names), stages: stages.rows } : row;
+};
+
+// [{ name, type: 'adult' | 'child' }], in the order the company entered them
+const parseTravelerNames = (raw: unknown): Array<{ name: string; type: 'adult' | 'child' }> => {
+  const list = parseJson(raw, []);
+  return Array.isArray(list)
+    ? list
+        .filter((item: any) => item && typeof item.name === 'string' && item.name.trim())
+        .map((item: any) => ({ name: String(item.name).trim(), type: item.type === 'child' ? 'child' : 'adult' }))
+    : [];
 };
 
 export const getCompanyOrderDetails = async (req: CompanyRequest, res: Response): Promise<void> => {
@@ -835,6 +846,56 @@ export const remindCompanyOrderPayment = async (req: CompanyRequest, res: Respon
   } catch (error) {
     console.error('Payment reminder error:', error);
     res.status(500).json({ error: 'تعذر إرسال التذكير' });
+  }
+};
+
+// ───── Traveler names ─────
+
+export const saveOrderTravelerNames = async (req: CompanyRequest, res: Response): Promise<void> => {
+  try {
+    const booking = req.booking;
+    if (booking.status === 'cancelled') {
+      res.status(409).json({ error: 'لا يمكن تعديل حجز ملغي' });
+      return;
+    }
+    const names = parseTravelerNames(req.body.names);
+    const adults = Number(booking.travelers_count || 0) - Number(booking.children_count || 0);
+    const children = Number(booking.children_count || 0);
+    if (names.filter((item) => item.type === 'adult').length > adults || names.filter((item) => item.type === 'child').length > children) {
+      res.status(400).json({ error: `الحجز لعدد ${adults} بالغ${children ? ` و${children} طفل` : ''}` });
+      return;
+    }
+    if (names.some((item) => item.name.length < 3)) {
+      res.status(400).json({ error: 'اكتب اسم كل مسافر كما في جواز السفر' });
+      return;
+    }
+    const lower = names.map((item) => item.name.toLowerCase());
+    if (new Set(lower).size !== lower.length) {
+      res.status(400).json({ error: 'يوجد اسم مكرر، اكتب الاسم بالكامل لتمييز كل مسافر' });
+      return;
+    }
+    // A name already used on a document cannot disappear, or that document would lose its owner
+    const previous = parseTravelerNames(booking.traveler_names).map((item) => item.name);
+    const removed = previous.filter((name) => !names.some((item) => item.name === name));
+    if (removed.length > 0) {
+      const stages = await pool.query('SELECT details FROM trip_stages WHERE booking_id = $1 AND details IS NOT NULL', [booking.id]);
+      const used = new Set<string>();
+      for (const stage of stages.rows) {
+        const rows = parseJson(stage.details, []);
+        if (Array.isArray(rows)) rows.forEach((row: any) => row?.name && used.add(String(row.name)));
+      }
+      const blocked = removed.find((name) => used.has(name));
+      if (blocked) {
+        res.status(409).json({ error: `لـ "${blocked}" مستندات مرفوعة، احذف مستنداته من المراحل قبل تغيير اسمه` });
+        return;
+      }
+    }
+    await pool.query('UPDATE bookings SET traveler_names = $1 WHERE id = $2', [JSON.stringify(names), booking.id]);
+    await activity(req, 'traveler_names', `حدّث أسماء المسافرين في الحجز #${booking.booking_reference} (${names.length})`, 'order', booking.id);
+    res.json({ success: true, message: 'تم حفظ أسماء المسافرين', data: await readOrder(booking.id, req.company.id) });
+  } catch (error) {
+    console.error('Traveler names error:', error);
+    res.status(500).json({ error: 'تعذر حفظ أسماء المسافرين' });
   }
 };
 
@@ -1045,6 +1106,17 @@ export const saveCompanyStage = async (req: CompanyRequest, res: Response): Prom
 
     let details: string | null | undefined;
     if (Array.isArray(req.body.travelers)) {
+      // Every document belongs to a traveler of this booking, so names are never misspelled or mixed up
+      const known = parseTravelerNames(booking.traveler_names).map((item) => item.name);
+      if (req.body.travelers.length > 0 && known.length === 0) {
+        res.status(400).json({ error: 'أدخل أسماء المسافرين في الطلب أولاً، ثم ارفع مستند كل مسافر باسمه', code: 'NAMES_REQUIRED' });
+        return;
+      }
+      const unknown = req.body.travelers.find((row: any) => !known.includes(String(row.name || '').trim()));
+      if (unknown) {
+        res.status(400).json({ error: `"${unknown.name}" ليس من مسافري هذا الحجز` });
+        return;
+      }
       const rows = [];
       for (const row of req.body.travelers) {
         const docUrl = await resolveStageFile(req, row.docUrl, existing);

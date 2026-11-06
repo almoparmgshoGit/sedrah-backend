@@ -50,6 +50,8 @@ router.post('/orders/:id/stages/:stageId/complete', can('trips.stages'), body(sc
 router.put('/orders/:id/stages/:stageId', can('trips.stages'), body(schemas.updateStageSchema), booking, company.saveCompanyStage as any);
 
 
+router.put('/orders/:id/traveler-names', can('orders.manage', 'trips.stages'), booking, company.saveOrderTravelerNames as any);
+
 router.get('/finance', can('finance.view'), company.getCompanyFinance as any);
 router.get('/reviews', can('reviews.view', 'reviews.reply'), company.getCompanyReviews as any);
 router.put('/reviews/:id/reply', can('reviews.reply'), body(schemas.reviewReplySchema), company.replyCompanyReview as any);

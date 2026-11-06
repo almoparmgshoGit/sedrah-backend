@@ -113,7 +113,7 @@ export const companyPackageSchema = z
     transport_info: shortText(2000).default(''),
     original_price: money.default(''),
     includes_flight: z.boolean().default(false),
-    season: z.enum(['regular', 'ramadan', 'shaban', 'rajab', 'mid_year', 'summer', 'winter'], { errorMap: () => ({ message: 'اختر موسم الرحلة' }) }),
+    season: z.enum(['regular', 'ramadan', 'shaban', 'rajab', 'mid_year', 'summer', 'winter'], { errorMap: () => ({ message: 'اختر موسم الرحلة' }) }).default('regular'),
   })
   .strict()
   .refine(

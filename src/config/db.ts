@@ -1018,6 +1018,63 @@ export const initDB = async () => {
     await pool.query('CREATE INDEX IF NOT EXISTS idx_receipt_reviews_booking ON receipt_reviews(booking_id, created_at);');
     // Receipts uploaded before this table existed get their submission time from the booking
     await pool.query(`UPDATE bookings SET receipt_submitted_at = created_at WHERE receipt_url IS NOT NULL AND receipt_submitted_at IS NULL;`);
+    // Company teams: the owner (companies.user_id) adds employees and defines their roles and permissions
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS company_roles (
+        id VARCHAR(16) PRIMARY KEY,
+        company_id VARCHAR(16) REFERENCES companies(id) ON DELETE CASCADE,
+        name VARCHAR(100) NOT NULL,
+        description TEXT,
+        color VARCHAR(20),
+        permissions TEXT NOT NULL DEFAULT '[]',
+        created_by VARCHAR(16),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_company_roles_company ON company_roles(company_id);');
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS company_members (
+        id VARCHAR(16) PRIMARY KEY,
+        company_id VARCHAR(16) REFERENCES companies(id) ON DELETE CASCADE,
+        user_id VARCHAR(16) REFERENCES users(id) ON DELETE CASCADE,
+        invite_email VARCHAR(255),
+        role_id VARCHAR(16) REFERENCES company_roles(id) ON DELETE SET NULL,
+        job_title VARCHAR(150),
+        status VARCHAR(20) NOT NULL DEFAULT 'invited',
+        invited_by VARCHAR(16),
+        joined_at TIMESTAMP,
+        last_seen_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_company_members_company ON company_members(company_id);');
+    // One company per person: a user belongs to at most one company team
+    await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_company_members_user ON company_members(user_id) WHERE user_id IS NOT NULL;');
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_company_members_invite ON company_members(company_id, LOWER(invite_email)) WHERE invite_email IS NOT NULL;`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS company_activity (
+        id VARCHAR(16) PRIMARY KEY,
+        company_id VARCHAR(16) REFERENCES companies(id) ON DELETE CASCADE,
+        actor_user_id VARCHAR(16),
+        actor_name VARCHAR(255),
+        action VARCHAR(100) NOT NULL,
+        target_type VARCHAR(50),
+        target_id VARCHAR(64),
+        details TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_company_activity_company ON company_activity(company_id, created_at DESC);');
+
+    // Which team member sent a company reply; shown to the team only, customers see the company name
+    await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS sent_by_name VARCHAR(255);');
+
+    // A company may answer each review once; the answer is shown under the review in the customer app
+    await pool.query('ALTER TABLE reviews ADD COLUMN IF NOT EXISTS company_reply TEXT;');
+    await pool.query('ALTER TABLE reviews ADD COLUMN IF NOT EXISTS company_reply_at TIMESTAMP;');
+    await pool.query('ALTER TABLE reviews ADD COLUMN IF NOT EXISTS company_reply_by VARCHAR(255);');
+
     // A rejected receipt awaiting a new upload used to keep the review status, which would list it as pending review
     await pool.query(`UPDATE bookings SET status = 'new' WHERE status = 'receipt_review' AND receipt_status = 'rejected';`);
 

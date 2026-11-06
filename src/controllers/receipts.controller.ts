@@ -5,6 +5,7 @@ import { AuthRequest } from '../middlewares/security.middleware';
 import { generate16CharId } from '../utils/formatId';
 import { createAndSendNotification } from '../utils/notificationHelper';
 import { logAudit } from '../utils/auditLogger';
+import { notifyCompanyTeam } from '../utils/companyAccess';
 
 /*
  * Payment receipts are verified by the platform alone. The company sees the receipt of its own bookings,
@@ -40,12 +41,12 @@ const addHistory = async (
   );
 };
 
-const companyOwnerOf = async (bookingId: string): Promise<{ userId: string | null; companyName: string | null }> => {
+const companyOwnerOf = async (bookingId: string): Promise<{ userId: string | null; companyId: string | null; companyName: string | null }> => {
   const result = await pool.query(
-    `SELECT c.user_id, c.name FROM bookings b JOIN packages p ON b.package_id = p.id JOIN companies c ON p.company_id = c.id WHERE b.id = $1`,
+    `SELECT c.user_id, c.id, c.name FROM bookings b JOIN packages p ON b.package_id = p.id JOIN companies c ON p.company_id = c.id WHERE b.id = $1`,
     [bookingId]
   );
-  return { userId: result.rows[0]?.user_id || null, companyName: result.rows[0]?.name || null };
+  return { userId: result.rows[0]?.user_id || null, companyId: result.rows[0]?.id || null, companyName: result.rows[0]?.name || null };
 };
 
 /**
@@ -92,17 +93,22 @@ export const submitReceiptForReview = async (
   await addHistory(pool, booking.id, 'submitted', actor, { receiptUrl, paidAmount });
 
   const owner = await companyOwnerOf(booking.id);
-  if (owner.userId && actor.type !== 'company') {
-    await createAndSendNotification({
-      userId: owner.userId,
-      title: 'إيصال دفع جديد',
-      subtitle: `رفع العميل إيصال الدفع للحجز #${updated.booking_reference}، وهو الآن قيد مراجعة إدارة سدرة.`,
-      category: 'booking',
-      icon: 'receipt-outline',
-      iconBg: '#EFF6FF',
-      iconColor: '#2563EB',
-      data: { type: 'receipt_uploaded', bookingId: updated.id, bookingRef: updated.booking_reference },
-    });
+  if (owner.companyId) {
+    // The team member who uploaded it does not need to hear about their own upload
+    await notifyCompanyTeam(
+      owner.companyId,
+      'orders.view',
+      {
+        title: 'إيصال دفع جديد',
+        subtitle: `${actor.type === 'company' ? `رفع ${actor.name}` : 'رفع العميل'} إيصال الدفع للحجز #${updated.booking_reference}، وهو الآن قيد مراجعة إدارة سدرة.`,
+        category: 'booking',
+        icon: 'receipt-outline',
+        iconBg: '#EFF6FF',
+        iconColor: '#2563EB',
+        data: { type: 'receipt_uploaded', bookingId: updated.id, bookingRef: updated.booking_reference },
+      },
+      actor.type === 'company' ? actor.id : null
+    );
   }
   if (actor.type === 'company') {
     await createAndSendNotification({
@@ -375,9 +381,8 @@ export const reviewReceipt = async (req: AuthRequest, res: Response): Promise<vo
       iconColor: '#059669',
       data: { type: 'receipt_approved', bookingId: booking.id, bookingRef: ref },
     });
-    if (owner.userId) {
-      await createAndSendNotification({
-        userId: owner.userId,
+    if (owner.companyId) {
+      await notifyCompanyTeam(owner.companyId, 'orders.view', {
         title: 'تم تأكيد حجز',
         subtitle: `اعتمدت إدارة سدرة إيصال الحجز #${ref}، والحجز مؤكد الآن. يمكنك متابعة مراحل الرحلة.`,
         category: 'booking',
@@ -401,9 +406,8 @@ export const reviewReceipt = async (req: AuthRequest, res: Response): Promise<vo
       iconColor: '#DC2626',
       data: { type: 'receipt_rejected', bookingId: booking.id, bookingRef: ref, reason },
     });
-    if (owner.userId) {
-      await createAndSendNotification({
-        userId: owner.userId,
+    if (owner.companyId) {
+      await notifyCompanyTeam(owner.companyId, 'orders.view', {
         title: retry ? 'رُفض إيصال حجز' : 'أُغلق حجز بعد رفض الإيصال',
         subtitle: `رفضت إدارة سدرة إيصال الحجز #${ref}. السبب: ${reason}${retry ? '. بانتظار إيصال جديد من العميل.' : ''}`,
         category: 'booking',
@@ -413,9 +417,8 @@ export const reviewReceipt = async (req: AuthRequest, res: Response): Promise<vo
         data: { type: 'receipt_rejected', bookingId: booking.id, bookingRef: ref, reason },
       });
     }
-  } else if (owner.userId) {
-    await createAndSendNotification({
-      userId: owner.userId,
+  } else if (owner.companyId) {
+    await notifyCompanyTeam(owner.companyId, 'orders.view', {
       title: 'إعادة مراجعة إيصال',
       subtitle: `أعادت إدارة سدرة فتح مراجعة إيصال الحجز #${ref}. السبب: ${reason}`,
       category: 'booking',

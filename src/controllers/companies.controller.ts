@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { pool } from '../config/db';
 import { notifyCitySubscribers } from './cities.controller';
 import { AuthRequest } from '../middlewares/security.middleware';
+import { resolveCompanyAccess } from '../utils/companyAccess';
 import { formatCompanyId, formatPackageId, formatUserId, parseIdOrToken, generateRandomToken, generate16CharId } from '../utils/formatId';
 
 const findCompanyQuery = async (rawId: any) => {
@@ -323,7 +324,7 @@ export const getCompanyReviews = async (req: Request, res: Response): Promise<vo
       SELECT r.*, u.name as user_name, u.public_id as user_public_id
       FROM reviews r
       JOIN users u ON r.user_id = u.id
-      WHERE r.company_id = $1
+      WHERE r.company_id = $1 AND COALESCE(r.hidden, FALSE) = FALSE
       ORDER BY r.created_at DESC
     `, [companyId]);
 
@@ -332,6 +333,8 @@ export const getCompanyReviews = async (req: Request, res: Response): Promise<vo
       rating: rev.rating,
       comment: rev.comment,
       created_at: rev.created_at,
+      company_reply: rev.company_reply || null,
+      company_reply_at: rev.company_reply_at || null,
       company_id: formatCompanyId(companyId, compRes.rows[0].public_id),
       user_name: 'عميل سدرة',
     }));
@@ -724,24 +727,31 @@ export const getMyCompanyProfile = async (req: AuthRequest, res: Response): Prom
     const userId = req.user.id;
     const userEmail = req.user.email;
 
-    const result = await pool.query(
-      `SELECT c.*, ci.name as city_name
-       FROM companies c
-       LEFT JOIN cities ci ON c.city_id = ci.id
-       WHERE c.user_id = $1 OR (c.pending_owner_email IS NOT NULL AND LOWER(c.pending_owner_email) = LOWER($2))
-       LIMIT 1`,
-      [userId, userEmail]
-    );
-
-    if (result.rows.length === 0) {
+    // Owners and team members alike; a pending invitation for this email is claimed here
+    const access = await resolveCompanyAccess(String(userId), userEmail);
+    if (access && 'suspended' in access) {
+      res.status(403).json({ error: `تم إيقاف حسابك في فريق ${access.companyName}، تواصل مع مسؤول الشركة`, code: 'MEMBER_SUSPENDED' });
+      return;
+    }
+    if (!access) {
       res.status(404).json({ error: 'لم يتم العثور على شركة مرتبطة بحسابك' });
       return;
     }
 
+    const result = await pool.query(
+      `SELECT c.*, ci.name as city_name FROM companies c LEFT JOIN cities ci ON c.city_id = ci.id WHERE c.id = $1`,
+      [access.company.id]
+    );
     const comp = result.rows[0];
     const formatted = {
       ...comp,
       id: formatCompanyId(comp.id, comp.public_id),
+      access: {
+        is_owner: access.isOwner,
+        role_name: access.roleName,
+        job_title: access.jobTitle,
+        permissions: access.permissions,
+      },
     };
 
     res.json({

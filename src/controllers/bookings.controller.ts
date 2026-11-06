@@ -6,6 +6,7 @@ import { suggestAppointmentForBooking } from '../utils/appointmentEngine';
 import { createAndSendNotification } from '../utils/notificationHelper';
 import { resolveUserUpload } from '../utils/uploadAccess';
 import { submitReceiptForReview } from './receipts.controller';
+import { notifyCompanyTeam } from '../utils/companyAccess';
 
 // Mirrors the room pricing shown in the app, so the charged total never comes from the client
 const calculateBookingTotal = (pkg: any, roomType: string, adults: number, children: number): number => {
@@ -258,6 +259,17 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       iconColor: '#059669',
       data: { type: 'booking_created', bookingRef, bookingId: newBookingId },
     });
+
+    // The company team that handles orders hears about the request right away
+    await notifyCompanyTeam(companyId, 'orders.view', {
+      title: 'طلب حجز جديد',
+      subtitle: `وصل طلب حجز جديد #${bookingRef} (${travelersCount} مسافر). افتح الطلب لقبوله أو رفضه.`,
+      category: 'booking',
+      icon: 'document-text-outline',
+      iconBg: '#EFF6FF',
+      iconColor: '#2563EB',
+      data: { type: 'new_booking', bookingRef, bookingId: newBookingId },
+    }).catch(() => {});
 
     res.status(201).json({
       success: true,

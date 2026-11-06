@@ -183,7 +183,16 @@ io.on('connection', (socket) => {
           `SELECT 1 FROM chats c
            WHERE c.id = $1 AND c.ticket_number IS NULL AND (
              c.user_id = $2
-             OR EXISTS (SELECT 1 FROM companies co WHERE co.user_id = $2 AND (co.id = c.company_id OR co.name = c.company_name))
+             OR EXISTS (
+               SELECT 1 FROM companies co
+               WHERE (co.id = c.company_id OR co.name = c.company_name)
+                 AND (co.user_id = $2 OR EXISTS (
+                   SELECT 1 FROM company_members cm
+                   JOIN company_roles r ON cm.role_id = r.id
+                   WHERE cm.company_id = co.id AND cm.user_id = $2 AND cm.status = 'active'
+                     AND (r.permissions LIKE '%"chats.view"%' OR r.permissions LIKE '%"chats.reply"%')
+                 ))
+             )
            )
            UNION
            SELECT 1 FROM chats c WHERE c.id = $1 AND c.user_id = $2`,

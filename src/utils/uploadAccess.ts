@@ -88,14 +88,14 @@ export const canAccessUpload = async (userId: string, filename: string): Promise
          LEFT JOIN companies co ON p.company_id = co.id
          LEFT JOIN documents d ON d.booking_id = b.id
          LEFT JOIN trip_stages ts ON ts.booking_id = b.id
-         WHERE (b.user_id = $1 OR co.user_id = $1)
+         WHERE (b.user_id = $1 OR (co.user_id = $1 OR EXISTS (SELECT 1 FROM company_members cm WHERE cm.company_id = co.id AND cm.user_id = $1 AND cm.status = 'active')))
            AND (${refersTo('b.receipt_url')} OR ${refersTo('d.file_url')} OR ${refersTo('ts.document_url')} OR ${refersTo('ts.details')})
        )
        OR EXISTS (
          SELECT 1 FROM chats c
          LEFT JOIN companies co ON c.company_id = co.id
          LEFT JOIN messages m ON m.chat_id = c.id
-         WHERE (c.user_id = $1 OR co.user_id = $1)
+         WHERE (c.user_id = $1 OR (co.user_id = $1 OR EXISTS (SELECT 1 FROM company_members cm WHERE cm.company_id = co.id AND cm.user_id = $1 AND cm.status = 'active')))
            AND (${refersTo('c.attachment_url')} OR ${refersTo('m.image_uri')})
        )`,
     [userId, filename, refs[0], refs[1]]

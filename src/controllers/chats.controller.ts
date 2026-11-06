@@ -8,6 +8,7 @@ import { generate16CharId } from '../utils/formatId';
 import { logAudit } from '../utils/auditLogger';
 import { normalizeUploadUrl, resolveUserUpload } from '../utils/uploadAccess';
 import { expireOverdueAppointmentsThrottled, isPastAppointmentDay, localToday } from '../utils/appointmentLifecycle';
+import { companyTeamUserIds } from '../utils/companyAccess';
 
 const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
 const INVALID_ATTACHMENT_ERROR = 'رابط المرفق غير صالح';
@@ -382,12 +383,13 @@ export const chatsController = {
 
       // Push notification to company owner for new chat message (skip if owner is currently viewing the chat)
       if (targetCompanyId) {
-        const compOwner = await pool.query('SELECT user_id FROM companies WHERE id = $1', [targetCompanyId]);
-        if (compOwner.rows.length > 0 && compOwner.rows[0].user_id) {
+        // The owner and every team member who handles chats
+        const teamIds = await companyTeamUserIds(String(targetCompanyId), 'chats.view');
+        if (teamIds.length > 0) {
           const socketsInRoom = io ? await io.in(`chat_${chatId}`).fetchSockets() : [];
           if (socketsInRoom.length === 0) {
             sendPushToUsers(
-              [compOwner.rows[0].user_id],
+              teamIds,
               'رسالة جديدة',
               message || 'أرسل لك صورة جديدة',
               { type: 'chat_message', chatId, companyName: targetCompanyName }

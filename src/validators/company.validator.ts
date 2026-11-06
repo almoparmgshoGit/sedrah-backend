@@ -169,3 +169,44 @@ export const cancelAppointmentSchema = z
   .strict();
 
 export const clientNoteSchema = z.object({ note: shortText(2000) }).strict();
+
+// ───── Team ─────
+
+const roleColor = z.union([z.literal(''), z.string().regex(/^#[0-9A-Fa-f]{6}$/, 'اللون غير صحيح')]);
+const permissionList = z.array(z.string().trim().max(60)).max(100);
+
+export const addMemberSchema = z
+  .object({
+    email: z.string().trim().email('البريد الإلكتروني غير صحيح').max(255),
+    roleId: z.string().trim().min(1, 'اختر الدور').max(16),
+    jobTitle: shortText(150).optional(),
+  })
+  .strict();
+
+export const updateMemberSchema = z
+  .object({
+    roleId: z.string().trim().min(1).max(16).optional(),
+    jobTitle: shortText(150).optional(),
+    status: z.enum(['active', 'suspended']).optional(),
+  })
+  .strict();
+
+export const createRoleSchema = z
+  .object({
+    name: shortText(100).min(2, 'اكتب اسم الدور'),
+    description: shortText(300).optional(),
+    color: roleColor.optional(),
+    permissions: permissionList,
+  })
+  .strict();
+
+export const updateRoleSchema = z
+  .object({
+    name: shortText(100).min(2, 'اكتب اسم الدور').optional(),
+    description: shortText(300).optional(),
+    color: roleColor.optional(),
+    permissions: permissionList.optional(),
+  })
+  .strict();
+
+export const reviewReplySchema = z.object({ reply: shortText(1000) }).strict();

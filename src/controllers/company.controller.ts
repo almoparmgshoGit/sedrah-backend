@@ -8,11 +8,20 @@ import { logAudit } from '../utils/auditLogger';
 import { resolveUserUpload } from '../utils/uploadAccess';
 import { updateBookingStatusByAdmin } from './admin.controller';
 import { submitReceiptForReview } from './receipts.controller';
+import {
+  CompanyAccess,
+  COMPANY_PERMISSION_GROUPS,
+  logCompanyActivity,
+  notifyCompanyTeam,
+  resolveCompanyAccess,
+} from '../utils/companyAccess';
 import { expireOverdueAppointmentsThrottled, isPastAppointmentDay, localToday, markAppointmentAttended } from '../utils/appointmentLifecycle';
 
 export interface CompanyRequest extends AuthRequest {
   company?: any;
   booking?: any;
+  access?: CompanyAccess;
+  actor?: { id: string; name: string };
 }
 
 const param = (req: AuthRequest, name: string) => String(req.params[name] || '');
@@ -20,29 +29,92 @@ const param = (req: AuthRequest, name: string) => String(req.params[name] || '')
 // Every route below is scoped through this: the company always comes from the token, never from the request
 export const requireCompany = async (req: CompanyRequest, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const result = await pool.query(
-      `SELECT * FROM companies
-       WHERE user_id = $1 OR (user_id IS NULL AND LOWER(pending_owner_email) = LOWER($2))
-       ORDER BY created_at ASC LIMIT 1`,
-      [req.user!.id, req.user!.email || '']
-    );
-    if (result.rows.length === 0) {
+    const access = await resolveCompanyAccess(String(req.user!.id), req.user!.email);
+    if (!access) {
       res.status(403).json({ error: 'لا توجد شركة مرتبطة بهذا الحساب' });
       return;
     }
-
-    const company = result.rows[0];
-    // File access and every other ownership check rely on user_id, so a pending owner is linked here
-    if (!company.user_id) {
-      await pool.query('UPDATE companies SET user_id = $1, pending_owner_email = NULL WHERE id = $2', [req.user!.id, company.id]);
-      company.user_id = req.user!.id;
+    if ('suspended' in access) {
+      res.status(403).json({ error: `تم إيقاف حسابك في فريق ${access.companyName}، تواصل مع مسؤول الشركة`, code: 'MEMBER_SUSPENDED' });
+      return;
     }
-    req.company = company;
+    const nameRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user!.id]);
+    req.company = access.company;
+    req.access = access;
+    req.actor = { id: String(req.user!.id), name: nameRes.rows[0]?.name || req.user!.email || 'عضو الفريق' };
     next();
   } catch (error) {
     console.error('requireCompany error:', error);
     res.status(500).json({ error: 'تعذر التحقق من الشركة' });
   }
+};
+
+// Passes when the owner or the member's role has any of the given permissions
+export const can = (...permissions: string[]) => (req: CompanyRequest, res: Response, next: NextFunction): void => {
+  if (req.access?.isOwner || permissions.some((key) => req.access?.permissions.includes(key))) {
+    next();
+    return;
+  }
+  res.status(403).json({ error: 'ليست لديك صلاحية لهذا الإجراء، تواصل مع مسؤول الشركة', code: 'NO_PERMISSION' });
+};
+
+// Fields a member sees only with the matching permission. Removing them from every response keeps
+// the rule in one place instead of in each endpoint.
+const AMOUNT_FIELDS = ['total_price', 'paid_amount', 'receipt_verified_amount'];
+const CONTACT_FIELDS = ['client_phone', 'customer_phone'];
+
+const stripFields = (value: any, fields: Set<string>): any => {
+  if (Array.isArray(value)) return value.map((item) => stripFields(item, fields));
+  if (!value || typeof value !== 'object' || value instanceof Date) return value;
+  const copy: Record<string, any> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (!fields.has(key)) copy[key] = stripFields(item, fields);
+  }
+  return copy;
+};
+
+export const redactForMember = (req: CompanyRequest, res: Response, next: NextFunction): void => {
+  const access = req.access;
+  if (!access || access.isOwner) {
+    next();
+    return;
+  }
+  const hidden = new Set<string>();
+  if (!access.permissions.includes('orders.view_amounts')) AMOUNT_FIELDS.forEach((key) => hidden.add(key));
+  if (!access.permissions.includes('clients.contact')) {
+    CONTACT_FIELDS.forEach((key) => hidden.add(key));
+    // In client records "phone" and "email" are the customer's own
+    if (req.path.startsWith('/clients')) ['phone', 'email'].forEach((key) => hidden.add(key));
+  }
+  if (!access.permissions.includes('clients.documents') && req.path.startsWith('/clients')) hidden.add('documents');
+  if (hidden.size === 0) {
+    next();
+    return;
+  }
+  const json = res.json.bind(res);
+  res.json = (body: any) => json(stripFields(body, hidden));
+  next();
+};
+
+const has = (req: CompanyRequest, permission: string) => Boolean(req.access?.isOwner || req.access?.permissions.includes(permission));
+
+const activity = (req: CompanyRequest, action: string, details: string, targetType?: string, targetId?: string | null) =>
+  logCompanyActivity(req.company.id, req.actor || {}, action, details, targetType, targetId);
+
+export const getCompanyAccess = async (req: CompanyRequest, res: Response): Promise<void> => {
+  const access = req.access!;
+  res.json({
+    success: true,
+    data: {
+      is_owner: access.isOwner,
+      member_id: access.memberId,
+      role_id: access.roleId,
+      role_name: access.roleName,
+      job_title: access.jobTitle,
+      permissions: access.permissions,
+      permission_groups: COMPANY_PERMISSION_GROUPS,
+    },
+  });
 };
 
 // A 404 rather than a 403, so another company's booking ids cannot be probed
@@ -85,6 +157,8 @@ const ORDER_STATE_SQL = `
     WHEN EXISTS (SELECT 1 FROM trip_stages s WHERE s.booking_id = b.id AND s.stage_order = 1 AND s.status = 'completed') THEN 'pending_payment'
     ELSE 'new'
   END`;
+
+const ORDER_STATE_KEYS = ['new', 'pending_payment', 'under_review', 'confirmed', 'completed', 'cancelled'];
 
 const ORDER_COLUMNS = `
   b.id, b.booking_reference, b.status, b.room_type, b.travelers_count, b.children_count, b.total_price, b.paid_amount,
@@ -225,6 +299,14 @@ export const updateCompanyProfile = async (req: CompanyRequest, res: Response): 
     const company = req.company;
     const updates: Record<string, any> = {};
 
+    // Official documents and the public profile are separate permissions
+    const touchesDocuments = DOCUMENT_FIELDS.some((field) => req.body[field] !== undefined);
+    const touchesProfile = PROFILE_FIELDS.some((field) => !DOCUMENT_FIELDS.includes(field) && req.body[field] !== undefined);
+    if ((touchesDocuments && !has(req, 'company.documents')) || (touchesProfile && !has(req, 'company.profile'))) {
+      res.status(403).json({ error: 'ليست لديك صلاحية لتعديل هذا القسم', code: 'NO_PERMISSION' });
+      return;
+    }
+
     for (const field of PROFILE_FIELDS) {
       if (req.body[field] === undefined) continue;
       let value = req.body[field];
@@ -268,6 +350,7 @@ export const updateCompanyProfile = async (req: CompanyRequest, res: Response): 
       await logAudit(req.user!.email, 'تعديل مستندات شركة', `عدّلت شركة (${company.name}) مستنداتها الرسمية`, req.ip, req.user!.email, null, null);
     }
 
+    await activity(req, touchesDocuments ? 'documents_updated' : 'profile_updated', touchesDocuments ? 'عدّل المستندات الرسمية للشركة' : `عدّل بيانات الشركة (${columns.join('، ')})`, 'company', company.id);
     res.json({ success: true, message: 'تم حفظ التعديلات', data: await readProfile(company.id) });
   } catch (error) {
     console.error('Update company profile error:', error);
@@ -374,6 +457,7 @@ export const createCompanyOwnPackage = async (req: CompanyRequest, res: Response
       'UPDATE cities SET total_packages = (SELECT COUNT(*) FROM packages WHERE city_id = $1) WHERE id = $1',
       [company.city_id]
     );
+    await activity(req, 'package_created', `أضاف الباقة "${result.rows[0].title}"`, 'package', result.rows[0].id);
     res.status(201).json({ success: true, message: 'تم إنشاء الباقة', data: formatPackage(result.rows[0]) });
   } catch (error) {
     console.error('Create company package error:', error);
@@ -401,6 +485,7 @@ export const updateCompanyOwnPackage = async (req: CompanyRequest, res: Response
        WHERE id = $18 AND company_id = $19 RETURNING *`,
       [...packageValues(req.body, image || ''), existing.id, req.company.id]
     );
+    await activity(req, 'package_updated', `عدّل الباقة "${result.rows[0].title}"`, 'package', existing.id);
     res.json({ success: true, message: 'تم تحديث الباقة', data: formatPackage(result.rows[0]) });
   } catch (error) {
     console.error('Update company package error:', error);
@@ -420,6 +505,7 @@ export const updateCompanyPackageStatus = async (req: CompanyRequest, res: Respo
       return;
     }
     const result = await pool.query('UPDATE packages SET status = $1 WHERE id = $2 RETURNING *', [req.body.status, existing.id]);
+    await activity(req, 'package_status', `${req.body.status === 'active' ? 'نشر' : 'أوقف'} الباقة "${existing.title}"`, 'package', existing.id);
     res.json({ success: true, data: formatPackage(result.rows[0]) });
   } catch (error) {
     console.error('Company package status error:', error);
@@ -444,6 +530,7 @@ export const deleteCompanyOwnPackage = async (req: CompanyRequest, res: Response
       'UPDATE cities SET total_packages = (SELECT COUNT(*) FROM packages WHERE city_id = $1) WHERE id = $1',
       [existing.city_id]
     );
+    await activity(req, 'package_deleted', `حذف الباقة "${existing.title}"`, 'package', existing.id);
     res.json({ success: true, message: 'تم حذف الباقة' });
   } catch (error) {
     console.error('Delete company package error:', error);
@@ -455,14 +542,56 @@ export const deleteCompanyOwnPackage = async (req: CompanyRequest, res: Response
 
 export const getCompanyOrders = async (req: CompanyRequest, res: Response): Promise<void> => {
   try {
-    const result = await pool.query(
-      `SELECT ${ORDER_COLUMNS}, ${stageProgressSql} AS progress
-       ${ORDER_FROM}
-       WHERE p.company_id = $1
-       ORDER BY b.created_at DESC LIMIT 500`,
-      [req.company.id]
+    // Without ?page the full list is returned (the trips screen groups all of it)
+    if (req.query.page === undefined) {
+      const result = await pool.query(
+        `SELECT ${ORDER_COLUMNS}, ${stageProgressSql} AS progress
+         ${ORDER_FROM}
+         WHERE p.company_id = $1
+         ORDER BY b.created_at DESC LIMIT 500`,
+        [req.company.id]
+      );
+      res.json({ success: true, data: result.rows });
+      return;
+    }
+
+    const page = Math.max(1, parseInt(String(req.query.page), 10) || 1);
+    const limit = Math.min(50, Math.max(5, parseInt(String(req.query.limit || '20'), 10) || 20));
+    const state = ORDER_STATE_KEYS.includes(String(req.query.state)) ? String(req.query.state) : null;
+    const search = String(req.query.q || '').trim().slice(0, 100);
+    const searchSql = `($3::text = '' OR COALESCE(b.customer_name, u.name, '') ILIKE '%' || $3 || '%'
+      OR b.booking_reference ILIKE '%' || $3 || '%' OR p.title ILIKE '%' || $3 || '%'
+      OR COALESCE(b.customer_phone, u.phone, '') ILIKE '%' || $3 || '%')`;
+
+    const rows = await pool.query(
+      `SELECT * FROM (
+         SELECT ${ORDER_COLUMNS}, ${stageProgressSql} AS progress ${ORDER_FROM}
+         WHERE p.company_id = $1 AND ${searchSql}
+       ) o
+       WHERE ($2::text IS NULL OR o.order_state = $2)
+       ORDER BY o.created_at DESC
+       LIMIT $4 OFFSET $5`,
+      [req.company.id, state, search, limit + 1, (page - 1) * limit]
     );
-    res.json({ success: true, data: result.rows });
+    const counts = await pool.query(
+      `SELECT (${ORDER_STATE_SQL}) AS state, COUNT(*)::int AS total ${ORDER_FROM}
+       WHERE p.company_id = $1 AND ${searchSql.replace(/\$3/g, '$2')}
+       GROUP BY 1`,
+      [req.company.id, search]
+    );
+    const byState: Record<string, number> = { all: 0 };
+    for (const row of counts.rows) {
+      byState[row.state] = row.total;
+      byState.all += row.total;
+    }
+
+    const hasMore = rows.rows.length > limit;
+    res.json({
+      success: true,
+      data: rows.rows.slice(0, limit),
+      pagination: { page, limit, has_more: hasMore, total: state ? byState[state] || 0 : byState.all },
+      counts: byState,
+    });
   } catch (error) {
     console.error('Company orders error:', error);
     res.status(500).json({ error: 'تعذر جلب الطلبات' });
@@ -525,6 +654,7 @@ export const acceptCompanyOrder = async (req: CompanyRequest, res: Response): Pr
       data: { type: 'booking_status', status: 'accepted', bookingRef: booking.booking_reference },
     });
 
+    await activity(req, 'order_accepted', `قبل طلب الحجز #${booking.booking_reference}`, 'order', booking.id);
     res.json({ success: true, message: 'تم قبول الطلب', data: await readOrder(booking.id, req.company.id) });
   } catch (error) {
     console.error('Accept order error:', error);
@@ -541,6 +671,7 @@ export const rejectCompanyOrder = async (req: CompanyRequest, res: Response, nex
     }
     await pool.query(`UPDATE trip_stages SET status = 'cancelled' WHERE booking_id = $1`, [booking.id]);
     req.body = { status: 'cancelled', cancellation_reason: req.body.reason, cancelled_by: 'company' };
+    await activity(req, 'order_rejected', `رفض طلب الحجز #${booking.booking_reference}: ${req.body.cancellation_reason}`, 'order', booking.id);
     await updateBookingStatusByAdmin(req, res);
   } catch (error) {
     next(error);
@@ -577,7 +708,8 @@ export const uploadCompanyReceipt = async (req: CompanyRequest, res: Response): 
     }
     const paidAmount = req.body.paidAmount ? Number(req.body.paidAmount) : null;
 
-    await submitReceiptForReview(booking, receiptUrl, paidAmount, { id: String(req.user!.id), name: req.company.name, type: 'company' });
+    await submitReceiptForReview(booking, receiptUrl, paidAmount, { id: String(req.user!.id), name: req.actor?.name || req.company.name, type: 'company' });
+    await activity(req, 'receipt_uploaded', `رفع إيصال الدفع للحجز #${booking.booking_reference}`, 'order', booking.id);
     res.json({ success: true, message: 'تم رفع الإيصال وإرساله لمراجعة إدارة سدرة', data: await readOrder(booking.id, req.company.id) });
   } catch (error) {
     console.error('Company receipt upload error:', error);
@@ -599,6 +731,7 @@ export const cancelCompanyOrder = async (req: CompanyRequest, res: Response, nex
     }
     await pool.query(`UPDATE trip_stages SET status = 'cancelled' WHERE booking_id = $1 AND status <> 'completed'`, [booking.id]);
     req.body = { status: 'cancelled', cancellation_reason: req.body.reason, cancelled_by: 'company' };
+    await activity(req, 'order_cancelled', `ألغى الحجز #${booking.booking_reference}: ${req.body.cancellation_reason}`, 'order', booking.id);
     await updateBookingStatusByAdmin(req, res);
   } catch (error) {
     next(error);
@@ -632,6 +765,7 @@ export const remindCompanyOrderPayment = async (req: CompanyRequest, res: Respon
       iconColor: '#D97706',
       data: { type: 'payment_reminder', bookingRef: booking.booking_reference },
     });
+    await activity(req, 'payment_reminder', `أرسل تذكيراً بالدفع للحجز #${booking.booking_reference}`, 'order', booking.id);
     res.json({ success: true, message: 'تم إرسال التذكير للعميل' });
   } catch (error) {
     console.error('Payment reminder error:', error);
@@ -688,10 +822,52 @@ export const getCompanyFinance = async (req: CompanyRequest, res: Response): Pro
 
 // ───── Reviews ─────
 
+// The reply shows under the review in the customer app; an empty reply removes it
+export const replyCompanyReview = async (req: CompanyRequest, res: Response): Promise<void> => {
+  try {
+    const reply = String(req.body.reply || '').trim();
+    const review = await pool.query(
+      `SELECT id, user_id, company_reply FROM reviews WHERE id = $1 AND company_id = $2 AND COALESCE(hidden, FALSE) = FALSE`,
+      [param(req, 'id'), req.company.id]
+    );
+    const row = review.rows[0];
+    if (!row) {
+      res.status(404).json({ error: 'التقييم غير موجود' });
+      return;
+    }
+    const updated = await pool.query(
+      `UPDATE reviews SET company_reply = NULLIF($1, ''), company_reply_at = CASE WHEN $1 = '' THEN NULL ELSE NOW() END,
+         company_reply_by = CASE WHEN $1 = '' THEN NULL ELSE $2 END
+       WHERE id = $3 RETURNING id, company_reply, company_reply_at, company_reply_by`,
+      [reply, req.actor?.name || req.company.name, row.id]
+    );
+    await activity(req, reply ? 'review_replied' : 'review_reply_removed', reply ? 'ردّ على تقييم عميل' : 'حذف الرد على تقييم', 'review', row.id);
+
+    // The customer hears about the first answer, not every later edit
+    if (reply && !row.company_reply && row.user_id) {
+      await createAndSendNotification({
+        userId: row.user_id,
+        title: `ردّت ${req.company.name} على تقييمك`,
+        subtitle: reply.length > 120 ? `${reply.slice(0, 117)}...` : reply,
+        category: 'review',
+        icon: 'chatbubble-outline',
+        iconBg: '#F8F5EE',
+        iconColor: '#C8A96A',
+        data: { type: 'review_reply', reviewId: row.id, companyId: req.company.id },
+      });
+    }
+    res.json({ success: true, message: reply ? 'تم نشر الرد' : 'تم حذف الرد', data: updated.rows[0] });
+  } catch (error) {
+    console.error('Review reply error:', error);
+    res.status(500).json({ error: 'تعذر حفظ الرد' });
+  }
+};
+
 export const getCompanyReviews = async (req: CompanyRequest, res: Response): Promise<void> => {
   try {
     const result = await pool.query(
-      `SELECT r.id, r.rating::float AS rating, r.comment, r.created_at, COALESCE(u.name, 'عميل') AS client_name
+      `SELECT r.id, r.rating::float AS rating, r.comment, r.created_at, COALESCE(u.name, 'عميل') AS client_name,
+         r.company_reply, r.company_reply_at, r.company_reply_by
        FROM reviews r LEFT JOIN users u ON r.user_id = u.id
        WHERE r.company_id = $1 AND COALESCE(r.hidden, FALSE) = FALSE
        ORDER BY r.created_at DESC LIMIT 200`,
@@ -769,6 +945,7 @@ export const completeCompanyStage = async (req: CompanyRequest, res: Response): 
       data: { type: 'stage_update', stageTitle: stage.title, bookingRef: booking.booking_reference },
     });
 
+    await activity(req, 'stage_completed', `أكمل مرحلة "${stage.title}" في الحجز #${booking.booking_reference}`, 'order', booking.id);
     res.json({ success: true, message: 'تم تحديث المرحلة', data: await readOrder(booking.id, req.company.id) });
   } catch (error) {
     console.error('Complete stage error:', error);
@@ -854,6 +1031,7 @@ export const saveCompanyClientNote = async (req: CompanyRequest, res: Response):
        ON CONFLICT (company_id, user_id) DO UPDATE SET note = EXCLUDED.note, updated_at = NOW()`,
       [req.company.id, clientId, req.body.note]
     );
+    await activity(req, 'client_note', 'عدّل ملاحظة الفريق على عميل', 'client', param(req, 'clientId'));
     res.json({ success: true, message: 'تم حفظ الملاحظة' });
   } catch (error) {
     console.error('Client note error:', error);
@@ -930,7 +1108,7 @@ export const getCompanyChatMessages = async (req: CompanyRequest, res: Response)
     }
     await pool.query(`UPDATE messages SET status = 'read' WHERE chat_id = $1 AND sender = 'user' AND status = 'sent'`, [chat.id]);
     const messages = await pool.query(
-      `SELECT id, sender, text, image_uri, time, status, created_at FROM messages WHERE chat_id = $1 ORDER BY created_at ASC LIMIT 500`,
+      `SELECT id, sender, text, image_uri, time, status, created_at, sent_by_name FROM messages WHERE chat_id = $1 ORDER BY created_at ASC LIMIT 500`,
       [chat.id]
     );
     res.json({
@@ -961,15 +1139,18 @@ export const sendCompanyChatMessage = async (req: CompanyRequest, res: Response)
     const text = req.body.message || '[صورة مرفقة]';
     const timeStr = new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' });
     const inserted = await pool.query(
-      `INSERT INTO messages (id, chat_id, user_id, company_id, company_name, sender, text, image_uri, time, status)
-       VALUES ($1, $2, $3, $4, $5, 'company', $6, $7, $8, 'received') RETURNING id, sender, text, image_uri, time, status, created_at`,
-      [generate16CharId(), chat.id, chat.user_id, req.company.id, req.company.name, text, imageUri, timeStr]
+      `INSERT INTO messages (id, chat_id, user_id, company_id, company_name, sender, text, image_uri, time, status, sent_by_name)
+       VALUES ($1, $2, $3, $4, $5, 'company', $6, $7, $8, 'received', $9) RETURNING id, sender, text, image_uri, time, status, created_at, sent_by_name`,
+      [generate16CharId(), chat.id, chat.user_id, req.company.id, req.company.name, text, imageUri, timeStr, req.actor?.name || null]
     );
     await pool.query(
       `UPDATE chats SET last_message = $1, unread_count = COALESCE(unread_count, 0) + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
       [text, chat.id]
     );
-    if (io) io.to(`chat_${chat.id}`).emit('receive_message', inserted.rows[0]);
+    if (io) {
+      const { sent_by_name, ...publicMessage } = inserted.rows[0];
+      io.to(`chat_${chat.id}`).emit('receive_message', { ...publicMessage, chat_id: chat.id });
+    }
 
     createAndSendNotification({
       userId: chat.user_id,
@@ -1085,6 +1266,7 @@ export const createCompanyAppointment = async (req: CompanyRequest, res: Respons
 
     const appointment = inserted.rows[0];
     await announceAppointment(req, appointment, 'موعد مقابلة جديد', `اقترحت ${companyName} موعداً بتاريخ ${appointmentDate} الساعة ${appointmentTime} في ${appointment.location}`);
+    await activity(req, 'appointment_created', 'حدد موعداً جديداً مع عميل', 'appointment', appointment?.id);
     res.status(201).json({ success: true, message: 'تم إرسال الموعد للعميل', data: appointment });
   } catch (error) {
     console.error('Create appointment error:', error);
@@ -1122,6 +1304,7 @@ export const rescheduleCompanyAppointment = async (req: CompanyRequest, res: Res
       [appointmentDate, appointmentTime, req.company.name, existing.user_id]
     );
     await announceAppointment(req, updated.rows[0], 'تغيير موعد المقابلة', `غيّرت ${req.company.name} الموعد إلى ${appointmentDate} الساعة ${appointmentTime}`);
+    await activity(req, 'appointment_rescheduled', 'أعاد جدولة موعد مع عميل', 'appointment', param(req, 'id'));
     res.json({ success: true, message: 'تم إرسال الموعد الجديد للعميل', data: updated.rows[0] });
   } catch (error) {
     console.error('Reschedule appointment error:', error);
@@ -1157,6 +1340,7 @@ export const markCompanyAppointmentAttended = async (req: CompanyRequest, res: R
       [req.company.id, existing.user_id]
     );
     if (io && existing.chat_id) io.to(`chat_${existing.chat_id}`).emit('appointment_updated', updated.rows[0]);
+    await activity(req, 'appointment_attended', 'سجّل حضور عميل لموعده', 'appointment', param(req, 'id'));
     res.json({ success: true, message: 'تم تسجيل حضور العميل', data: { ...existing, ...updated.rows[0] } });
   } catch (error) {
     console.error('Mark appointment attended error:', error);
@@ -1180,6 +1364,7 @@ export const cancelCompanyAppointment = async (req: CompanyRequest, res: Respons
       [existing.id, req.body.reason || 'ألغت الشركة الموعد']
     );
     await announceAppointment(req, updated.rows[0], 'إلغاء موعد المقابلة', `ألغت ${req.company.name} موعد ${existing.appointment_date}. السبب: ${req.body.reason}`);
+    await activity(req, 'appointment_cancelled', 'ألغى موعداً مع عميل', 'appointment', param(req, 'id'));
     res.json({ success: true, message: 'تم إلغاء الموعد وإبلاغ العميل', data: updated.rows[0] });
   } catch (error) {
     console.error('Cancel appointment error:', error);

@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { listReceipts, getReceipt, reviewReceipt } from '../controllers/receipts.controller';
 import {
   getAllUsers,
   getUserDetails,
@@ -21,7 +22,6 @@ import {
   getSettings,
   updateSettings,
   testSmtpConnection,
-  reviewBookingReceiptByAdmin,
   getPlatformEarnings,
   adminGetCategories,
   adminCreateCategory,
@@ -70,7 +70,11 @@ router.delete('/users/:id', idempotencyMiddleware, requireModulePermission('user
 
 router.get('/bookings', requireModulePermission('bookings'), getAllBookings);
 router.patch('/bookings/:id/status', idempotencyMiddleware, requireModulePermission('bookings'), updateBookingStatusByAdmin);
-router.patch('/bookings/:id/receipt-review', idempotencyMiddleware, requireModulePermission('bookings'), reviewBookingReceiptByAdmin);
+// Receipts are approved only through the receipts module, which records who reviewed them
+router.patch('/bookings/:id/receipt-review', idempotencyMiddleware, requireModulePermission('receipts'), reviewReceipt);
+router.get('/receipts', requireModulePermission('receipts'), listReceipts);
+router.get('/receipts/:id', requireModulePermission('receipts'), getReceipt);
+router.patch('/receipts/:id/review', idempotencyMiddleware, requireModulePermission('receipts'), reviewReceipt);
 router.patch('/bookings/:id/stages/:stageId', idempotencyMiddleware, requireModulePermission('bookings'), updateTripStageByAdmin);
 router.get('/bookings/:id/stages', requireModulePermission('bookings'), getBookingStagesByAdmin);
 

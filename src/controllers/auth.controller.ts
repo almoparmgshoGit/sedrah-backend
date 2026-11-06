@@ -906,6 +906,10 @@ export const updateMyProfile = async (req: AuthRequest, res: Response): Promise<
         res.status(400).json({ error: 'كلمة المرور الحالية غير صحيحة' });
         return;
       }
+      if (newPassword.length < 8 || newPassword.length > 128 || !/\p{L}/u.test(newPassword) || !/\d/.test(newPassword)) {
+        res.status(400).json({ error: 'كلمة المرور الجديدة يجب أن تكون 8 أحرف على الأقل وتحتوي على حرف ورقم' });
+        return;
+      }
       newPasswordHash = await argon2.hash(newPassword);
       // Revoke all refresh tokens for user on password change
       await pool.query('UPDATE refresh_tokens SET is_revoked = TRUE WHERE user_id = $1', [userId]);

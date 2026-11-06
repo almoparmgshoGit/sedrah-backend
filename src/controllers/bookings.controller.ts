@@ -5,6 +5,7 @@ import { parseIdOrToken, generate16CharId } from '../utils/formatId';
 import { suggestAppointmentForBooking } from '../utils/appointmentEngine';
 import { createAndSendNotification } from '../utils/notificationHelper';
 import { resolveUserUpload } from '../utils/uploadAccess';
+import { submitReceiptForReview } from './receipts.controller';
 
 // Mirrors the room pricing shown in the app, so the charged total never comes from the client
 const calculateBookingTotal = (pkg: any, roomType: string, adults: number, children: number): number => {
@@ -98,7 +99,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
 
     // Only packages the customer can see in the app can be booked
     const pkgRes = await pool.query(
-      `SELECT company_id, price, room_prices FROM packages WHERE id = $1 AND (status = 'active' OR status IS NULL)`,
+      `SELECT company_id, price, room_prices, max_adults, max_children FROM packages WHERE id = $1 AND (status = 'active' OR status IS NULL)`,
       [resolvedPackageId]
     );
     if (pkgRes.rows.length === 0) {
@@ -109,6 +110,19 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
 
     const childrenTotal = childrenCount;
     const adultsTotal = travelersCount - childrenCount;
+    // The package's limits on travelers per booking; 'unlimited' or an empty value means no limit
+    const limitOf = (value: unknown) => (/^\d+$/.test(String(value ?? '')) ? Number(value) : null);
+    const maxAdults = limitOf(pkgRes.rows[0].max_adults);
+    const maxChildren = limitOf(pkgRes.rows[0].max_children);
+    if (maxAdults !== null && adultsTotal > maxAdults) {
+      res.status(400).json({ error: `الحد الأقصى للبالغين في هذه الباقة ${maxAdults}` });
+      return;
+    }
+    if (maxChildren !== null && childrenTotal > maxChildren) {
+      res.status(400).json({ error: maxChildren === 0 ? 'هذه الباقة لا تقبل أطفالاً' : `الحد الأقصى للأطفال في هذه الباقة ${maxChildren}` });
+      return;
+    }
+
     const totalPrice = calculateBookingTotal(pkgRes.rows[0], roomType, adultsTotal, childrenTotal);
 
     // Suggest appointment for booking
@@ -171,7 +185,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       { order: 1, title: 'انتظار زيارة المستخدم للشركة', subtitle: apptSubtitle, status: 'current', date: currentDate },
       { order: 2, title: 'بانتظار مراجعة إيصال الدفع', subtitle: 'يتم رفع الإيصال بعد تسجيل إتمام زيارة الشركة', status: 'pending', date: 'قريباً' },
       { order: 3, title: 'تأكيد الحجز النهائي', subtitle: 'اعتماد الإيصال وتأكيد الحجز بنجاح', status: 'pending', date: 'قريباً' },
-      { order: 4, title: 'جارٍ تجهيز التأشيرات', subtitle: 'تصدُر بعد تأكيد الحجز واعتماد الإيصال من الشركة', status: 'pending', date: 'قريباً' },
+      { order: 4, title: 'جارٍ تجهيز التأشيرات', subtitle: 'تصدُر بعد تأكيد الحجز واعتماد الإيصال من إدارة سدرة', status: 'pending', date: 'قريباً' },
       { order: 5, title: 'تم إصدار التأشيرات', subtitle: 'المستندات متاحة للتحميل في قسم مستندات رحلتي', status: 'pending', date: 'قريباً' },
       { order: 6, title: 'تذاكر الطيران والسكن', subtitle: 'حجز الفنادق وتذاكر الطيران الرسمية', status: 'pending', date: 'قريباً' },
       { order: 7, title: 'جاهزية الرحلة والتوجه للمطار', subtitle: 'تعليمات السفر والتجمع', status: 'pending', date: 'قريباً' },
@@ -399,38 +413,12 @@ export const updateBookingReceipt = async (req: Request, res: Response): Promise
       return;
     }
 
-    const result = await pool.query(
-      `UPDATE bookings
-       SET status = 'receipt_review',
-           receipt_url = COALESCE(NULLIF($1, ''), receipt_url),
-           receipt_approved = FALSE,
-           receipt_status = 'pending',
-           rejection_reason = NULL,
-           paid_amount = COALESCE($3, paid_amount)
-       WHERE id = $2
-       RETURNING *`,
-      [finalReceiptUrl, bookingRecord.id, parsedPaidAmount]
-    );
-
-    if (result.rows.length === 0) {
-      res.status(404).json({ error: 'الحجز غير موجود' });
-      return;
-    }
-
-    const booking = result.rows[0];
-
-    try {
-      await pool.query(
-        `UPDATE trip_stages SET status = 'completed', document_url = COALESCE(NULLIF($1, ''), document_url) WHERE booking_id = $2 AND stage_order = 2`,
-        [finalReceiptUrl, booking.id]
-      );
-      await pool.query(
-        `UPDATE trip_stages SET status = 'current' WHERE booking_id = $1 AND stage_order = 3`,
-        [booking.id]
-      );
-    } catch (stageErr) {
-      console.error('Error updating stages on receipt:', stageErr);
-    }
+    const customer = await pool.query('SELECT name FROM users WHERE id = $1', [userId]);
+    const booking = await submitReceiptForReview(bookingRecord, finalReceiptUrl, parsedPaidAmount, {
+      id: String(userId),
+      name: customer.rows[0]?.name || 'العميل',
+      type: 'customer',
+    });
 
     await createAndSendNotification({
       userId,
@@ -545,9 +533,9 @@ export const getBookingStages = async (req: Request, res: Response): Promise<voi
       const currentDate = new Date().toLocaleDateString('ar-EG', { month: 'long', day: 'numeric', year: 'numeric' });
       const defaultStages = [
         { order: 1, title: 'تم استلام طلب الحجز', subtitle: 'تم إرسال الطلب بنجاح إلى الشركة', status: 'completed', date: currentDate },
-        { order: 2, title: 'بانتظار مراجعة إيصال الدفع', subtitle: 'يرجى رفع إيصال السداد لمراجعة الشركة', status: 'current', date: currentDate },
+        { order: 2, title: 'بانتظار مراجعة إيصال الدفع', subtitle: 'يرجى رفع إيصال السداد لمراجعة إدارة سدرة', status: 'current', date: currentDate },
         { order: 3, title: 'تأكيد الحجز النهائي', subtitle: 'قيد الانتظار لحين اعتماد الإيصال', status: 'pending', date: 'قريباً' },
-        { order: 4, title: 'جارٍ تجهيز التأشيرات', subtitle: 'تصدُر بعد تأكيد الحجز واعتماد الإيصال من الشركة', status: 'pending', date: 'قريباً' },
+        { order: 4, title: 'جارٍ تجهيز التأشيرات', subtitle: 'تصدُر بعد تأكيد الحجز واعتماد الإيصال من إدارة سدرة', status: 'pending', date: 'قريباً' },
         { order: 5, title: 'تم إصدار التأشيرات', subtitle: 'المستندات متاحة للتحميل في قسم مستندات رحلتي', status: 'pending', date: 'قريباً' },
         { order: 6, title: 'تذاكر الطيران والسكن', subtitle: 'حجز الفنادق وتذاكر الطيران الرسمية', status: 'pending', date: 'قريباً' },
         { order: 7, title: 'جاهزية الرحلة والتوجه للمطار', subtitle: 'تعليمات السفر والتجمع', status: 'pending', date: 'قريباً' },

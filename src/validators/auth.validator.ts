@@ -5,7 +5,12 @@ export const registerSchema = z.object({
   body: z.object({
     name: z.string().min(2, 'Name must be at least 2 characters').max(100),
     email: z.string().email('Invalid email address format'),
-    password: z.string().min(6, 'Password must be at least 6 characters long'),
+    // Same rule as a password reset, so an account can never be created with a password it could not be reset to
+    password: z.string()
+      .min(8, 'كلمة المرور يجب ألا تقل عن 8 أحرف')
+      .max(128, 'كلمة المرور طويلة جداً')
+      .regex(/\p{L}/u, 'كلمة المرور يجب أن تحتوي على حرف واحد على الأقل')
+      .regex(/\d/, 'كلمة المرور يجب أن تحتوي على رقم واحد على الأقل'),
     phone: z.string().optional(),
   }),
 });

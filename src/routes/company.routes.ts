@@ -36,8 +36,13 @@ router.get('/orders', company.getCompanyOrders as any);
 router.get('/orders/:id', company.requireCompanyBooking as any, company.getCompanyOrderDetails as any);
 router.post('/orders/:id/accept', company.requireCompanyBooking as any, company.acceptCompanyOrder as any);
 router.post('/orders/:id/reject', body(schemas.rejectOrderSchema), company.requireCompanyBooking as any, company.rejectCompanyOrder as any);
-router.post('/orders/:id/receipt', body(schemas.reviewReceiptSchema), company.requireCompanyBooking as any, company.reviewCompanyReceipt as any);
+router.post('/orders/:id/receipt-upload', authLimiter, body(schemas.companyReceiptSchema), company.requireCompanyBooking as any, company.uploadCompanyReceipt as any);
+router.post('/orders/:id/cancel', body(schemas.cancelOrderSchema), company.requireCompanyBooking as any, company.cancelCompanyOrder as any);
+router.post('/orders/:id/remind-payment', authLimiter, company.requireCompanyBooking as any, company.remindCompanyOrderPayment as any);
 router.post('/orders/:id/stages/:stageId/complete', body(schemas.updateStageSchema), company.requireCompanyBooking as any, company.completeCompanyStage as any);
+
+router.get('/finance', company.getCompanyFinance as any);
+router.get('/reviews', company.getCompanyReviews as any);
 
 router.get('/clients', company.getCompanyClients as any);
 router.get('/clients/:clientId', company.getCompanyClientDetails as any);

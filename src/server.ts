@@ -177,9 +177,18 @@ io.on('connection', (socket) => {
     try {
       if (typeof room !== 'string') return;
       if (!isStaff) {
-        // Customers may only join the rooms of their own chats
+        // Customers may only join the rooms of their own chats, and a company owner those of its company's chats
         if (!room.startsWith('chat_')) return;
-        const owned = await pool.query('SELECT 1 FROM chats WHERE id = $1 AND user_id = $2', [room.slice(5), String(user.id)]);
+        const owned = await pool.query(
+          `SELECT 1 FROM chats c
+           WHERE c.id = $1 AND c.ticket_number IS NULL AND (
+             c.user_id = $2
+             OR EXISTS (SELECT 1 FROM companies co WHERE co.user_id = $2 AND (co.id = c.company_id OR co.name = c.company_name))
+           )
+           UNION
+           SELECT 1 FROM chats c WHERE c.id = $1 AND c.user_id = $2`,
+          [room.slice(5), String(user.id)]
+        );
         if (owned.rows.length === 0) return;
       }
       socket.join(room);

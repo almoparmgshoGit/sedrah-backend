@@ -992,8 +992,37 @@ export const initDB = async () => {
     await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS governorate VARCHAR(255);');
     await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS district VARCHAR(255);');
 
+    // Payment receipts are verified by the platform only: the commission depends on that review
+    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS receipt_submitted_at TIMESTAMP;');
+    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS receipt_reviewed_at TIMESTAMP;');
+    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS receipt_reviewed_by VARCHAR(255);');
+    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS receipt_verified_amount NUMERIC(10, 2);');
+    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS receipt_admin_note TEXT;');
+    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS receipt_uploaded_by VARCHAR(50);');
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS receipt_reviews (
+        id VARCHAR(16) PRIMARY KEY,
+        booking_id VARCHAR(16) REFERENCES bookings(id) ON DELETE CASCADE,
+        action VARCHAR(30) NOT NULL,
+        receipt_url TEXT,
+        paid_amount NUMERIC(10, 2),
+        verified_amount NUMERIC(10, 2),
+        reason TEXT,
+        note TEXT,
+        actor_id VARCHAR(16),
+        actor_name VARCHAR(255),
+        actor_type VARCHAR(30),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_receipt_reviews_booking ON receipt_reviews(booking_id, created_at);');
+    // Receipts uploaded before this table existed get their submission time from the booking
+    await pool.query(`UPDATE bookings SET receipt_submitted_at = created_at WHERE receipt_url IS NOT NULL AND receipt_submitted_at IS NULL;`);
+    // A rejected receipt awaiting a new upload used to keep the review status, which would list it as pending review
+    await pool.query(`UPDATE bookings SET status = 'new' WHERE status = 'receipt_review' AND receipt_status = 'rejected';`);
+
     // Ensure default admin user exists and is verified
-    const allPerms = JSON.stringify(['users','companies','packages','bookings','store','notifications','support','reviews','admins','audit_logs','settings']);
+    const allPerms = JSON.stringify(['users','companies','packages','bookings','receipts','store','notifications','support','reviews','admins','audit_logs','settings']);
     const adminCheck = await pool.query('SELECT id FROM users WHERE email = $1', ['admin@sdra.com']);
     if (adminCheck.rows.length === 0 && process.env.ADMIN_INITIAL_PASSWORD) {
       const passwordHash = await argon2.hash(process.env.ADMIN_INITIAL_PASSWORD);

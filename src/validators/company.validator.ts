@@ -115,17 +115,17 @@ export const rejectOrderSchema = z
   .object({ reason: shortText(200).min(2, 'اكتب سبب الرفض للعميل') })
   .strict();
 
-export const reviewReceiptSchema = z
+export const cancelOrderSchema = z
+  .object({ reason: shortText(500).min(2, 'اكتب سبب الإلغاء للعميل') })
+  .strict();
+
+// The company only uploads; approving a receipt belongs to the platform
+export const companyReceiptSchema = z
   .object({
-    action: z.enum(['approve', 'reject']),
-    rejectionReason: shortText(500).optional(),
-    allowRetry: z.boolean().optional(),
+    receiptUrl: fileLink.min(1, 'أرفق صورة الإيصال'),
+    paidAmount: z.union([z.literal(''), z.string().regex(/^\d{1,8}(\.\d{1,2})?$/, 'المبلغ المدفوع غير صحيح')]).optional(),
   })
-  .strict()
-  .refine((body) => body.action === 'approve' || (body.rejectionReason || '').length >= 2, {
-    message: 'اكتب سبب رفض الإيصال',
-    path: ['rejectionReason'],
-  });
+  .strict();
 
 export const updateStageSchema = z
   .object({

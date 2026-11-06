@@ -563,6 +563,14 @@ export const updateBookingStatusByAdmin = async (req: AuthRequest, res: Response
   try {
     const { id } = req.params;
     const { status, cancellation_reason, cancelled_by, appointment_date, appointment_time, appointment_status } = req.body;
+    // Confirming a booking means its receipt was verified, which only the receipts module records
+    if (status === 'confirmed' || status === 'receipt_review') {
+      const current = await pool.query('SELECT receipt_approved FROM bookings WHERE id = $1', [id]);
+      if (current.rows[0] && !(status === 'confirmed' && current.rows[0].receipt_approved)) {
+        res.status(409).json({ error: 'تأكيد الحجز ومراجعة الإيصال يتمان من قسم الإيصالات فقط' });
+        return;
+      }
+    }
     const result = await pool.query(
       `UPDATE bookings
        SET status = COALESCE($1, status),
@@ -1029,167 +1037,6 @@ export const getPublicSettings = async (req: Request, res: Response): Promise<vo
   }
 };
 
-export const reviewBookingReceiptByAdmin = async (req: AuthRequest, res: Response): Promise<void> => {
-  try {
-    const { id } = req.params;
-    const { action, rejectionReason, allowRetry, retryCount } = req.body; // action: 'approve' | 'reject'
-
-    const bookingRes = await pool.query('SELECT * FROM bookings WHERE id = $1', [id]);
-    if (bookingRes.rows.length === 0) {
-      res.status(404).json({ error: 'الحجز غير موجود' });
-      return;
-    }
-    const bookingRecord = bookingRes.rows[0];
-
-    if (!bookingRecord.receipt_url || !String(bookingRecord.receipt_url).trim()) {
-      res.status(400).json({ error: 'لا يمكن مراجعة الإيصال لعدم وجود ملف إيصال مرفوع من العميل بعد' });
-      return;
-    }
-
-    if (action === 'approve' || action === 'approved') {
-      const result = await pool.query(
-        `UPDATE bookings
-         SET status = 'confirmed',
-             receipt_approved = TRUE,
-             receipt_status = 'approved',
-             rejection_reason = NULL
-         WHERE id = $1
-         RETURNING *`,
-        [id]
-      );
-      const booking = result.rows[0];
-
-      // Mark stage 2 ("بانتظار مراجعة إيصال الدفع") as completed
-      await pool.query(
-        `UPDATE trip_stages
-         SET status = 'completed'
-         WHERE booking_id = $1 AND (stage_order = 2 OR title LIKE '%إيصال%')`,
-        [booking.id]
-      );
-
-      // Advance stage 3 to 'current' if pending
-      await pool.query(
-        `UPDATE trip_stages
-         SET status = 'current'
-         WHERE booking_id = $1 AND stage_order = 3 AND status = 'pending'`,
-        [booking.id]
-      );
-
-      // Record platform earnings
-      const pkgRes = await pool.query('SELECT company_id FROM packages WHERE id = $1', [booking.package_id]);
-      const companyId = pkgRes.rows.length > 0 ? pkgRes.rows[0].company_id : null;
-      if (companyId) {
-        const commAmt = booking.commission_amount || 0;
-        await pool.query(
-          `INSERT INTO platform_earnings (id, booking_id, company_id, commission_amount, status)
-           VALUES ($1, $2, $3, $4, 'recorded')
-           ON CONFLICT (booking_id) DO UPDATE SET commission_amount = EXCLUDED.commission_amount, status = 'recorded'`,
-          [generate16CharId(), booking.id, companyId, commAmt]
-        );
-      }
-
-      await createAndSendNotification({
-        userId: booking.user_id,
-        title: 'تم اعتماد إيصال الدفع',
-        subtitle: `تمت الموافقة على إيصال الدفع لحجزك #${booking.booking_reference} وتأكيد الحجز بنجاح.`,
-        category: 'booking',
-        icon: 'checkmark-circle-outline',
-        iconBg: '#ECFDF5',
-        iconColor: '#059669',
-        data: { type: 'receipt_approved', bookingRef: booking.booking_reference },
-      });
-
-      res.json({ success: true, message: 'تم اعتماد الإيصال وتأكيد الحجز وتحديث مرحلة الإيصال إلى مكتمل بنجاح', data: booking });
-      return;
-    } else if (action === 'reject') {
-      const isRetryAllowed = allowRetry !== false && allowRetry !== 'false';
-      const newStatus = isRetryAllowed ? 'receipt_review' : 'cancelled';
-
-      const result = await pool.query(
-        `UPDATE bookings
-         SET status = $1,
-             receipt_approved = FALSE,
-             receipt_status = 'rejected',
-             rejection_reason = $2,
-             allow_retry = $3,
-             retry_count = COALESCE($4, retry_count)
-         WHERE id = $5
-         RETURNING *`,
-        [newStatus, rejectionReason || 'تم رفض الإيصال من الإدارة', isRetryAllowed, retryCount !== undefined ? parseInt(retryCount, 10) : null, id]
-      );
-
-      if (result.rows.length === 0) {
-        res.status(404).json({ error: 'الحجز غير موجود' });
-        return;
-      }
-      const booking = result.rows[0];
-
-      // Reset stage 2 and subsequent stages
-      await pool.query(
-        `UPDATE trip_stages
-         SET status = CASE WHEN stage_order = 2 THEN 'current' ELSE 'pending' END
-         WHERE booking_id = $1 AND stage_order >= 2`,
-        [booking.id]
-      );
-
-      await pool.query(
-        `UPDATE platform_earnings SET status = 'cancelled' WHERE booking_id = $1`,
-        [booking.id]
-      );
-
-      const notifSub = isRetryAllowed
-        ? `تم رفض إيصال الدفع لحجزك #${booking.booking_reference}. السبب: ${rejectionReason || 'يرجى مراجعة الملاحظة وإعادة الرفع'}`
-        : `تم رفض إيصال الدفع وإغلاق الحجز #${booking.booking_reference}. السبب: ${rejectionReason || 'الإيصال غير مطابق'}`;
-
-      await createAndSendNotification({
-        userId: booking.user_id,
-        title: 'رفض إيصال الدفع',
-        subtitle: notifSub,
-        category: 'booking',
-        icon: 'alert-circle-outline',
-        iconBg: '#FEF2F2',
-        iconColor: '#DC2626',
-        data: { type: 'receipt_rejected', bookingRef: booking.booking_reference, reason: rejectionReason },
-      });
-
-      res.json({ success: true, message: 'تم رفض الإيصال وتحديث حالة الحجز والمراحل', data: booking });
-      return;
-    } else if (action === 'pending' || action === 'review') {
-      const result = await pool.query(
-        `UPDATE bookings
-         SET status = 'receipt_review',
-             receipt_approved = FALSE,
-             receipt_status = 'pending',
-             rejection_reason = NULL
-         WHERE id = $1
-         RETURNING *`,
-        [id]
-      );
-
-      if (result.rows.length === 0) {
-        res.status(404).json({ error: 'الحجز غير موجود' });
-        return;
-      }
-      const booking = result.rows[0];
-
-      // Reset stage 2 to 'current' and subsequent stages to 'pending'
-      await pool.query(
-        `UPDATE trip_stages
-         SET status = CASE WHEN stage_order = 2 THEN 'current' ELSE 'pending' END
-         WHERE booking_id = $1 AND stage_order >= 2`,
-        [booking.id]
-      );
-
-      res.json({ success: true, message: 'تم إعادة حالة الإيصال إلى قيد المراجعة', data: booking });
-      return;
-    }
-
-    res.status(400).json({ error: 'إجراء غير معروف' });
-  } catch (error: any) {
-    console.error('Error reviewing receipt:', error);
-    res.status(500).json({ error: 'فشل مراجعة الإيصال' });
-  }
-};
 
 // ==========================================
 // STORE MANAGEMENT ADMIN CONTROLLERS

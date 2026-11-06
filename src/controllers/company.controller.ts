@@ -6,7 +6,8 @@ import { generate16CharId } from '../utils/formatId';
 import { createAndSendNotification } from '../utils/notificationHelper';
 import { logAudit } from '../utils/auditLogger';
 import { resolveUserUpload } from '../utils/uploadAccess';
-import { reviewBookingReceiptByAdmin, updateBookingStatusByAdmin } from './admin.controller';
+import { updateBookingStatusByAdmin } from './admin.controller';
+import { submitReceiptForReview } from './receipts.controller';
 import { expireOverdueAppointmentsThrottled, isPastAppointmentDay, localToday, markAppointmentAttended } from '../utils/appointmentLifecycle';
 
 export interface CompanyRequest extends AuthRequest {
@@ -87,7 +88,8 @@ const ORDER_STATE_SQL = `
 
 const ORDER_COLUMNS = `
   b.id, b.booking_reference, b.status, b.room_type, b.travelers_count, b.children_count, b.total_price, b.paid_amount,
-  b.notes, b.created_at, b.receipt_url, b.receipt_status, b.rejection_reason, b.cancellation_reason,
+  b.notes, b.created_at, b.receipt_url, b.receipt_status, b.rejection_reason, b.cancellation_reason, b.cancelled_by,
+  b.allow_retry, b.receipt_submitted_at, b.receipt_reviewed_at, b.receipt_uploaded_by,
   b.appointment_date, b.appointment_time, b.appointment_status, b.user_id,
   COALESCE(b.customer_name, u.name) AS client_name, COALESCE(b.customer_phone, u.phone) AS client_phone,
   COALESCE(b.governorate, u.city) AS client_city, b.district AS client_district,
@@ -142,11 +144,13 @@ export const getCompanyDashboard = async (req: CompanyRequest, res: Response): P
        ORDER BY a.appointment_time`,
       [companyName]
     );
+    // Shown for follow-up only: the platform reviews receipts, the company cannot act on them
     const receipts = await pool.query(
-      `SELECT b.id, b.total_price, b.paid_amount, b.created_at, u.name AS client_name
+      `SELECT b.id, b.total_price, b.paid_amount, COALESCE(b.receipt_submitted_at, b.created_at) AS created_at,
+         COALESCE(b.customer_name, u.name) AS client_name
        ${ORDER_FROM}
        WHERE p.company_id = $1 AND b.status = 'receipt_review'
-       ORDER BY b.created_at DESC LIMIT 5`,
+       ORDER BY b.receipt_submitted_at DESC NULLS LAST LIMIT 5`,
       [companyId]
     );
     const unread = await pool.query(
@@ -162,7 +166,7 @@ export const getCompanyDashboard = async (req: CompanyRequest, res: Response): P
         unread_chats: chats.rows[0].total,
         appointments_today: today.rows.length,
         unread_notifications: unread.rows[0].total,
-        receipts_to_review: receipts.rows,
+        receipts_in_review: receipts.rows,
         today_appointments: today.rows,
       },
     });
@@ -543,15 +547,163 @@ export const rejectCompanyOrder = async (req: CompanyRequest, res: Response, nex
   }
 };
 
-export const reviewCompanyReceipt = async (req: CompanyRequest, res: Response, next: NextFunction): Promise<void> => {
+// The order is accepted, and either no receipt was sent yet or the platform rejected it and allows another
+const isAwaitingPayment = async (booking: any): Promise<boolean> => {
+  if (booking.status !== 'new') return false;
+  const visit = await pool.query(
+    `SELECT 1 FROM trip_stages WHERE booking_id = $1 AND stage_order = 1 AND status = 'completed'`,
+    [booking.id]
+  );
+  return visit.rows.length > 0;
+};
+
+// A client who paid at the office may hand the receipt to the company; it still goes to the platform for review
+export const uploadCompanyReceipt = async (req: CompanyRequest, res: Response): Promise<void> => {
   try {
-    if (req.booking.status !== 'receipt_review') {
-      res.status(409).json({ error: 'لا يوجد إيصال بانتظار المراجعة في هذا الطلب' });
+    const booking = req.booking;
+    if (!(await isAwaitingPayment(booking))) {
+      res.status(409).json({ error: 'لا يمكن رفع إيصال لهذا الطلب في حالته الحالية' });
       return;
     }
-    await reviewBookingReceiptByAdmin(req, res);
+    if (booking.receipt_status === 'rejected' && booking.allow_retry === false) {
+      res.status(409).json({ error: 'أغلقت الإدارة هذا الحجز ولا يمكن رفع إيصال جديد' });
+      return;
+    }
+
+    const receiptUrl = await resolveUserUpload(req.body.receiptUrl, req, req.user!.id, null);
+    if (!receiptUrl) {
+      res.status(400).json({ error: 'يرجى إرفاق صورة إيصال صالحة' });
+      return;
+    }
+    const paidAmount = req.body.paidAmount ? Number(req.body.paidAmount) : null;
+
+    await submitReceiptForReview(booking, receiptUrl, paidAmount, { id: String(req.user!.id), name: req.company.name, type: 'company' });
+    res.json({ success: true, message: 'تم رفع الإيصال وإرساله لمراجعة إدارة سدرة', data: await readOrder(booking.id, req.company.id) });
+  } catch (error) {
+    console.error('Company receipt upload error:', error);
+    res.status(500).json({ error: 'تعذر رفع الإيصال' });
+  }
+};
+
+// Before payment the company may still withdraw; after a receipt is sent only the platform decides
+export const cancelCompanyOrder = async (req: CompanyRequest, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const booking = req.booking;
+    if (!(await isAwaitingPayment(booking))) {
+      res.status(409).json({
+        error: booking.status === 'receipt_review'
+          ? 'الإيصال قيد مراجعة الإدارة، تواصل مع دعم سدرة لإلغاء الحجز'
+          : 'لا يمكن إلغاء هذا الطلب من التطبيق، تواصل مع دعم سدرة',
+      });
+      return;
+    }
+    await pool.query(`UPDATE trip_stages SET status = 'cancelled' WHERE booking_id = $1 AND status <> 'completed'`, [booking.id]);
+    req.body = { status: 'cancelled', cancellation_reason: req.body.reason, cancelled_by: 'company' };
+    await updateBookingStatusByAdmin(req, res);
   } catch (error) {
     next(error);
+  }
+};
+
+// Reminds an accepted client to pay and send the receipt; limited to one reminder a day per booking
+export const remindCompanyOrderPayment = async (req: CompanyRequest, res: Response): Promise<void> => {
+  try {
+    const booking = req.booking;
+    if (!(await isAwaitingPayment(booking))) {
+      res.status(409).json({ error: 'هذا الطلب لا ينتظر الدفع' });
+      return;
+    }
+    const recent = await pool.query(
+      `SELECT 1 FROM notifications WHERE user_id = $1 AND created_at > NOW() - INTERVAL '24 hours'
+         AND data::text LIKE $2 LIMIT 1`,
+      [booking.user_id, `%"payment_reminder"%${booking.booking_reference}%`]
+    );
+    if (recent.rows.length > 0) {
+      res.status(429).json({ error: 'تم إرسال تذكير لهذا العميل خلال آخر 24 ساعة' });
+      return;
+    }
+    await createAndSendNotification({
+      userId: booking.user_id,
+      title: 'تذكير بإتمام الدفع',
+      subtitle: `تذكّرك ${req.company.name} بإتمام الدفع في مكتبها ورفع الإيصال لتأكيد حجزك #${booking.booking_reference}.`,
+      category: 'booking',
+      icon: 'time-outline',
+      iconBg: '#FFFBEB',
+      iconColor: '#D97706',
+      data: { type: 'payment_reminder', bookingRef: booking.booking_reference },
+    });
+    res.json({ success: true, message: 'تم إرسال التذكير للعميل' });
+  } catch (error) {
+    console.error('Payment reminder error:', error);
+    res.status(500).json({ error: 'تعذر إرسال التذكير' });
+  }
+};
+
+// ───── Finance ─────
+
+export const getCompanyFinance = async (req: CompanyRequest, res: Response): Promise<void> => {
+  try {
+    const companyId = req.company.id;
+    const totals = await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE b.receipt_approved)::int AS confirmed_count,
+         COALESCE(SUM(COALESCE(b.receipt_verified_amount, b.paid_amount, b.total_price)) FILTER (WHERE b.receipt_approved), 0)::float AS confirmed_sales,
+         COUNT(*) FILTER (WHERE b.status = 'receipt_review')::int AS in_review_count,
+         COALESCE(SUM(COALESCE(b.paid_amount, b.total_price)) FILTER (WHERE b.status = 'receipt_review'), 0)::float AS in_review_sales,
+         COALESCE(SUM(pe.commission_amount) FILTER (WHERE pe.status = 'recorded'), 0)::float AS commission_total,
+         COALESCE(SUM(pe.commission_amount) FILTER (WHERE pe.status = 'recorded' AND DATE_TRUNC('month', b.receipt_reviewed_at) = DATE_TRUNC('month', NOW())), 0)::float AS commission_this_month,
+         COALESCE(SUM(COALESCE(b.receipt_verified_amount, b.paid_amount, b.total_price))
+           FILTER (WHERE b.receipt_approved AND DATE_TRUNC('month', b.receipt_reviewed_at) = DATE_TRUNC('month', NOW())), 0)::float AS sales_this_month
+       FROM bookings b
+       JOIN packages p ON b.package_id = p.id
+       LEFT JOIN platform_earnings pe ON pe.booking_id = b.id
+       WHERE p.company_id = $1`,
+      [companyId]
+    );
+    const items = await pool.query(
+      `SELECT b.id, b.booking_reference, COALESCE(b.customer_name, u.name) AS client_name, p.title AS package_title,
+         COALESCE(b.receipt_verified_amount, b.paid_amount, b.total_price)::float AS amount,
+         COALESCE(pe.commission_amount, b.commission_amount, 0)::float AS commission,
+         b.receipt_reviewed_at, b.status
+       ${ORDER_FROM}
+       LEFT JOIN platform_earnings pe ON pe.booking_id = b.id
+       WHERE p.company_id = $1 AND b.receipt_approved = TRUE
+       ORDER BY b.receipt_reviewed_at DESC NULLS LAST LIMIT 100`,
+      [companyId]
+    );
+    const row = totals.rows[0];
+    res.json({
+      success: true,
+      data: {
+        ...row,
+        net_total: row.confirmed_sales - row.commission_total,
+        items: items.rows.map((item: any) => ({ ...item, net: item.amount - item.commission })),
+      },
+    });
+  } catch (error) {
+    console.error('Company finance error:', error);
+    res.status(500).json({ error: 'تعذر جلب البيانات المالية' });
+  }
+};
+
+// ───── Reviews ─────
+
+export const getCompanyReviews = async (req: CompanyRequest, res: Response): Promise<void> => {
+  try {
+    const result = await pool.query(
+      `SELECT r.id, r.rating::float AS rating, r.comment, r.created_at, COALESCE(u.name, 'عميل') AS client_name
+       FROM reviews r LEFT JOIN users u ON r.user_id = u.id
+       WHERE r.company_id = $1 AND COALESCE(r.hidden, FALSE) = FALSE
+       ORDER BY r.created_at DESC LIMIT 200`,
+      [req.company.id]
+    );
+    const rows = result.rows;
+    const average = rows.length ? rows.reduce((sum: number, r: any) => sum + Number(r.rating || 0), 0) / rows.length : 0;
+    const distribution = [5, 4, 3, 2, 1].map((stars) => ({ stars, count: rows.filter((r: any) => Math.round(Number(r.rating)) === stars).length }));
+    res.json({ success: true, data: { average: Math.round(average * 10) / 10, count: rows.length, distribution, items: rows } });
+  } catch (error) {
+    console.error('Company reviews error:', error);
+    res.status(500).json({ error: 'تعذر جلب التقييمات' });
   }
 };
 

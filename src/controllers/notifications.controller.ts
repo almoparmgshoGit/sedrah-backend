@@ -303,3 +303,20 @@ export const deleteNotification = async (req: AuthRequest, res: Response): Promi
     res.status(500).json({ error: 'فشل حذف الإشعار' });
   }
 };
+
+export const markAllNotificationsAsRead = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user?.id) {
+      res.status(401).json({ error: 'غير مصرح' });
+      return;
+    }
+    const result = await pool.query(
+      'UPDATE notifications SET is_read = true WHERE user_id = $1 AND is_read = false',
+      [String(req.user.id)]
+    );
+    res.json({ success: true, message: 'تم تعليم كل الإشعارات كمقروءة', data: { updated: result.rowCount } });
+  } catch (error: any) {
+    console.error('Error marking all notifications as read:', error);
+    res.status(500).json({ error: 'حدث خطأ أثناء تحديث الإشعارات' });
+  }
+};

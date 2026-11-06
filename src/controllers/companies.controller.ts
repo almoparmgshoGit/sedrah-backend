@@ -5,6 +5,7 @@ import { AuthRequest } from '../middlewares/security.middleware';
 import { notifyCompanyTeam, resolveCompanyAccess } from '../utils/companyAccess';
 import { logAudit } from '../utils/auditLogger';
 import { enrichPackage, PACKAGE_EXTRA_COLUMNS } from '../utils/packageInfo';
+import { companyReadySql } from '../utils/companyReadiness';
 import { formatCompanyId, formatPackageId, formatUserId, parseIdOrToken, generateRandomToken, generate16CharId } from '../utils/formatId';
 
 const findCompanyQuery = async (rawId: any) => {
@@ -81,7 +82,8 @@ export const getCompanies = async (req: Request, res: Response): Promise<void> =
       ) pe_stats ON c.id = pe_stats.company_id
     `;
 
-    let conditions: string[] = [];
+    // Only companies with a complete profile and a published package are listed
+    let conditions: string[] = [companyReadySql('c')];
     let params: any[] = [];
     let paramIndex = 1;
 
@@ -289,7 +291,7 @@ export const getCompanyPackages = async (req: Request, res: Response): Promise<v
       SELECT p.*, (SELECT COUNT(*) FROM bookings b WHERE b.package_id = p.id) as bookings_count, ${PACKAGE_EXTRA_COLUMNS}
       FROM packages p
       JOIN companies c ON p.company_id = c.id
-      WHERE p.company_id = $1 AND (p.status = 'active' OR p.status IS NULL)
+      WHERE p.company_id = $1 AND (p.status = 'active' OR p.status IS NULL) AND ${companyReadySql('c')}
       ORDER BY p.created_at ASC
     `, [companyId]);
 

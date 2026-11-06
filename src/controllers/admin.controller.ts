@@ -9,6 +9,7 @@ import { replaceEmailPlaceholders } from '../utils/mailer';
 import { createAndSendNotification } from '../utils/notificationHelper';
 import { markAppointmentAttended } from '../utils/appointmentLifecycle';
 import { notifyCompanyTeam, recalcCompanyRating } from '../utils/companyAccess';
+import { companyReadySql } from '../utils/companyReadiness';
 
 const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
 // Both bypass every module permission, so only a super admin can grant or touch them
@@ -897,7 +898,8 @@ export const getBookingStagesByAdmin = async (req: AuthRequest, res: Response): 
 
 export const getAllCompanies = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const result = await pool.query('SELECT * FROM companies ORDER BY created_at DESC');
+    // is_ready: whether customers can see the company (complete profile and a published package)
+    const result = await pool.query(`SELECT c.*, ${companyReadySql('c')} AS is_ready FROM companies c ORDER BY c.created_at DESC`);
     res.json({ success: true, data: result.rows });
   } catch (error: any) {
     console.error('Error fetching companies:', error);

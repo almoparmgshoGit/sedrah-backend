@@ -6,6 +6,7 @@ import { generate16CharId } from '../utils/formatId';
 import { createAndSendNotification } from '../utils/notificationHelper';
 import { logAudit } from '../utils/auditLogger';
 import { normalizeUploadUrl, resolveUserUpload } from '../utils/uploadAccess';
+import { getCompanyReadiness } from '../utils/companyReadiness';
 import { updateBookingStatusByAdmin } from './admin.controller';
 import {
   CompanyAccess,
@@ -241,6 +242,8 @@ export const getCompanyDashboard = async (req: CompanyRequest, res: Response): P
         unread_notifications: unread.rows[0].total,
         receipts_in_review: receipts.rows,
         today_appointments: today.rows,
+        // What the company still has to complete before customers can see it
+        readiness: await getCompanyReadiness(companyId),
       },
     });
   } catch (error) {

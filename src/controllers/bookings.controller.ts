@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { pool } from '../config/db';
 import { parseIdOrToken, generate16CharId } from '../utils/formatId';
 import { suggestAppointmentForBooking } from '../utils/appointmentEngine';
+import { companyReadySql } from '../utils/companyReadiness';
 import { createAndSendNotification } from '../utils/notificationHelper';
 import { resolveUserUpload } from '../utils/uploadAccess';
 import { submitReceiptForReview } from './receipts.controller';
@@ -77,7 +78,8 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
     const pkgRes = await pool.query(
       `SELECT p.company_id, p.price, p.room_prices, p.max_adults, p.max_children, p.seats_total,
          (SELECT COALESCE(SUM(b.travelers_count), 0) FROM bookings b WHERE b.package_id = p.id AND b.status <> 'cancelled')::int AS seats_booked
-       FROM packages p WHERE p.id = $1 AND (p.status = 'active' OR p.status IS NULL)`,
+       FROM packages p JOIN companies c ON p.company_id = c.id
+       WHERE p.id = $1 AND (p.status = 'active' OR p.status IS NULL) AND ${companyReadySql('c')}`,
       [resolvedPackageId]
     );
     if (pkgRes.rows.length === 0) {

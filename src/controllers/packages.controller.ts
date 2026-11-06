@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { pool } from '../config/db';
 import { formatPackageId, formatCompanyId, parseIdOrToken } from '../utils/formatId';
 import { enrichPackage, PACKAGE_EXTRA_COLUMNS } from '../utils/packageInfo';
+import { companyReadySql } from '../utils/companyReadiness';
 import { notifyCompanyTeam } from '../utils/companyAccess';
 
 const STATUS_LABELS: Record<string, string> = { active: 'منشورة', paused: 'موقوفة', hidden: 'مخفية' };
@@ -15,7 +16,7 @@ export const getPackages = async (req: Request, res: Response): Promise<void> =>
       FROM packages p
       JOIN companies c ON p.company_id = c.id
       JOIN cities ci ON p.city_id = ci.id
-      WHERE (p.status = 'active' OR p.status IS NULL)
+      WHERE (p.status = 'active' OR p.status IS NULL) AND ${companyReadySql('c')}
     `;
     const params: any[] = [];
     let paramIndex = 1;

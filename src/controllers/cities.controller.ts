@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { pool } from '../config/db';
+import { companyReadySql } from '../utils/companyReadiness';
 import { generate16CharId, generateRandomToken } from '../utils/formatId';
 import { createAndSendNotification } from '../utils/notificationHelper';
 
@@ -17,16 +18,16 @@ export const getCities = async (req: Request, res: Response): Promise<void> => {
         COALESCE(pkg.total_packages, 0)::INTEGER AS total_packages
       FROM cities c
       LEFT JOIN (
-        SELECT city_id, COUNT(*)::INTEGER AS total_companies
-        FROM companies
-        WHERE city_id IS NOT NULL
-        GROUP BY city_id
+        SELECT c.city_id, COUNT(*)::INTEGER AS total_companies
+        FROM companies c
+        WHERE c.city_id IS NOT NULL AND ${companyReadySql('c')}
+        GROUP BY c.city_id
       ) comp ON c.id = comp.city_id
       LEFT JOIN (
-        SELECT city_id, COUNT(*)::INTEGER AS total_packages
-        FROM packages
-        WHERE city_id IS NOT NULL
-        GROUP BY city_id
+        SELECT p.city_id, COUNT(*)::INTEGER AS total_packages
+        FROM packages p JOIN companies c ON p.company_id = c.id
+        WHERE p.city_id IS NOT NULL AND (p.status = 'active' OR p.status IS NULL) AND ${companyReadySql('c')}
+        GROUP BY p.city_id
       ) pkg ON c.id = pkg.city_id
       ORDER BY c.created_at ASC
     `);

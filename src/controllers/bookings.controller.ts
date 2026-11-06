@@ -6,34 +6,10 @@ import { suggestAppointmentForBooking } from '../utils/appointmentEngine';
 import { createAndSendNotification } from '../utils/notificationHelper';
 import { resolveUserUpload } from '../utils/uploadAccess';
 import { submitReceiptForReview } from './receipts.controller';
+import { BookingPriceError, calculateBookingTotal } from '../utils/packageInfo';
+import { readTravelers, saveTravelers, TravelerError, travelersBodySchema, travelersComplete } from '../utils/bookingTravelers';
 import { notifyCompanyTeam } from '../utils/companyAccess';
 
-// Mirrors the room pricing shown in the app, so the charged total never comes from the client
-const calculateBookingTotal = (pkg: any, roomType: string, adults: number, children: number): number => {
-  let prices: any = null;
-  try {
-    prices = typeof pkg.room_prices === 'string' ? JSON.parse(pkg.room_prices) : pkg.room_prices;
-  } catch {}
-
-  const multipliers: Record<string, number> = { quad: 1.0, triple: 1.15, double: 1.3, single: 1.6 };
-  const room = multipliers[roomType] ? roomType : 'quad';
-  const basePrice = pkg.price ? parseFloat(pkg.price) : 5000;
-  const entry = prices && typeof prices === 'object' ? prices[room] : null;
-
-  let adult = 0;
-  let child = 0;
-  if (entry && typeof entry === 'object') {
-    adult = parseFloat(entry.adult || entry.price || 0);
-    child = parseFloat(entry.child || 0);
-  } else if (entry) {
-    adult = parseFloat(String(entry));
-    child = parseFloat(prices[`${room}_child`] || 0);
-  }
-  if (adult <= 0) adult = Math.round(basePrice * multipliers[room]);
-  if (child <= 0) child = Math.round(adult * 0.5);
-
-  return adults * adult + children * child;
-};
 
 const ROOM_TYPES = ['quad', 'triple', 'double', 'single'];
 const MAX_TRAVELERS = 50;
@@ -100,7 +76,9 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
 
     // Only packages the customer can see in the app can be booked
     const pkgRes = await pool.query(
-      `SELECT company_id, price, room_prices, max_adults, max_children FROM packages WHERE id = $1 AND (status = 'active' OR status IS NULL)`,
+      `SELECT p.company_id, p.price, p.room_prices, p.max_adults, p.max_children, p.seats_total,
+         (SELECT COALESCE(SUM(b.travelers_count), 0) FROM bookings b WHERE b.package_id = p.id AND b.status <> 'cancelled')::int AS seats_booked
+       FROM packages p WHERE p.id = $1 AND (p.status = 'active' OR p.status IS NULL)`,
       [resolvedPackageId]
     );
     if (pkgRes.rows.length === 0) {
@@ -124,7 +102,30 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
-    const totalPrice = calculateBookingTotal(pkgRes.rows[0], roomType, adultsTotal, childrenTotal);
+    // Seats are shared by every booking that is not cancelled
+    const seatsTotal = Number(pkgRes.rows[0].seats_total) > 0 ? Number(pkgRes.rows[0].seats_total) : null;
+    if (seatsTotal !== null) {
+      const seatsLeft = seatsTotal - Number(pkgRes.rows[0].seats_booked || 0);
+      if (seatsLeft <= 0) {
+        res.status(409).json({ error: 'اكتمل عدد المقاعد في هذه الباقة' });
+        return;
+      }
+      if (travelersCount > seatsLeft) {
+        res.status(409).json({ error: `المتبقي في هذه الباقة ${seatsLeft} مقعد فقط` });
+        return;
+      }
+    }
+
+    let totalPrice: number;
+    try {
+      totalPrice = calculateBookingTotal(pkgRes.rows[0], roomType, adultsTotal, childrenTotal);
+    } catch (priceError) {
+      if (priceError instanceof BookingPriceError) {
+        res.status(400).json({ error: priceError.message });
+        return;
+      }
+      throw priceError;
+    }
 
     // Suggest appointment for booking
     let suggestedAppt = await suggestAppointmentForBooking(companyId);
@@ -571,5 +572,78 @@ export const getBookingStages = async (req: Request, res: Response): Promise<voi
   } catch (error: any) {
     console.error('Error fetching booking stages:', error);
     res.status(500).json({ error: 'حدث خطأ أثناء جلب مراحل الرحلة' });
+  }
+};
+
+// ───── Travelers ─────
+
+const findCustomerBooking = async (req: Request) => {
+  const userId = (req as any).user?.id || (req as any).user?.userId;
+  const result = await pool.query(
+    `SELECT b.*, p.company_id FROM bookings b JOIN packages p ON b.package_id = p.id
+     WHERE (b.id::text = $1 OR b.booking_reference = $1) AND b.user_id = $2`,
+    [String(req.params.id), String(userId)]
+  );
+  return { userId: String(userId), booking: result.rows[0] || null };
+};
+
+export const getBookingTravelers = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { booking } = await findCustomerBooking(req);
+    if (!booking) {
+      res.status(404).json({ error: 'الحجز غير موجود' });
+      return;
+    }
+    const travelers = await readTravelers(booking.id);
+    res.json({
+      success: true,
+      data: {
+        travelers,
+        adults_count: Number(booking.travelers_count || 0) - Number(booking.children_count || 0),
+        children_count: Number(booking.children_count || 0),
+        complete: travelersComplete(booking, travelers),
+        editable: !['cancelled', 'completed'].includes(booking.status),
+      },
+    });
+  } catch (error) {
+    console.error('Get travelers error:', error);
+    res.status(500).json({ error: 'تعذر جلب بيانات المسافرين' });
+  }
+};
+
+export const updateBookingTravelers = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { userId, booking } = await findCustomerBooking(req);
+    if (!booking) {
+      res.status(404).json({ error: 'الحجز غير موجود' });
+      return;
+    }
+    if (['cancelled', 'completed'].includes(booking.status)) {
+      res.status(409).json({ error: 'لا يمكن تعديل المسافرين في حجز ملغي أو مكتمل' });
+      return;
+    }
+    const parsed = travelersBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.errors[0]?.message || 'بيانات المسافرين غير صالحة' });
+      return;
+    }
+    const travelers = await saveTravelers(req, booking, parsed.data.travelers, { userId, type: 'customer' });
+    await notifyCompanyTeam(booking.company_id, 'orders.view', {
+      title: 'بيانات المسافرين',
+      subtitle: `حدّث العميل بيانات المسافرين للحجز #${booking.booking_reference} (${travelers.length} مسافر).`,
+      category: 'booking',
+      icon: 'people-outline',
+      iconBg: '#EFF6FF',
+      iconColor: '#2563EB',
+      data: { type: 'travelers_updated', bookingId: booking.id, bookingRef: booking.booking_reference },
+    }).catch(() => {});
+    res.json({ success: true, message: 'تم حفظ بيانات المسافرين', data: { travelers, complete: travelersComplete(booking, travelers) } });
+  } catch (error) {
+    if (error instanceof TravelerError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    console.error('Update travelers error:', error);
+    res.status(500).json({ error: 'تعذر حفظ بيانات المسافرين' });
   }
 };

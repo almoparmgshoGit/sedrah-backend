@@ -4,6 +4,8 @@ import { authLimiter } from '../middlewares/security.middleware';
 import * as company from '../controllers/company.controller';
 import * as schemas from '../validators/company.validator';
 import * as team from '../controllers/companyTeam.controller';
+import * as support from '../controllers/companySupport.controller';
+import { travelersBodySchema } from '../utils/bookingTravelers';
 
 const router = Router();
 
@@ -45,7 +47,11 @@ router.post('/orders/:id/accept', can('orders.manage'), booking, company.acceptC
 router.post('/orders/:id/reject', can('orders.manage'), body(schemas.rejectOrderSchema), booking, company.rejectCompanyOrder as any);
 router.post('/orders/:id/cancel', can('orders.manage'), body(schemas.cancelOrderSchema), booking, company.cancelCompanyOrder as any);
 router.post('/orders/:id/remind-payment', authLimiter, can('orders.manage'), booking, company.remindCompanyOrderPayment as any);
-router.post('/orders/:id/stages/:stageId/complete', can('trips.stages'), body(schemas.updateStageSchema), booking, company.completeCompanyStage as any);
+router.post('/orders/:id/stages/:stageId/complete', can('trips.stages'), body(schemas.updateStageSchema), booking, company.saveCompanyStage as any);
+router.put('/orders/:id/stages/:stageId', can('trips.stages'), body(schemas.updateStageSchema), booking, company.saveCompanyStage as any);
+
+router.put('/orders/:id/travelers', can('orders.manage'), body(travelersBodySchema), booking, company.updateCompanyOrderTravelers as any);
+router.post('/orders/:id/request-travelers', authLimiter, can('orders.manage'), booking, company.requestOrderTravelers as any);
 
 router.get('/finance', can('finance.view'), company.getCompanyFinance as any);
 router.get('/reviews', can('reviews.view', 'reviews.reply'), company.getCompanyReviews as any);
@@ -66,6 +72,13 @@ router.post('/appointments', can('appointments.manage'), body(schemas.appointmen
 router.put('/appointments/:id', can('appointments.manage'), body(schemas.rescheduleAppointmentSchema), company.rescheduleCompanyAppointment as any);
 router.post('/appointments/:id/cancel', can('appointments.manage'), body(schemas.cancelAppointmentSchema), company.cancelCompanyAppointment as any);
 router.post('/appointments/:id/attended', can('appointments.manage'), company.markCompanyAppointmentAttended as any);
+
+// ───── Support tickets with the platform ─────
+router.get('/support/tickets', can('support.tickets'), support.listCompanyTickets as any);
+router.post('/support/tickets', authLimiter, can('support.tickets'), body(schemas.companyTicketSchema), support.createCompanyTicket as any);
+router.get('/support/tickets/:id/messages', can('support.tickets'), support.getCompanyTicketMessages as any);
+router.post('/support/tickets/:id/messages', can('support.tickets'), body(schemas.ticketMessageSchema), support.sendCompanyTicketMessage as any);
+router.patch('/support/tickets/:id/close', can('support.tickets'), support.closeCompanyTicket as any);
 
 // ───── Team ─────
 router.get('/team/permissions', can('team.view', 'team.manage', 'team.roles'), team.getPermissionCatalogue as any);

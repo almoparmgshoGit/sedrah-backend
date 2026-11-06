@@ -49,6 +49,8 @@ export const companyProfileSchema = z
       })
       .strict(),
     holidays_notes: shortText(1000),
+    max_daily_capacity: z.number().int().min(1, 'عدد الزيارات اليومية 1 على الأقل').max(200, 'عدد الزيارات اليومية كبير جداً'),
+    slot_duration_minutes: z.number().int().min(10, 'مدة الزيارة 10 دقائق على الأقل').max(240, 'مدة الزيارة 4 ساعات على الأكثر'),
     commercial_register_url: fileLink,
     tax_id_url: fileLink,
     manager_id_url: fileLink,
@@ -63,14 +65,16 @@ const money = z.union([
   z.string().regex(/^\d{1,9}(\.\d{1,2})?$/, 'السعر غير صحيح'),
 ]);
 const guestLimit = z.string().regex(/^(unlimited|\d{1,4})$/, 'الحد الأقصى غير صحيح');
+const noChildren = z.enum(['1', '']);
 
 export const companyPackageSchema = z
   .object({
     title: shortText(255).min(2, 'أدخل عنوان الباقة'),
     duration: shortText(100).min(1, 'أدخل مدة الباقة'),
     description: shortText(5000).default(''),
-    nights_count: z.union([z.literal(''), z.string().regex(/^\d{1,3}$/, 'عدد الليالي غير صحيح')]).default(''),
-    departure_date: optionalDate.default(''),
+    // Required because the customer app filters packages by nights and travel month
+    nights_count: z.string({ required_error: 'أدخل عدد الليالي' }).regex(/^\d{1,3}$/, 'أدخل عدد الليالي'),
+    departure_date: isoDate,
     return_date: optionalDate.default(''),
     departure_airport: shortText(100).default(''),
     hotel_makkah: shortText(255).min(1, 'أدخل فندق مكة'),
@@ -85,6 +89,11 @@ export const companyPackageSchema = z
         double_child: money,
         single: money,
         single_child: money,
+        // '1' marks a room that does not take children
+        quad_no_children: noChildren,
+        triple_no_children: noChildren,
+        double_no_children: noChildren,
+        single_no_children: noChildren,
       })
       .partial()
       .strict(),
@@ -97,6 +106,14 @@ export const companyPackageSchema = z
       .array(z.object({ title: shortText(200), desc: shortText(2000).default('') }).strict())
       .max(60)
       .default([]),
+    gallery: z.array(fileLink).max(10, 'الألبوم 10 صور على الأكثر').default([]),
+    exclusions: z.array(shortText(200)).max(50).default([]),
+    seats_total: z.union([z.literal(''), z.string().regex(/^\d{1,4}$/, 'عدد المقاعد غير صحيح')]).default(''),
+    visa_info: shortText(2000).default(''),
+    transport_info: shortText(2000).default(''),
+    original_price: money.default(''),
+    includes_flight: z.boolean().default(false),
+    season: z.enum(['regular', 'ramadan', 'shaban', 'rajab', 'mid_year', 'summer', 'winter'], { errorMap: () => ({ message: 'اختر موسم الرحلة' }) }),
   })
   .strict()
   .refine(
@@ -125,7 +142,22 @@ export const updateStageSchema = z
     document_url: fileLink.optional(),
     document_number: shortText(100).optional(),
     traveler_name: shortText(255).optional(),
-    details: shortText(2000).optional(),
+    instructions: shortText(3000).optional(),
+    complete: z.boolean().optional(),
+    // One document per traveler; docType tells the customer app where to list it
+    travelers: z
+      .array(
+        z
+          .object({
+            name: shortText(255).min(1, 'اكتب اسم المسافر'),
+            docNumber: shortText(100).optional(),
+            docUrl: fileLink.optional(),
+            docType: z.enum(['visa', 'ticket', 'hotel', 'other']).optional(),
+          })
+          .strict()
+      )
+      .max(60)
+      .optional(),
   })
   .strict();
 
@@ -201,5 +233,20 @@ export const updateRoleSchema = z
     permissions: permissionList.optional(),
   })
   .strict();
+
+export const companyTicketSchema = z
+  .object({
+    title: shortText(200).min(3, 'اكتب عنوان التذكرة'),
+    message: shortText(3000).min(3, 'اكتب تفاصيل طلبك'),
+    category: z.enum(['general', 'payments', 'packages', 'bookings', 'account', 'technical']).default('general'),
+    bookingReference: shortText(50).optional(),
+    attachmentUrl: fileLink.optional(),
+  })
+  .strict();
+
+export const ticketMessageSchema = z
+  .object({ message: shortText(3000).optional(), imageUri: fileLink.optional() })
+  .strict()
+  .refine((body) => Boolean(body.message || body.imageUri), 'اكتب رسالة أو أرفق صورة');
 
 export const reviewReplySchema = z.object({ reply: shortText(1000) }).strict();

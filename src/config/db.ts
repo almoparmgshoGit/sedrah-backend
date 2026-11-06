@@ -1067,6 +1067,64 @@ export const initDB = async () => {
     `);
     await pool.query('CREATE INDEX IF NOT EXISTS idx_company_activity_company ON company_activity(company_id, created_at DESC);');
 
+    // Package details the company fills and the customer sees; search filters rely on the structured ones
+    await pool.query(`
+      ALTER TABLE packages ADD COLUMN IF NOT EXISTS gallery TEXT;
+      ALTER TABLE packages ADD COLUMN IF NOT EXISTS exclusions TEXT;
+      ALTER TABLE packages ADD COLUMN IF NOT EXISTS seats_total INT;
+      ALTER TABLE packages ADD COLUMN IF NOT EXISTS visa_info TEXT;
+      ALTER TABLE packages ADD COLUMN IF NOT EXISTS transport_info TEXT;
+      ALTER TABLE packages ADD COLUMN IF NOT EXISTS original_price NUMERIC(10, 2);
+      ALTER TABLE packages ADD COLUMN IF NOT EXISTS includes_flight BOOLEAN DEFAULT FALSE;
+      ALTER TABLE packages ADD COLUMN IF NOT EXISTS season VARCHAR(30);
+      ALTER TABLE packages ADD COLUMN IF NOT EXISTS admin_status_reason TEXT;
+    `);
+    // Packages had no reviews of their own; they show their company's rating
+    await pool.query(`UPDATE packages p SET rating = COALESCE(c.rating, 0) FROM companies c WHERE p.company_id = c.id AND p.rating IS DISTINCT FROM COALESCE(c.rating, 0);`);
+
+    // Travel instructions for a stage (meeting point and time before the airport, for example)
+    await pool.query('ALTER TABLE trip_stages ADD COLUMN IF NOT EXISTS instructions TEXT;');
+
+    // The people travelling on a booking, entered by the customer or by the company at the office visit
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS booking_travelers (
+        id VARCHAR(16) PRIMARY KEY,
+        booking_id VARCHAR(16) REFERENCES bookings(id) ON DELETE CASCADE,
+        full_name VARCHAR(255) NOT NULL,
+        traveler_type VARCHAR(10) NOT NULL DEFAULT 'adult',
+        gender VARCHAR(10),
+        birth_date VARCHAR(10),
+        nationality VARCHAR(100),
+        passport_number VARCHAR(50),
+        passport_expiry VARCHAR(10),
+        passport_image_url TEXT,
+        added_by VARCHAR(20) NOT NULL DEFAULT 'customer',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_booking_travelers_booking ON booking_travelers(booking_id);');
+
+    // Each official company document has its own review status and rejection reason
+    await pool.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS documents_review TEXT;');
+
+    // Settling the commission a company owes the platform
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS company_settlements (
+        id VARCHAR(16) PRIMARY KEY,
+        company_id VARCHAR(16) REFERENCES companies(id) ON DELETE CASCADE,
+        amount NUMERIC(12, 2) NOT NULL,
+        earnings_count INT NOT NULL DEFAULT 0,
+        method VARCHAR(50),
+        reference VARCHAR(255),
+        note TEXT,
+        created_by VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`ALTER TABLE platform_earnings ADD COLUMN IF NOT EXISTS settlement_id VARCHAR(16);`);
+    await pool.query(`ALTER TABLE platform_earnings ADD COLUMN IF NOT EXISTS settled_at TIMESTAMP;`);
+
     // Which team member sent a company reply; shown to the team only, customers see the company name
     await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS sent_by_name VARCHAR(255);');
 

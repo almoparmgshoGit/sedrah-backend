@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { getCompanyStatement, settleCompanyCommission } from '../controllers/settlements.controller';
 import { listReceipts, getReceipt, reviewReceipt } from '../controllers/receipts.controller';
 import {
   getAllUsers,
@@ -48,7 +49,7 @@ import {
   getCityCompanies,
   linkCompanyToCity
 } from '../controllers/cities.controller';
-import { createCompanyFull, getCompanyAdminDetails, createCompanyPackage, updateCompany } from '../controllers/companies.controller';
+import { createCompanyFull, getCompanyAdminDetails, createCompanyPackage, updateCompany, reviewCompanyDocument } from '../controllers/companies.controller';
 import { getCompanyRequests, updateCompanyRequestStatus } from '../controllers/companyRequests.controller';
 import { updatePackageByAdmin, deletePackageByAdmin, updatePackageStatusByAdmin } from '../controllers/packages.controller';
 import { sendNotificationByAdmin, getAllAdminNotifications, getPushTokenStats, deleteNotification } from '../controllers/notifications.controller';
@@ -86,6 +87,7 @@ router.post('/companies', idempotencyMiddleware, requireModulePermission('compan
 router.put('/companies/:id', idempotencyMiddleware, requireModulePermission('companies'), updateCompany);
 router.patch('/companies/:id/owner', idempotencyMiddleware, requireModulePermission('companies'), setCompanyOwner);
 router.get('/companies/:id/details', requireModulePermission('companies'), getCompanyAdminDetails);
+router.patch('/companies/:id/documents/:field', idempotencyMiddleware, requireModulePermission('companies'), reviewCompanyDocument);
 router.post('/companies/:id/packages', idempotencyMiddleware, requireModulePermission('packages'), createCompanyPackage);
 router.put('/packages/:id', idempotencyMiddleware, requireModulePermission('packages'), updatePackageByAdmin);
 router.delete('/packages/:id', idempotencyMiddleware, requireModulePermission('packages'), deletePackageByAdmin);
@@ -114,6 +116,8 @@ router.post('/notification-templates/reset', idempotencyMiddleware, requireModul
 
 router.get('/audit-logs', requireModulePermission('audit_logs'), getAuditLogs);
 router.get('/earnings', requireModulePermission('settings'), getPlatformEarnings);
+router.get('/earnings/companies/:id', requireModulePermission('settings'), getCompanyStatement);
+router.post('/earnings/companies/:id/settle', idempotencyMiddleware, requireModulePermission('settings'), settleCompanyCommission);
 
 router.get('/settings', requireModulePermission('settings'), getSettings);
 router.put('/settings', idempotencyMiddleware, requireModulePermission('settings'), updateSettings);

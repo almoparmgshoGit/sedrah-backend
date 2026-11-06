@@ -8,6 +8,7 @@ import nodemailer from 'nodemailer';
 import { replaceEmailPlaceholders } from '../utils/mailer';
 import { createAndSendNotification } from '../utils/notificationHelper';
 import { markAppointmentAttended } from '../utils/appointmentLifecycle';
+import { notifyCompanyTeam, recalcCompanyRating } from '../utils/companyAccess';
 
 const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
 // Both bypass every module permission, so only a super admin can grant or touch them
@@ -465,12 +466,51 @@ export const setCompanyOwner = async (req: AuthRequest, res: Response): Promise<
         res.status(409).json({ error: `هذا المستخدم مرتبط بالفعل بشركة: ${ownedRes.rows[0].name}` });
         return;
       }
+      // A person belongs to one company: an employee elsewhere cannot become an owner here
+      const memberRes = await pool.query(
+        'SELECT c.name, m.company_id FROM company_members m JOIN companies c ON m.company_id = c.id WHERE m.user_id = $1',
+        [ownerId]
+      );
+      if (memberRes.rows.length > 0) {
+        if (memberRes.rows[0].company_id !== company.id) {
+          res.status(409).json({ error: `هذا المستخدم موظف في فريق شركة: ${memberRes.rows[0].name}` });
+          return;
+        }
+        // Promoted from employee to owner of the same company
+        await pool.query('DELETE FROM company_members WHERE user_id = $1', [ownerId]);
+      }
     }
 
     const updated = await pool.query(
       'UPDATE companies SET user_id = $1, pending_owner_email = NULL WHERE id = $2 RETURNING *',
       [ownerId, company.id]
     );
+
+    const previousOwner = company.user_id ? String(company.user_id) : null;
+    if (previousOwner && previousOwner !== String(ownerId || '')) {
+      await createAndSendNotification({
+        userId: previousOwner,
+        title: 'لم تعد مالكاً للشركة',
+        subtitle: `فكّت إدارة سدرة ربط حسابك بشركة ${company.name}. تواصل مع الدعم إذا كان ذلك غير متوقع.`,
+        category: 'company',
+        icon: 'business-outline',
+        iconBg: '#FEF2F2',
+        iconColor: '#DC2626',
+        data: { type: 'company_owner_removed', companyId: company.id },
+      });
+    }
+    if (ownerId && String(ownerId) !== previousOwner) {
+      await createAndSendNotification({
+        userId: ownerId,
+        title: 'تم ربط حسابك بشركة',
+        subtitle: `ربطت إدارة سدرة حسابك بشركة ${company.name} كمالك لها. افتح تطبيق سدرة للشركات لإدارتها.`,
+        category: 'company',
+        icon: 'business-outline',
+        iconBg: '#ECFDF5',
+        iconColor: '#059669',
+        data: { type: 'company_owner_added', companyId: company.id },
+      });
+    }
 
     await logAudit(
       req.user?.email || 'admin',
@@ -557,6 +597,11 @@ export const getAllBookings = async (req: AuthRequest, res: Response): Promise<v
     console.error('Error fetching bookings:', error);
     res.status(500).json({ error: 'فشل جلب الحجوزات' });
   }
+};
+
+const companyIdOfBooking = async (bookingId: string): Promise<string | null> => {
+  const result = await pool.query('SELECT p.company_id FROM bookings b JOIN packages p ON b.package_id = p.id WHERE b.id = $1', [bookingId]);
+  return result.rows[0]?.company_id || null;
 };
 
 export const updateBookingStatusByAdmin = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -647,6 +692,36 @@ export const updateBookingStatusByAdmin = async (req: AuthRequest, res: Response
       iconColor: '#2563EB',
       data: { type: 'booking_status', status, bookingRef: booking.booking_reference },
     });
+
+    // The company hears about changes the platform makes; its own cancellations come through here too and are skipped
+    if (cancelled_by !== 'company') {
+      const companyId = await companyIdOfBooking(String(booking.id));
+      if (status) {
+        const labels: Record<string, string> = { new: 'طلب جديد', confirmed: 'مؤكد', completed: 'مكتمل', cancelled: 'ملغي' };
+        await notifyCompanyTeam(companyId, 'orders.view', {
+          title: status === 'cancelled' ? 'ألغت الإدارة حجزاً' : 'عدّلت الإدارة حالة حجز',
+          subtitle: status === 'cancelled'
+            ? `ألغت إدارة سدرة الحجز #${booking.booking_reference}${cancellation_reason ? `. السبب: ${cancellation_reason}` : ''}`
+            : `غيّرت إدارة سدرة حالة الحجز #${booking.booking_reference} إلى: ${labels[status] || status}`,
+          category: 'booking',
+          icon: status === 'cancelled' ? 'close-circle-outline' : 'swap-horizontal-outline',
+          iconBg: status === 'cancelled' ? '#FEF2F2' : '#EFF6FF',
+          iconColor: status === 'cancelled' ? '#DC2626' : '#2563EB',
+          data: { type: 'admin_booking_update', bookingId: booking.id, bookingRef: booking.booking_reference, status },
+        });
+      }
+      if (appointment_date || appointment_time) {
+        await notifyCompanyTeam(companyId, 'appointments.view', {
+          title: 'حددت الإدارة موعد زيارة',
+          subtitle: `حددت إدارة سدرة موعد زيارة العميل للحجز #${booking.booking_reference}: ${String(booking.appointment_date || appointment_date).split('T')[0]} ${booking.appointment_time || appointment_time || ''}`,
+          category: 'booking',
+          icon: 'calendar-outline',
+          iconBg: '#EFF6FF',
+          iconColor: '#2563EB',
+          data: { type: 'admin_booking_update', bookingId: booking.id, bookingRef: booking.booking_reference },
+        });
+      }
+    }
 
     await logAudit(
       req.user?.email || 'admin@sdra.com',
@@ -786,6 +861,17 @@ export const updateTripStageByAdmin = async (req: AuthRequest, res: Response): P
         iconColor: '#16A34A',
         data: { type: 'stage_update', stageTitle: targetStage.title, bookingRef: booking.booking_reference },
       });
+      await notifyCompanyTeam(await companyIdOfBooking(String(id)), 'trips.view', {
+        title: status === 'cancelled' ? 'ألغت الإدارة حجزاً' : 'حدّثت الإدارة مرحلة رحلة',
+        subtitle: status === 'cancelled'
+          ? `ألغت إدارة سدرة الحجز #${booking.booking_reference} من مرحلة "${targetStage.title}"`
+          : `حدّثت إدارة سدرة مرحلة "${targetStage.title}" في الحجز #${booking.booking_reference} إلى (${stageStatusLabels[status] || status})`,
+        category: 'booking',
+        icon: 'flag-outline',
+        iconBg: '#F0FDF4',
+        iconColor: '#16A34A',
+        data: { type: 'admin_stage_update', bookingId: booking.id, bookingRef: booking.booking_reference },
+      });
     }
 
     res.json({ success: true, message: 'تم تحديث مرحلة الرحلة بنجاح', data: result.rows[0] });
@@ -880,13 +966,17 @@ export const deleteReviewByAdmin = async (req: AuthRequest, res: Response): Prom
     const rev = revCheck.rows[0];
 
     await pool.query('DELETE FROM reviews WHERE id = $1', [id]);
-
-    await pool.query(`
-      UPDATE companies
-      SET reviews_count = (SELECT COUNT(*) FROM reviews WHERE company_id = $1),
-          rating = COALESCE((SELECT ROUND(AVG(rating)::numeric, 1) FROM reviews WHERE company_id = $1), 0.0)
-      WHERE id = $1
-    `, [rev.company_id]);
+    await recalcCompanyRating(rev.company_id);
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 300) : '';
+    await notifyCompanyTeam(rev.company_id, 'reviews.view', {
+      title: 'حذفت الإدارة تقييماً',
+      subtitle: `حذفت إدارة سدرة تقييماً (${Number(rev.rating)} نجوم) لمخالفته سياسة المنصة${reason ? `: ${reason}` : ''}. تم تحديث تقييم شركتكم.`,
+      category: 'review',
+      icon: 'trash-outline',
+      iconBg: '#FEF2F2',
+      iconColor: '#DC2626',
+      data: { type: 'review_removed', reviewId: id },
+    });
 
     await logAudit(req.user?.email || 'admin', 'حذف تقييم', `تم حذف تقييم العميل برقم ${id} نهائياً`, req.ip, req.user?.email || 'المسؤول');
     res.json({ success: true, message: 'تم حذف التقييم بنجاح' });
@@ -909,6 +999,18 @@ export const toggleHideReviewByAdmin = async (req: AuthRequest, res: Response): 
 
     const result = await pool.query('UPDATE reviews SET hidden = $1 WHERE id = $2 RETURNING *', [newHidden, id]);
     const rev = result.rows[0];
+    await recalcCompanyRating(rev.company_id);
+    await notifyCompanyTeam(rev.company_id, 'reviews.view', {
+      title: newHidden ? 'أخفت الإدارة تقييماً' : 'أعادت الإدارة إظهار تقييم',
+      subtitle: newHidden
+        ? `أخفت إدارة سدرة تقييماً (${Number(rev.rating)} نجوم) لمراجعته، ولا يُحتسب في تقييم شركتكم حالياً.`
+        : `أعادت إدارة سدرة إظهار تقييم (${Number(rev.rating)} نجوم) وأصبح يُحتسب في تقييم شركتكم.`,
+      category: 'review',
+      icon: newHidden ? 'eye-off-outline' : 'eye-outline',
+      iconBg: '#F8F5EE',
+      iconColor: '#C8A96A',
+      data: { type: newHidden ? 'review_hidden' : 'review_shown', reviewId: id },
+    });
 
     await logAudit(req.user?.email || 'admin', newHidden ? 'إخفاء تقييم' : 'إظهار تقييم', `تم ${newHidden ? 'إخفاء' : 'إظهار'} التقييم برقم ${id} مؤقتاً`, req.ip, req.user?.email || 'المسؤول');
     res.json({ success: true, message: newHidden ? 'تم إخفاء التقييم مؤقتاً' : 'تم إظهار التقييم بنجاح', data: rev });

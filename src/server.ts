@@ -195,7 +195,14 @@ io.on('connection', (socket) => {
              )
            )
            UNION
-           SELECT 1 FROM chats c WHERE c.id = $1 AND c.user_id = $2`,
+           SELECT 1 FROM chats c WHERE c.id = $1 AND c.user_id = $2
+           UNION
+           SELECT 1 FROM chats c JOIN companies co ON co.id = c.company_id
+           WHERE c.id = $1 AND c.ticket_number IS NOT NULL AND c.department = 'companies'
+             AND (co.user_id = $2 OR EXISTS (
+               SELECT 1 FROM company_members cm JOIN company_roles r ON cm.role_id = r.id
+               WHERE cm.company_id = co.id AND cm.user_id = $2 AND cm.status = 'active' AND r.permissions LIKE '%"support.tickets"%'
+             ))`,
           [room.slice(5), String(user.id)]
         );
         if (owned.rows.length === 0) return;

@@ -94,6 +94,11 @@ export const COMPANY_PERMISSION_GROUPS: PermissionGroup[] = [
     ],
   },
   {
+    key: 'support',
+    label: 'دعم سدرة',
+    permissions: [{ key: 'support.tickets', label: 'فتح تذاكر الدعم مع إدارة سدرة والرد عليها' }],
+  },
+  {
     key: 'team',
     label: 'فريق العمل',
     permissions: [
@@ -299,3 +304,14 @@ export const logCompanyActivity = async (
 // SQL fragment: is $userParam the owner or an active member of company alias `co`
 export const isCompanyTeamSql = (companyAlias: string, userParam: string) =>
   `(${companyAlias}.user_id = ${userParam} OR EXISTS (SELECT 1 FROM company_members cm WHERE cm.company_id = ${companyAlias}.id AND cm.user_id = ${userParam} AND cm.status = 'active'))`;
+
+// A company's rating counts only the reviews customers can see
+export const recalcCompanyRating = async (companyId: string): Promise<void> => {
+  await pool.query(
+    `UPDATE companies
+     SET reviews_count = (SELECT COUNT(*) FROM reviews WHERE company_id = $1 AND COALESCE(hidden, FALSE) = FALSE),
+         rating = COALESCE((SELECT ROUND(AVG(rating)::numeric, 1) FROM reviews WHERE company_id = $1 AND COALESCE(hidden, FALSE) = FALSE), 0.0)
+     WHERE id = $1`,
+    [companyId]
+  );
+};

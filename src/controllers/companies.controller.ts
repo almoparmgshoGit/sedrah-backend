@@ -2,7 +2,9 @@ import { Request, Response } from 'express';
 import { pool } from '../config/db';
 import { notifyCitySubscribers } from './cities.controller';
 import { AuthRequest } from '../middlewares/security.middleware';
-import { resolveCompanyAccess } from '../utils/companyAccess';
+import { notifyCompanyTeam, resolveCompanyAccess } from '../utils/companyAccess';
+import { logAudit } from '../utils/auditLogger';
+import { enrichPackage, PACKAGE_EXTRA_COLUMNS } from '../utils/packageInfo';
 import { formatCompanyId, formatPackageId, formatUserId, parseIdOrToken, generateRandomToken, generate16CharId } from '../utils/formatId';
 
 const findCompanyQuery = async (rawId: any) => {
@@ -284,16 +286,15 @@ export const getCompanyPackages = async (req: Request, res: Response): Promise<v
 
     const companyId = compRes.rows[0].id;
     const result = await pool.query(`
-      SELECT p.*, COUNT(b.id) as bookings_count
+      SELECT p.*, (SELECT COUNT(*) FROM bookings b WHERE b.package_id = p.id) as bookings_count, ${PACKAGE_EXTRA_COLUMNS}
       FROM packages p
-      LEFT JOIN bookings b ON p.id = b.package_id
-      WHERE p.company_id = $1
-      GROUP BY p.id
+      JOIN companies c ON p.company_id = c.id
+      WHERE p.company_id = $1 AND (p.status = 'active' OR p.status IS NULL)
       ORDER BY p.created_at ASC
     `, [companyId]);
 
     const formatted = result.rows.map(pkg => ({
-      ...pkg,
+      ...enrichPackage(pkg),
       id: formatPackageId(pkg.id, pkg.public_id),
       company_id: formatCompanyId(companyId, compRes.rows[0].public_id),
       bookings_count: parseInt(pkg.bookings_count || '0', 10),
@@ -398,8 +399,8 @@ export const addCompanyReview = async (req: AuthRequest, res: Response): Promise
 
     await pool.query(`
       UPDATE companies
-      SET reviews_count = (SELECT COUNT(*) FROM reviews WHERE company_id = $1),
-          rating = (SELECT ROUND(AVG(rating)::numeric, 1) FROM reviews WHERE company_id = $1)
+      SET reviews_count = (SELECT COUNT(*) FROM reviews WHERE company_id = $1 AND COALESCE(hidden, FALSE) = FALSE),
+          rating = COALESCE((SELECT ROUND(AVG(rating)::numeric, 1) FROM reviews WHERE company_id = $1 AND COALESCE(hidden, FALSE) = FALSE), 0.0)
       WHERE id = $1
     `, [companyId]);
 
@@ -565,6 +566,16 @@ export const createCompanyPackage = async (req: Request, res: Response): Promise
     // Update total_packages in cities
     await pool.query('UPDATE cities SET total_packages = (SELECT COUNT(*) FROM packages WHERE city_id = $1) WHERE id = $1', [targetCityId]);
 
+    await notifyCompanyTeam(result.rows[0].company_id, 'packages.view', {
+      title: 'أضافت الإدارة باقة لشركتكم',
+      subtitle: `أضافت إدارة سدرة الباقة "${result.rows[0].title}" إلى باقات شركتكم.`,
+      category: 'package',
+      icon: 'add-circle-outline',
+      iconBg: '#ECFDF5',
+      iconColor: '#059669',
+      data: { type: 'admin_package_created', packageId: result.rows[0].id },
+    });
+
     res.status(201).json({
       success: true,
       message: 'تم إضافة الباقة للشركة بنجاح',
@@ -704,6 +715,35 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
     );
 
     const updatedComp = result.rows[0];
+    const before = compRes.rows[0];
+
+    // The company team is told what the platform changed in its profile
+    const FIELD_LABELS: Record<string, string> = {
+      name: 'الاسم', short_description: 'الوصف القصير', description: 'الوصف', phone: 'الجوال', whatsapp: 'الواتساب',
+      landline_phone: 'الهاتف الأرضي', website_url: 'الموقع الإلكتروني', social_links: 'حسابات التواصل', city_id: 'المحافظة',
+      address: 'العنوان', google_maps_url: 'الخريطة', logo_url: 'الشعار', banner_url: 'الغلاف', working_hours: 'أوقات العمل',
+      holidays_notes: 'الإجازات', commercial_register_url: 'السجل التجاري', tax_id_url: 'البطاقة الضريبية',
+      manager_id_url: 'بطاقة المدير', manager_id_back_url: 'بطاقة المدير (الخلفية)',
+      max_daily_capacity: 'عدد الزيارات اليومية', slot_duration_minutes: 'مدة الزيارة',
+    };
+    const changed = Object.keys(FIELD_LABELS).filter((key) => String(before[key] ?? '') !== String(updatedComp[key] ?? ''));
+    const verificationChanged = Boolean(before.field_verified) !== Boolean(updatedComp.field_verified);
+    if (changed.length > 0 || verificationChanged) {
+      const parts = [
+        ...(verificationChanged ? [updatedComp.field_verified ? 'تم توثيق شركتكم ميدانياً' : 'أُلغي التوثيق الميداني لشركتكم'] : []),
+        ...(changed.length > 0 ? [`عُدّلت: ${changed.map((key) => FIELD_LABELS[key]).join('، ')}`] : []),
+      ];
+      await notifyCompanyTeam(updatedComp.id, 'company.profile', {
+        title: verificationChanged && updatedComp.field_verified ? 'تم توثيق شركتكم' : 'عدّلت الإدارة بيانات شركتكم',
+        subtitle: parts.join('. '),
+        category: 'company',
+        icon: verificationChanged && updatedComp.field_verified ? 'shield-checkmark-outline' : 'business-outline',
+        iconBg: '#ECFDF5',
+        iconColor: '#059669',
+        data: { type: 'admin_company_update', fields: changed },
+      });
+    }
+
     updatedComp.id = formatCompanyId(updatedComp.id, updatedComp.public_id);
 
     res.json({
@@ -764,3 +804,80 @@ export const getMyCompanyProfile = async (req: AuthRequest, res: Response): Prom
   }
 };
 
+
+const COMPANY_DOCUMENT_LABELS: Record<string, string> = {
+  commercial_register_url: 'السجل التجاري',
+  tax_id_url: 'البطاقة الضريبية',
+  manager_id_url: 'بطاقة المدير (الوجه الأمامي)',
+  manager_id_back_url: 'بطاقة المدير (الوجه الخلفي)',
+};
+
+// Reviews one official company document; a rejection tells the company what to fix and re-upload
+export const reviewCompanyDocument = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const field = String(req.params.field);
+    if (!COMPANY_DOCUMENT_LABELS[field]) {
+      res.status(400).json({ error: 'مستند غير معروف' });
+      return;
+    }
+    const status = String(req.body?.status || '');
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 500) : '';
+    if (!['approved', 'rejected'].includes(status)) {
+      res.status(400).json({ error: 'اختر قبول المستند أو رفضه' });
+      return;
+    }
+    if (status === 'rejected' && reason.length < 3) {
+      res.status(400).json({ error: 'اكتب سبب رفض المستند ليظهر للشركة' });
+      return;
+    }
+
+    const compRes = await findCompanyQuery(String(req.params.id));
+    const company = compRes.rows[0];
+    if (!company) {
+      res.status(404).json({ error: 'الشركة غير موجودة' });
+      return;
+    }
+    if (!company[field]) {
+      res.status(400).json({ error: 'لم ترفع الشركة هذا المستند بعد' });
+      return;
+    }
+
+    let review: Record<string, any> = {};
+    try {
+      review = company.documents_review ? JSON.parse(company.documents_review) : {};
+    } catch {
+      review = {};
+    }
+    review[field] = {
+      status,
+      reason: status === 'rejected' ? reason : null,
+      reviewed_at: new Date().toISOString(),
+      reviewed_by: req.user?.email || 'الإدارة',
+    };
+    await pool.query('UPDATE companies SET documents_review = $1 WHERE id = $2', [JSON.stringify(review), company.id]);
+
+    const label = COMPANY_DOCUMENT_LABELS[field];
+    await notifyCompanyTeam(company.id, 'company.documents', {
+      title: status === 'approved' ? `تم قبول ${label}` : `مطلوب إعادة رفع ${label}`,
+      subtitle: status === 'approved'
+        ? `راجعت إدارة سدرة ${label} وقبلته.`
+        : `رفضت إدارة سدرة ${label}. السبب: ${reason}. ارفع نسخة جديدة من قسم المستندات الرسمية.`,
+      category: 'company',
+      icon: status === 'approved' ? 'checkmark-circle-outline' : 'alert-circle-outline',
+      iconBg: status === 'approved' ? '#ECFDF5' : '#FEF2F2',
+      iconColor: status === 'approved' ? '#059669' : '#DC2626',
+      data: { type: 'company_document_review', field, status },
+    });
+    await logAudit(
+      req.user?.email || 'admin',
+      status === 'approved' ? 'قبول مستند شركة' : 'رفض مستند شركة',
+      `${label} لشركة (${company.name})${reason ? ` · السبب: ${reason}` : ''}`,
+      req.ip,
+      req.user?.email
+    );
+    res.json({ success: true, message: status === 'approved' ? 'تم قبول المستند' : 'تم رفض المستند وإبلاغ الشركة', data: review });
+  } catch (error: any) {
+    console.error('Review company document error:', error);
+    res.status(500).json({ error: 'تعذر حفظ مراجعة المستند' });
+  }
+};

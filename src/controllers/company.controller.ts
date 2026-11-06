@@ -5,7 +5,8 @@ import { AuthRequest } from '../middlewares/security.middleware';
 import { generate16CharId } from '../utils/formatId';
 import { createAndSendNotification } from '../utils/notificationHelper';
 import { logAudit } from '../utils/auditLogger';
-import { resolveUserUpload } from '../utils/uploadAccess';
+import { normalizeUploadUrl, resolveUserUpload } from '../utils/uploadAccess';
+import { readTravelers, saveTravelers, TravelerError, travelersComplete } from '../utils/bookingTravelers';
 import { updateBookingStatusByAdmin } from './admin.controller';
 import {
   CompanyAccess,
@@ -61,6 +62,7 @@ export const can = (...permissions: string[]) => (req: CompanyRequest, res: Resp
 // the rule in one place instead of in each endpoint.
 const AMOUNT_FIELDS = ['total_price', 'paid_amount', 'receipt_verified_amount'];
 const CONTACT_FIELDS = ['client_phone', 'customer_phone'];
+const PASSPORT_FIELDS = ['passport_number', 'passport_image_url', 'birth_date', 'passport_expiry'];
 
 const stripFields = (value: any, fields: Set<string>): any => {
   if (Array.isArray(value)) return value.map((item) => stripFields(item, fields));
@@ -85,7 +87,10 @@ export const redactForMember = (req: CompanyRequest, res: Response, next: NextFu
     // In client records "phone" and "email" are the customer's own
     if (req.path.startsWith('/clients')) ['phone', 'email'].forEach((key) => hidden.add(key));
   }
-  if (!access.permissions.includes('clients.documents') && req.path.startsWith('/clients')) hidden.add('documents');
+  if (!access.permissions.includes('clients.documents')) {
+    if (req.path.startsWith('/clients')) hidden.add('documents');
+    PASSPORT_FIELDS.forEach((key) => hidden.add(key));
+  }
   if (hidden.size === 0) {
     next();
     return;
@@ -265,6 +270,7 @@ const PROFILE_COLUMNS = `
   c.short_description, c.description, c.phone, c.whatsapp, c.landline_phone, c.contact_email, c.website_url,
   c.social_links, c.city_id, c.address, c.google_maps_url, c.logo_url, c.banner_url, c.working_hours,
   c.holidays_notes, c.commercial_register_url, c.tax_id_url, c.manager_id_url, c.manager_id_back_url,
+  c.documents_review, c.max_daily_capacity, c.slot_duration_minutes,
   ci.name AS city_name`;
 
 const readProfile = async (companyId: string) => {
@@ -273,7 +279,12 @@ const readProfile = async (companyId: string) => {
     [companyId]
   );
   const row = result.rows[0];
-  return { ...row, social_links: parseJson(row.social_links, {}), working_hours: parseJson(row.working_hours, null) };
+  return {
+    ...row,
+    social_links: parseJson(row.social_links, {}),
+    working_hours: parseJson(row.working_hours, null),
+    documents_review: parseJson(row.documents_review, {}),
+  };
 };
 
 export const getCompanyProfile = async (req: CompanyRequest, res: Response): Promise<void> => {
@@ -290,7 +301,8 @@ const DOCUMENT_FIELDS = ['commercial_register_url', 'tax_id_url', 'manager_id_ur
 // Column names only ever come from this list, never from the request
 const PROFILE_FIELDS = [
   'short_description', 'description', 'phone', 'whatsapp', 'landline_phone', 'contact_email', 'website_url',
-  'social_links', 'city_id', 'address', 'google_maps_url', 'working_hours', 'holidays_notes', ...FILE_FIELDS,
+  'social_links', 'city_id', 'address', 'google_maps_url', 'working_hours', 'holidays_notes',
+  'max_daily_capacity', 'slot_duration_minutes', ...FILE_FIELDS,
 ];
 
 export const updateCompanyProfile = async (req: CompanyRequest, res: Response): Promise<void> => {
@@ -345,8 +357,16 @@ export const updateCompanyProfile = async (req: CompanyRequest, res: Response): 
     }
 
     // Official documents were reviewed by the platform, so replacing one leaves a trail for the admins
-    if (DOCUMENT_FIELDS.some((field) => updates[field] !== undefined && updates[field] !== company[field])) {
+    const replacedDocuments = DOCUMENT_FIELDS.filter((field) => updates[field] !== undefined && updates[field] !== company[field]);
+    if (replacedDocuments.length > 0) {
       await logAudit(req.user!.email, 'تعديل مستندات شركة', `عدّلت شركة (${company.name}) مستنداتها الرسمية`, req.ip, req.user!.email, null, null);
+      // A new or replaced document waits for the platform to review it again
+      const review = parseJson(company.documents_review, {}) || {};
+      for (const field of replacedDocuments) {
+        review[field] = updates[field] ? { status: 'pending', updated_at: new Date().toISOString() } : undefined;
+      }
+      await pool.query('UPDATE companies SET documents_review = $1 WHERE id = $2', [JSON.stringify(review), company.id]);
+      if (io) io.to('staff').emit('company_documents_updated', { companyId: company.id });
     }
 
     await activity(req, touchesDocuments ? 'documents_updated' : 'profile_updated', touchesDocuments ? 'عدّل المستندات الرسمية للشركة' : `عدّل بيانات الشركة (${columns.join('، ')})`, 'company', company.id);
@@ -364,7 +384,10 @@ const formatPackage = (row: any) => ({
   room_prices: parseJson(row.room_prices, {}),
   features: parseJson(row.features, []),
   itinerary: parseJson(row.itinerary, []),
+  gallery: parseJson(row.gallery, []),
+  exclusions: parseJson(row.exclusions, []),
   bookings_count: Number(row.bookings_count || 0),
+  seats_booked: row.seats_booked !== undefined ? Number(row.seats_booked) : undefined,
 });
 
 const findOwnPackage = async (req: CompanyRequest) => {
@@ -379,7 +402,8 @@ const findOwnPackage = async (req: CompanyRequest) => {
 export const getCompanyPackagesList = async (req: CompanyRequest, res: Response): Promise<void> => {
   try {
     const result = await pool.query(
-      `SELECT p.*, (SELECT COUNT(*) FROM bookings b WHERE b.package_id = p.id) AS bookings_count
+      `SELECT p.*, (SELECT COUNT(*) FROM bookings b WHERE b.package_id = p.id) AS bookings_count,
+         (SELECT COALESCE(SUM(b.travelers_count), 0) FROM bookings b WHERE b.package_id = p.id AND b.status <> 'cancelled')::int AS seats_booked
        FROM packages p WHERE p.company_id = $1 ORDER BY p.created_at DESC`,
       [req.company.id]
     );
@@ -430,6 +454,61 @@ const packageValues = (body: any, imageUrl: string) => [
   JSON.stringify(body.itinerary.filter((item: any) => item.title)),
 ];
 
+// Fields added after the first package form; saved in a second statement so the main one keeps its shape
+const preparePackageExtras = async (
+  req: CompanyRequest,
+  existing: any | null
+): Promise<{ error: string } | { values: any[] }> => {
+  const body = req.body;
+  // Gallery images already on the package are kept as is; new ones must be the saver's own uploads
+  const known = new Set<string>();
+  if (existing) {
+    const previous = parseJson(existing.gallery, []);
+    if (Array.isArray(previous)) previous.forEach((url: string) => known.add(String(url).split('/').pop() || ''));
+  }
+  const gallery: string[] = [];
+  for (const raw of body.gallery || []) {
+    const url = normalizeUploadUrl(raw, req);
+    if (url === false) return { error: 'إحدى صور الألبوم غير صالحة، ارفعها مرة أخرى' };
+    if (!url) continue;
+    if (known.has(url.split('/').pop() || '')) {
+      gallery.push(url);
+      continue;
+    }
+    const owned = await resolveUserUpload(url, req, req.user!.id, null);
+    if (!owned) return { error: 'إحدى صور الألبوم غير صالحة، ارفعها مرة أخرى' };
+    gallery.push(owned);
+  }
+  const seats = body.seats_total ? parseInt(body.seats_total, 10) : null;
+  const originalPrice = body.original_price ? Number(body.original_price) : null;
+  const lowest = lowestAdultPrice(body.room_prices);
+  if (originalPrice !== null && lowest !== null && originalPrice <= lowest) {
+    return { error: 'السعر قبل الخصم يجب أن يكون أكبر من سعر الباقة' };
+  }
+  return {
+    values: [
+      JSON.stringify(gallery),
+      JSON.stringify((body.exclusions || []).filter(Boolean)),
+      seats,
+      body.visa_info || null,
+      body.transport_info || null,
+      originalPrice,
+      Boolean(body.includes_flight),
+      body.season || null,
+    ],
+  };
+};
+
+const applyPackageExtras = async (packageId: string, values: any[]) => {
+  const result = await pool.query(
+    `UPDATE packages SET gallery = $1, exclusions = $2, seats_total = $3, visa_info = $4, transport_info = $5,
+       original_price = $6, includes_flight = $7, season = $8
+     WHERE id = $9 RETURNING *`,
+    [...values, packageId]
+  );
+  return result.rows[0];
+};
+
 export const createCompanyOwnPackage = async (req: CompanyRequest, res: Response): Promise<void> => {
   try {
     const company = req.company;
@@ -440,6 +519,11 @@ export const createCompanyOwnPackage = async (req: CompanyRequest, res: Response
     const image = await resolveUserUpload(req.body.image_url, req, req.user!.id);
     if (image === false) {
       res.status(400).json({ error: 'رابط الصورة غير صالح' });
+      return;
+    }
+    const extras = await preparePackageExtras(req, null);
+    if ('error' in extras) {
+      res.status(400).json({ error: extras.error });
       return;
     }
 
@@ -456,8 +540,9 @@ export const createCompanyOwnPackage = async (req: CompanyRequest, res: Response
       'UPDATE cities SET total_packages = (SELECT COUNT(*) FROM packages WHERE city_id = $1) WHERE id = $1',
       [company.city_id]
     );
-    await activity(req, 'package_created', `أضاف الباقة "${result.rows[0].title}"`, 'package', result.rows[0].id);
-    res.status(201).json({ success: true, message: 'تم إنشاء الباقة', data: formatPackage(result.rows[0]) });
+    const created = await applyPackageExtras(result.rows[0].id, extras.values);
+    await activity(req, 'package_created', `أضاف الباقة "${created.title}"`, 'package', created.id);
+    res.status(201).json({ success: true, message: 'تم إنشاء الباقة', data: formatPackage(created) });
   } catch (error) {
     console.error('Create company package error:', error);
     res.status(500).json({ error: 'تعذر إنشاء الباقة' });
@@ -476,6 +561,20 @@ export const updateCompanyOwnPackage = async (req: CompanyRequest, res: Response
       res.status(400).json({ error: 'رابط الصورة غير صالح' });
       return;
     }
+    const extras = await preparePackageExtras(req, existing);
+    if ('error' in extras) {
+      res.status(400).json({ error: extras.error });
+      return;
+    }
+    const seatsBooked = await pool.query(
+      `SELECT COALESCE(SUM(travelers_count), 0)::int AS total FROM bookings WHERE package_id = $1 AND status <> 'cancelled'`,
+      [existing.id]
+    );
+    const seats = extras.values[2];
+    if (seats !== null && seats < seatsBooked.rows[0].total) {
+      res.status(400).json({ error: `حُجز ${seatsBooked.rows[0].total} مقعد بالفعل، لا يمكن أن يقل عدد المقاعد عن ذلك` });
+      return;
+    }
     const result = await pool.query(
       `UPDATE packages SET
          title = $1, duration = $2, price = $3, image_url = $4, description = $5, features = $6, nights_count = $7,
@@ -484,8 +583,9 @@ export const updateCompanyOwnPackage = async (req: CompanyRequest, res: Response
        WHERE id = $18 AND company_id = $19 RETURNING *`,
       [...packageValues(req.body, image || ''), existing.id, req.company.id]
     );
-    await activity(req, 'package_updated', `عدّل الباقة "${result.rows[0].title}"`, 'package', existing.id);
-    res.json({ success: true, message: 'تم تحديث الباقة', data: formatPackage(result.rows[0]) });
+    const updated = await applyPackageExtras(existing.id, extras.values);
+    await activity(req, 'package_updated', `عدّل الباقة "${updated.title}"`, 'package', existing.id);
+    res.json({ success: true, message: 'تم تحديث الباقة', data: formatPackage(updated) });
   } catch (error) {
     console.error('Update company package error:', error);
     res.status(500).json({ error: 'تعذر تحديث الباقة' });
@@ -603,11 +703,12 @@ const readOrder = async (bookingId: string, companyId: string) => {
     [bookingId, companyId]
   );
   const stages = await pool.query(
-    `SELECT id, stage_order, title, subtitle, status, stage_date, traveler_name, document_url, document_number, details
+    `SELECT id, stage_order, title, subtitle, status, stage_date, traveler_name, document_url, document_number, details, instructions
      FROM trip_stages WHERE booking_id = $1 ORDER BY stage_order`,
     [bookingId]
   );
-  return { ...order.rows[0], stages: stages.rows };
+  const travelers = await readTravelers(bookingId);
+  return { ...order.rows[0], stages: stages.rows, travelers, travelers_complete: travelersComplete(order.rows[0] || {}, travelers) };
 };
 
 export const getCompanyOrderDetails = async (req: CompanyRequest, res: Response): Promise<void> => {
@@ -745,6 +846,28 @@ export const remindCompanyOrderPayment = async (req: CompanyRequest, res: Respon
 
 // ───── Finance ─────
 
+// The commission rule currently applied to new bookings, in words the company understands
+const describeCommission = (settings: Record<string, string>) => {
+  const enabled = settings.commission_system_enabled !== 'false';
+  const method = settings.commission_method || 'percentage_total';
+  if (!enabled) return { enabled, method, text: 'لا تُحتسب عمولة على الحجوزات حالياً' };
+  if (method === 'per_individual') {
+    return {
+      enabled,
+      method,
+      adult_rate: Number(settings.adult_commission_rate || 5),
+      child_rate: Number(settings.child_commission_rate || 2),
+      text: `${Number(settings.adult_commission_rate || 5)}% عن كل بالغ و${Number(settings.child_commission_rate || 2)}% عن كل طفل من قيمة الحجز`,
+    };
+  }
+  if (method === 'fixed_amount') {
+    const amount = Number(settings.fixed_commission_amount || settings.platform_commission_fee || 50);
+    return { enabled, method, fixed_amount: amount, text: `مبلغ ثابت ${amount} عن كل حجز مؤكد` };
+  }
+  const pct = Number(settings.commission_percentage || 5);
+  return { enabled, method, percentage: pct, text: `${pct}% من إجمالي قيمة الحجز` };
+};
+
 export const getCompanyFinance = async (req: CompanyRequest, res: Response): Promise<void> => {
   try {
     const companyId = req.company.id;
@@ -755,6 +878,7 @@ export const getCompanyFinance = async (req: CompanyRequest, res: Response): Pro
          COUNT(*) FILTER (WHERE b.status = 'receipt_review')::int AS in_review_count,
          COALESCE(SUM(COALESCE(b.paid_amount, b.total_price)) FILTER (WHERE b.status = 'receipt_review'), 0)::float AS in_review_sales,
          COALESCE(SUM(pe.commission_amount) FILTER (WHERE pe.status = 'recorded'), 0)::float AS commission_total,
+         COALESCE(SUM(pe.commission_amount) FILTER (WHERE pe.status = 'recorded' AND pe.settlement_id IS NOT NULL), 0)::float AS commission_settled,
          COALESCE(SUM(pe.commission_amount) FILTER (WHERE pe.status = 'recorded' AND DATE_TRUNC('month', b.receipt_reviewed_at) = DATE_TRUNC('month', NOW())), 0)::float AS commission_this_month,
          COALESCE(SUM(COALESCE(b.receipt_verified_amount, b.paid_amount, b.total_price))
            FILTER (WHERE b.receipt_approved AND DATE_TRUNC('month', b.receipt_reviewed_at) = DATE_TRUNC('month', NOW())), 0)::float AS sales_this_month
@@ -768,6 +892,8 @@ export const getCompanyFinance = async (req: CompanyRequest, res: Response): Pro
       `SELECT b.id, b.booking_reference, COALESCE(b.customer_name, u.name) AS client_name, p.title AS package_title,
          COALESCE(b.receipt_verified_amount, b.paid_amount, b.total_price)::float AS amount,
          COALESCE(pe.commission_amount, b.commission_amount, 0)::float AS commission,
+         b.commission_method_used, b.commission_rate_used,
+         (pe.settlement_id IS NOT NULL) AS settled, pe.settled_at,
          b.receipt_reviewed_at, b.status
        ${ORDER_FROM}
        LEFT JOIN platform_earnings pe ON pe.booking_id = b.id
@@ -775,13 +901,28 @@ export const getCompanyFinance = async (req: CompanyRequest, res: Response): Pro
        ORDER BY b.receipt_reviewed_at DESC NULLS LAST LIMIT 100`,
       [companyId]
     );
+    const settlements = await pool.query(
+      `SELECT id, amount::float AS amount, earnings_count, method, reference, note, created_at
+       FROM company_settlements WHERE company_id = $1 ORDER BY created_at DESC LIMIT 50`,
+      [companyId]
+    );
+    const settingsRes = await pool.query(
+      `SELECT key, value FROM settings WHERE key IN ('commission_system_enabled', 'commission_method', 'commission_percentage',
+         'adult_commission_rate', 'child_commission_rate', 'fixed_commission_amount', 'platform_commission_fee')`
+    );
+    const settings = Object.fromEntries(settingsRes.rows.map((row: any) => [row.key, row.value]));
+
     const row = totals.rows[0];
     res.json({
       success: true,
       data: {
         ...row,
         net_total: row.confirmed_sales - row.commission_total,
+        // What the company still owes the platform for confirmed bookings
+        commission_due: Math.max(0, row.commission_total - row.commission_settled),
+        commission_terms: describeCommission(settings),
         items: items.rows.map((item: any) => ({ ...item, net: item.amount - item.commission })),
+        settlements: settlements.rows,
       },
     });
   } catch (error) {
@@ -789,7 +930,6 @@ export const getCompanyFinance = async (req: CompanyRequest, res: Response): Pro
     res.status(500).json({ error: 'تعذر جلب البيانات المالية' });
   }
 };
-
 // ───── Reviews ─────
 
 // The reply shows under the review in the customer app; an empty reply removes it
@@ -853,73 +993,150 @@ export const getCompanyReviews = async (req: CompanyRequest, res: Response): Pro
   }
 };
 
-export const completeCompanyStage = async (req: CompanyRequest, res: Response): Promise<void> => {
+const STAGE_DOC_TYPES = ['visa', 'ticket', 'hotel', 'other'];
+
+// Each document link must point to a file the platform stored. A file already attached to this stage is kept
+// as is; a new one must have been uploaded by the person saving it, so nobody can attach someone else's file.
+const resolveStageFile = async (req: CompanyRequest, raw: unknown, existing: Set<string>): Promise<string | null | false> => {
+  const url = normalizeUploadUrl(raw, req);
+  if (!url) return url;
+  const name = url.split('/').pop();
+  for (const known of existing) {
+    if (known.split('/').pop() === name) return url;
+  }
+  return resolveUserUpload(url, req, req.user!.id, null);
+};
+
+/**
+ * Saves a trip stage: one document per traveler (visa, ticket, hotel voucher), travel instructions, and
+ * optionally completes it. Documents can be corrected after completion; the customer sees them in
+ * "مستندات رحلتي" and is notified.
+ */
+export const saveCompanyStage = async (req: CompanyRequest, res: Response): Promise<void> => {
   try {
     const booking = req.booking;
-    // The visit and receipt stages move only through accepting the order and reviewing the receipt
+    // The visit, receipt and confirmation stages move only through the order and the receipt review
     if (!booking.receipt_approved || !['confirmed', 'completed'].includes(booking.status)) {
       res.status(409).json({ error: 'لا يمكن تحديث مراحل الرحلة قبل اعتماد الإيصال' });
       return;
     }
-
     const stageRes = await pool.query('SELECT * FROM trip_stages WHERE id = $1 AND booking_id = $2', [param(req, 'stageId'), booking.id]);
     const stage = stageRes.rows[0];
     if (!stage || stage.stage_order < 3) {
       res.status(404).json({ error: 'المرحلة غير موجودة' });
       return;
     }
-    if (stage.status === 'completed') {
-      res.status(409).json({ error: 'هذه المرحلة مكتملة بالفعل' });
-      return;
-    }
-    const previous = await pool.query(
-      'SELECT status FROM trip_stages WHERE booking_id = $1 AND stage_order = $2',
-      [booking.id, stage.stage_order - 1]
-    );
-    if (previous.rows[0] && previous.rows[0].status !== 'completed') {
-      res.status(400).json({ error: 'أكمل المرحلة السابقة أولاً' });
+    if (stage.status === 'cancelled') {
+      res.status(409).json({ error: 'هذه المرحلة ملغاة' });
       return;
     }
 
-    const documentUrl = await resolveUserUpload(req.body.document_url, req, req.user!.id, stage.document_url);
+    const complete = req.body.complete === true || req.path.endsWith('/complete');
+    if (complete && stage.status === 'completed') {
+      res.status(409).json({ error: 'هذه المرحلة مكتملة بالفعل' });
+      return;
+    }
+    if (complete) {
+      const previous = await pool.query('SELECT status FROM trip_stages WHERE booking_id = $1 AND stage_order = $2', [booking.id, stage.stage_order - 1]);
+      if (previous.rows[0] && previous.rows[0].status !== 'completed') {
+        res.status(400).json({ error: 'أكمل المرحلة السابقة أولاً' });
+        return;
+      }
+    }
+
+    // Files already on this stage, which may have been uploaded by another team member
+    const existing = new Set<string>([stage.document_url].filter(Boolean));
+    const previousTravelers = parseJson(stage.details, []);
+    if (Array.isArray(previousTravelers)) previousTravelers.forEach((row: any) => row?.docUrl && existing.add(String(row.docUrl)));
+
+    let details: string | null | undefined;
+    if (Array.isArray(req.body.travelers)) {
+      const rows = [];
+      for (const row of req.body.travelers) {
+        const docUrl = await resolveStageFile(req, row.docUrl, existing);
+        if (docUrl === false) {
+          res.status(400).json({ error: `ملف المستند الخاص بـ ${row.name || 'المسافر'} غير صالح، ارفعه مرة أخرى` });
+          return;
+        }
+        rows.push({
+          name: String(row.name || '').trim(),
+          docNumber: String(row.docNumber || '').trim(),
+          docUrl: docUrl || null,
+          docType: STAGE_DOC_TYPES.includes(row.docType) ? row.docType : undefined,
+        });
+      }
+      details = rows.length > 0 ? JSON.stringify(rows) : null;
+    }
+
+    const documentUrl = req.body.document_url !== undefined ? await resolveStageFile(req, req.body.document_url, existing) : undefined;
     if (documentUrl === false) {
       res.status(400).json({ error: 'رابط المستند غير صالح' });
       return;
     }
+    const instructions = req.body.instructions !== undefined ? String(req.body.instructions).trim() || null : undefined;
 
     await pool.query(
-      `UPDATE trip_stages SET status = 'completed',
-         document_url = COALESCE($1, document_url), document_number = COALESCE($2, document_number),
-         traveler_name = COALESCE($3, traveler_name), details = COALESCE($4, details)
-       WHERE id = $5`,
-      [documentUrl, req.body.document_number || null, req.body.traveler_name || null, req.body.details || null, stage.id]
-    );
-    await pool.query(
-      `UPDATE trip_stages SET status = 'current' WHERE booking_id = $1 AND stage_order = $2 AND status = 'pending'`,
-      [booking.id, stage.stage_order + 1]
-    );
-    await pool.query(
-      `UPDATE bookings b SET status = 'completed' WHERE b.id = $1 AND b.status <> 'cancelled' AND b.receipt_approved = TRUE
-       AND NOT EXISTS (SELECT 1 FROM trip_stages ts WHERE ts.booking_id = b.id AND ts.status <> 'completed')`,
-      [booking.id]
+      `UPDATE trip_stages SET
+         details = CASE WHEN $1::boolean THEN $2 ELSE details END,
+         document_url = CASE WHEN $3::boolean THEN $4 ELSE document_url END,
+         document_number = COALESCE($5, document_number),
+         traveler_name = COALESCE($6, traveler_name),
+         instructions = CASE WHEN $7::boolean THEN $8 ELSE instructions END,
+         status = CASE WHEN $9::boolean THEN 'completed' ELSE status END
+       WHERE id = $10`,
+      [
+        details !== undefined, details ?? null,
+        documentUrl !== undefined, documentUrl ?? null,
+        req.body.document_number || null,
+        req.body.traveler_name || null,
+        instructions !== undefined, instructions ?? null,
+        complete,
+        stage.id,
+      ]
     );
 
-    await createAndSendNotification({
-      userId: booking.user_id,
-      title: 'تحديث مراحل الرحلة',
-      subtitle: `حجزك #${booking.booking_reference}: اكتملت مرحلة "${stage.title}"`,
-      category: 'stage',
-      icon: 'flag-outline',
-      iconBg: '#F0FDF4',
-      iconColor: '#16A34A',
-      data: { type: 'stage_update', stageTitle: stage.title, bookingRef: booking.booking_reference },
-    });
+    if (complete) {
+      await pool.query(
+        `UPDATE trip_stages SET status = 'current' WHERE booking_id = $1 AND stage_order = $2 AND status = 'pending'`,
+        [booking.id, stage.stage_order + 1]
+      );
+      await pool.query(
+        `UPDATE bookings b SET status = 'completed' WHERE b.id = $1 AND b.status <> 'cancelled' AND b.receipt_approved = TRUE
+         AND NOT EXISTS (SELECT 1 FROM trip_stages ts WHERE ts.booking_id = b.id AND ts.status <> 'completed')`,
+        [booking.id]
+      );
+    }
 
-    await activity(req, 'stage_completed', `أكمل مرحلة "${stage.title}" في الحجز #${booking.booking_reference}`, 'order', booking.id);
-    res.json({ success: true, message: 'تم تحديث المرحلة', data: await readOrder(booking.id, req.company.id) });
+    const documentsAdded = details !== undefined || documentUrl !== undefined;
+    if (complete || documentsAdded || instructions !== undefined) {
+      const what = [
+        complete ? `اكتملت مرحلة "${stage.title}"` : `تحديث في مرحلة "${stage.title}"`,
+        documentsAdded ? 'المستندات متاحة في مستندات رحلتي' : '',
+        instructions ? 'أُضيفت تعليمات السفر' : '',
+      ].filter(Boolean);
+      await createAndSendNotification({
+        userId: booking.user_id,
+        title: complete ? 'تحديث مراحل الرحلة' : 'مستندات وتعليمات جديدة لرحلتك',
+        subtitle: `حجزك #${booking.booking_reference}: ${what.join('، ')}`,
+        category: 'stage',
+        icon: documentsAdded ? 'document-attach-outline' : 'flag-outline',
+        iconBg: '#F0FDF4',
+        iconColor: '#16A34A',
+        data: { type: 'stage_update', stageTitle: stage.title, bookingId: booking.id, bookingRef: booking.booking_reference },
+      });
+    }
+    await activity(
+      req,
+      complete ? 'stage_completed' : 'stage_updated',
+      `${complete ? 'أكمل' : 'حدّث'} مرحلة "${stage.title}"${documentsAdded ? ' مع المستندات' : ''} في الحجز #${booking.booking_reference}`,
+      'order',
+      booking.id
+    );
+
+    res.json({ success: true, message: complete ? 'تم إكمال المرحلة' : 'تم حفظ المرحلة', data: await readOrder(booking.id, req.company.id) });
   } catch (error) {
-    console.error('Complete stage error:', error);
-    res.status(500).json({ error: 'تعذر تحديث المرحلة' });
+    console.error('Save stage error:', error);
+    res.status(500).json({ error: 'تعذر حفظ المرحلة' });
   }
 };
 
@@ -966,9 +1183,18 @@ export const getCompanyClientDetails = async (req: CompanyRequest, res: Response
       [companyName, clientId]
     );
     const documents = await pool.query(
-      `SELECT d.id, d.traveler_name, d.document_type, d.status, d.valid_until, d.file_url, b.booking_reference
-       FROM documents d JOIN bookings b ON d.booking_id = b.id JOIN packages p ON b.package_id = p.id
-       WHERE p.company_id = $1 AND b.user_id = $2 ORDER BY d.created_at DESC`,
+      // Passports the travelers entered, then any other documents linked to the client's bookings
+      `SELECT * FROM (
+         SELECT bt.id, bt.full_name AS traveler_name, 'جواز سفر' AS document_type,
+           COALESCE(bt.passport_number, 'رقم الجواز ناقص') AS status,
+           bt.passport_expiry AS valid_until, bt.passport_image_url AS file_url, b.booking_reference, bt.created_at
+         FROM booking_travelers bt JOIN bookings b ON bt.booking_id = b.id JOIN packages p ON b.package_id = p.id
+         WHERE p.company_id = $1 AND b.user_id = $2
+         UNION ALL
+         SELECT d.id, d.traveler_name, d.document_type, d.status, d.valid_until::text, d.file_url, b.booking_reference, d.created_at
+         FROM documents d JOIN bookings b ON d.booking_id = b.id JOIN packages p ON b.package_id = p.id
+         WHERE p.company_id = $1 AND b.user_id = $2
+       ) docs ORDER BY created_at DESC`,
       [companyId, clientId]
     );
     const note = await pool.query('SELECT note FROM company_client_notes WHERE company_id = $1 AND user_id = $2', [companyId, clientId]);
@@ -1339,5 +1565,58 @@ export const cancelCompanyAppointment = async (req: CompanyRequest, res: Respons
   } catch (error) {
     console.error('Cancel appointment error:', error);
     res.status(500).json({ error: 'تعذر إلغاء الموعد' });
+  }
+};
+
+// ───── Travelers ─────
+
+// The company completes or corrects the travelers after seeing their passports at the office
+export const updateCompanyOrderTravelers = async (req: CompanyRequest, res: Response): Promise<void> => {
+  try {
+    const booking = req.booking;
+    if (['cancelled', 'completed'].includes(booking.status)) {
+      res.status(409).json({ error: 'لا يمكن تعديل المسافرين في حجز ملغي أو مكتمل' });
+      return;
+    }
+    const travelers = await saveTravelers(req, booking, req.body.travelers, { userId: String(req.user!.id), type: 'company' });
+    await activity(req, 'travelers_updated', `حدّث بيانات المسافرين في الحجز #${booking.booking_reference} (${travelers.length} مسافر)`, 'order', booking.id);
+    res.json({ success: true, message: 'تم حفظ بيانات المسافرين', data: await readOrder(booking.id, req.company.id) });
+  } catch (error) {
+    if (error instanceof TravelerError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    console.error('Company travelers error:', error);
+    res.status(500).json({ error: 'تعذر حفظ بيانات المسافرين' });
+  }
+};
+
+// Asks the customer to enter the travelers' names and passports; at most once a day per booking
+export const requestOrderTravelers = async (req: CompanyRequest, res: Response): Promise<void> => {
+  try {
+    const booking = req.booking;
+    const recent = await pool.query(
+      `SELECT 1 FROM notifications WHERE user_id = $1 AND created_at > NOW() - INTERVAL '24 hours' AND data::text LIKE $2 LIMIT 1`,
+      [booking.user_id, `%"travelers_requested"%${booking.booking_reference}%`]
+    );
+    if (recent.rows.length > 0) {
+      res.status(429).json({ error: 'تم إرسال الطلب لهذا العميل خلال آخر 24 ساعة' });
+      return;
+    }
+    await createAndSendNotification({
+      userId: booking.user_id,
+      title: 'مطلوب بيانات المسافرين',
+      subtitle: `تطلب ${req.company.name} أسماء المسافرين وبيانات جوازات السفر لحجزك #${booking.booking_reference} لاستخراج التأشيرات. أضفها من تفاصيل الحجز.`,
+      category: 'booking',
+      icon: 'people-outline',
+      iconBg: '#FFFBEB',
+      iconColor: '#D97706',
+      data: { type: 'travelers_requested', bookingId: booking.id, bookingRef: booking.booking_reference },
+    });
+    await activity(req, 'travelers_requested', `طلب بيانات المسافرين للحجز #${booking.booking_reference}`, 'order', booking.id);
+    res.json({ success: true, message: 'تم إرسال الطلب للعميل' });
+  } catch (error) {
+    console.error('Request travelers error:', error);
+    res.status(500).json({ error: 'تعذر إرسال الطلب' });
   }
 };

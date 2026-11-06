@@ -4,6 +4,7 @@ import { pool } from '../config/db';
 import { generate16CharId } from '../utils/formatId';
 import { logAudit } from '../utils/auditLogger';
 import { sendPushToUsers, sendPushToAllTokens } from '../utils/pushNotification';
+import { companyTeamUserIds } from '../utils/companyAccess';
 
 export const getUserNotifications = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -147,16 +148,13 @@ export const sendNotificationByAdmin = async (req: AuthRequest, res: Response): 
         targetUserIds = allU.rows.map(r => r.id);
       }
     } else if (targetType === 'all_companies') {
-      const compOwners = await pool.query('SELECT DISTINCT user_id FROM companies WHERE user_id IS NOT NULL');
-      targetUserIds = compOwners.rows.map(r => r.user_id).filter(Boolean);
-      if (targetUserIds.length === 0) {
-        const companyUsers = await pool.query("SELECT id FROM users WHERE role = 'company' OR role = 'provider'");
-        targetUserIds = companyUsers.rows.map(r => r.id);
-      }
-      if (targetUserIds.length === 0) {
-        const allU = await pool.query('SELECT id FROM users');
-        targetUserIds = allU.rows.map(r => r.id);
-      }
+      // Owners and active team members of every company; never everyone when no company has a team yet
+      const companyTeams = await pool.query(
+        `SELECT user_id FROM companies WHERE user_id IS NOT NULL
+         UNION
+         SELECT user_id FROM company_members WHERE status = 'active' AND user_id IS NOT NULL`
+      );
+      targetUserIds = companyTeams.rows.map(r => r.user_id).filter(Boolean);
     } else if (targetType === 'specific_user' && targetId) {
       const userRes = await pool.query('SELECT id FROM users WHERE id = $1 OR public_id = $1', [String(targetId).trim()]);
       if (userRes.rows.length > 0) {
@@ -168,7 +166,7 @@ export const sendNotificationByAdmin = async (req: AuthRequest, res: Response): 
       if (compRes.rows.length > 0) {
         const comp = compRes.rows[0];
         if (comp.user_id) {
-          targetUserIds = [comp.user_id];
+          targetUserIds = await companyTeamUserIds(comp.id);
         } else if (comp.pending_owner_email) {
           const userMatch = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [comp.pending_owner_email]);
           if (userMatch.rows.length > 0) {

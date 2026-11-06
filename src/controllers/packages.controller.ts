@@ -1,13 +1,17 @@
 import { Request, Response } from 'express';
 import { pool } from '../config/db';
 import { formatPackageId, formatCompanyId, parseIdOrToken } from '../utils/formatId';
+import { enrichPackage, PACKAGE_EXTRA_COLUMNS } from '../utils/packageInfo';
+import { notifyCompanyTeam } from '../utils/companyAccess';
+
+const STATUS_LABELS: Record<string, string> = { active: 'منشورة', paused: 'موقوفة', hidden: 'مخفية' };
 
 export const getPackages = async (req: Request, res: Response): Promise<void> => {
   try {
     const { cityId, companyId, minPrice, maxPrice } = req.query;
     let query = `
-      SELECT p.*, c.name as company_name, c.logo_url as company_logo, ci.name as city_name,
-             (SELECT COUNT(*) FROM bookings b WHERE b.package_id = p.id) as bookings_count
+      SELECT p.*, c.name as company_name, c.logo_url as company_logo, ci.name as city_name, c.public_id as company_public_id,
+             (SELECT COUNT(*) FROM bookings b WHERE b.package_id = p.id) as bookings_count, ${PACKAGE_EXTRA_COLUMNS}
       FROM packages p
       JOIN companies c ON p.company_id = c.id
       JOIN cities ci ON p.city_id = ci.id
@@ -40,7 +44,7 @@ export const getPackages = async (req: Request, res: Response): Promise<void> =>
 
     const result = await pool.query(query, params);
     const formatted = result.rows.map(pkg => ({
-      ...pkg,
+      ...enrichPackage(pkg),
       numeric_id: pkg.id,
       id: formatPackageId(pkg.id, pkg.public_id),
       company_id: formatCompanyId(pkg.company_id, pkg.company_public_id),
@@ -66,7 +70,7 @@ export const getPackageById = async (req: Request, res: Response): Promise<void>
       result = await pool.query(
         `
         SELECT p.*, c.name as company_name, c.logo_url as company_logo, ci.name as city_name, c.public_id as company_public_id,
-               (SELECT COUNT(*) FROM bookings b WHERE b.package_id = p.id) as bookings_count
+               (SELECT COUNT(*) FROM bookings b WHERE b.package_id = p.id) as bookings_count, ${PACKAGE_EXTRA_COLUMNS}
         FROM packages p
         JOIN companies c ON p.company_id = c.id
         JOIN cities ci ON p.city_id = ci.id
@@ -78,7 +82,7 @@ export const getPackageById = async (req: Request, res: Response): Promise<void>
       result = await pool.query(
         `
         SELECT p.*, c.name as company_name, c.logo_url as company_logo, ci.name as city_name, c.public_id as company_public_id,
-               (SELECT COUNT(*) FROM bookings b WHERE b.package_id = p.id) as bookings_count
+               (SELECT COUNT(*) FROM bookings b WHERE b.package_id = p.id) as bookings_count, ${PACKAGE_EXTRA_COLUMNS}
         FROM packages p
         JOIN companies c ON p.company_id = c.id
         JOIN cities ci ON p.city_id = ci.id
@@ -93,7 +97,7 @@ export const getPackageById = async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    const pkg = result.rows[0];
+    const pkg = enrichPackage(result.rows[0]);
     const numericId = pkg.id;
     pkg.id = formatPackageId(pkg.id, pkg.public_id);
     pkg.numeric_id = numericId;
@@ -188,10 +192,21 @@ export const updatePackageByAdmin = async (req: Request, res: Response): Promise
       return;
     }
 
+    const updated = result.rows[0];
+    await notifyCompanyTeam(updated.company_id, 'packages.view', {
+      title: 'عدّلت الإدارة باقة',
+      subtitle: `عدّلت إدارة سدرة بيانات الباقة "${updated.title}". راجع الباقة من قائمة الباقات.`,
+      category: 'package',
+      icon: 'create-outline',
+      iconBg: '#EFF6FF',
+      iconColor: '#2563EB',
+      data: { type: 'admin_package_update', packageId: updated.id },
+    });
+
     res.json({
       success: true,
       message: 'تم تحديث الباقة بنجاح',
-      data: result.rows[0],
+      data: updated,
     });
   } catch (error: any) {
     console.error('Error updating package:', error);
@@ -203,11 +218,32 @@ export const deletePackageByAdmin = async (req: Request, res: Response): Promise
   try {
     const rawId = req.params.id;
     const parsed = parseIdOrToken(rawId);
-    const result = await pool.query('DELETE FROM packages WHERE id = $1 OR public_id = $2 RETURNING city_id', [parsed.value, String(rawId)]);
-    if (result.rows.length === 0) {
+    // Deleting cascades to the bookings, which would erase customers' reservations and payment records
+    const existing = await pool.query(
+      `SELECT p.id, p.title, p.company_id, (SELECT COUNT(*) FROM bookings b WHERE b.package_id = p.id)::int AS bookings_count
+       FROM packages p WHERE p.id = $1 OR p.public_id = $2`,
+      [parsed.value, String(rawId)]
+    );
+    const pkg = existing.rows[0];
+    if (!pkg) {
       res.status(404).json({ error: 'الباقة غير موجودة' });
       return;
     }
+    if (pkg.bookings_count > 0) {
+      res.status(409).json({ error: `على هذه الباقة ${pkg.bookings_count} حجز، لا يمكن حذفها. استخدم الإخفاء بدلاً من الحذف` });
+      return;
+    }
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 500) : '';
+    const result = await pool.query('DELETE FROM packages WHERE id = $1 RETURNING city_id', [pkg.id]);
+    await notifyCompanyTeam(pkg.company_id, 'packages.view', {
+      title: 'حذفت الإدارة باقة',
+      subtitle: `حذفت إدارة سدرة الباقة "${pkg.title}"${reason ? `. السبب: ${reason}` : ''}`,
+      category: 'package',
+      icon: 'trash-outline',
+      iconBg: '#FEF2F2',
+      iconColor: '#DC2626',
+      data: { type: 'admin_package_deleted' },
+    });
     const cityId = result.rows[0].city_id;
     if (cityId) {
       await pool.query('UPDATE cities SET total_packages = (SELECT COUNT(*) FROM packages WHERE city_id = $1) WHERE id = $1', [cityId]);
@@ -224,16 +260,38 @@ export const updatePackageStatusByAdmin = async (req: Request, res: Response): P
     const rawId = req.params.id;
     const { status } = req.body; // 'active', 'paused', 'hidden'
     const parsed = parseIdOrToken(rawId);
+    if (!['active', 'paused', 'hidden'].includes(status)) {
+      res.status(400).json({ error: 'حالة غير معروفة' });
+      return;
+    }
+    // The reason is shown to the company, so hiding a package always says why
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 500) : '';
+    if (status === 'hidden' && reason.length < 3) {
+      res.status(400).json({ error: 'اكتب سبب الإخفاء ليظهر للشركة' });
+      return;
+    }
 
     const result = await pool.query(
-      'UPDATE packages SET status = $1 WHERE id = $2 OR public_id = $3 RETURNING *',
-      [status, parsed.value, String(rawId)]
+      'UPDATE packages SET status = $1, admin_status_reason = $4 WHERE id = $2 OR public_id = $3 RETURNING *',
+      [status, parsed.value, String(rawId), status === 'hidden' ? reason : null]
     );
 
     if (result.rows.length === 0) {
       res.status(404).json({ error: 'الباقة غير موجودة' });
       return;
     }
+    const pkg = result.rows[0];
+    await notifyCompanyTeam(pkg.company_id, 'packages.view', {
+      title: status === 'hidden' ? 'أخفت الإدارة باقة' : `أصبحت الباقة ${STATUS_LABELS[status]}`,
+      subtitle: status === 'hidden'
+        ? `أخفت إدارة سدرة الباقة "${pkg.title}" عن العملاء. السبب: ${reason}`
+        : `غيّرت إدارة سدرة حالة الباقة "${pkg.title}" إلى: ${STATUS_LABELS[status]}`,
+      category: 'package',
+      icon: status === 'hidden' ? 'eye-off-outline' : 'pricetag-outline',
+      iconBg: status === 'hidden' ? '#FEF2F2' : '#ECFDF5',
+      iconColor: status === 'hidden' ? '#DC2626' : '#059669',
+      data: { type: 'admin_package_status', packageId: pkg.id, status },
+    });
 
     res.json({ success: true, message: 'تم تغيير حالة الباقة بنجاح', data: result.rows[0] });
   } catch (error: any) {

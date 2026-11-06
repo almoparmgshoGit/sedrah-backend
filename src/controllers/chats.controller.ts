@@ -8,7 +8,7 @@ import { generate16CharId } from '../utils/formatId';
 import { logAudit } from '../utils/auditLogger';
 import { normalizeUploadUrl, resolveUserUpload } from '../utils/uploadAccess';
 import { expireOverdueAppointmentsThrottled, isPastAppointmentDay, localToday } from '../utils/appointmentLifecycle';
-import { companyTeamUserIds } from '../utils/companyAccess';
+import { companyTeamUserIds, notifyCompanyTeam } from '../utils/companyAccess';
 
 const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
 const INVALID_ATTACHMENT_ERROR = 'رابط المرفق غير صالح';
@@ -870,7 +870,17 @@ export const chatsController = {
         io.to('staff').emit('ticket_updated', { id: chatId });
       }
 
-      if (chat.user_id) {
+      if (chat.department === 'companies' && chat.company_id && chat.ticket_number) {
+        await notifyCompanyTeam(chat.company_id, 'support.tickets', {
+          title: `رد من دعم سدرة · ${chat.ticket_number}`,
+          subtitle: message || 'أرسل لكم الدعم صورة',
+          category: 'support',
+          icon: 'headset-outline',
+          iconBg: '#EFF6FF',
+          iconColor: '#2563EB',
+          data: { type: 'support_reply', ticketId: chat.id },
+        }).catch(() => {});
+      } else if (chat.user_id) {
         const socketsInRoom = io ? await io.in(`chat_${chatId}`).fetchSockets() : [];
         if (socketsInRoom.length === 0) {
           sendPushToUsers(
@@ -979,8 +989,18 @@ export const chatsController = {
         io.to('staff').emit('ticket_updated', newChat.rows[0]);
       }
 
-      // Push notification to user for admin-initiated chat
-      if (targetUserId) {
+      // A ticket with a company reaches its whole support team, not only the owner
+      if (targetCompanyId) {
+        notifyCompanyTeam(targetCompanyId, 'support.tickets', {
+          title: `تذكرة جديدة من دعم سدرة · ${ticketNumber}`,
+          subtitle: `${title}: ${initialText}`.slice(0, 200),
+          category: 'support',
+          icon: 'headset-outline',
+          iconBg: '#EFF6FF',
+          iconColor: '#2563EB',
+          data: { type: 'support_reply', ticketId: chatId },
+        }).catch(() => {});
+      } else if (targetUserId) {
         createAndSendNotification({
           userId: targetUserId!,
           title: 'محادثة جديدة من الإدارة',

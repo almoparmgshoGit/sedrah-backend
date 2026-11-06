@@ -93,6 +93,8 @@ export const getBookingDocuments = async (req: Request, res: Response): Promise<
       );
 
       for (const st of stagesResult.rows) {
+        // The receipt stage holds the payment receipt, which is already listed from the booking above
+        if (st.stage_order === 2) continue;
         const titleStr = String(st.title || '');
         let docType = 'visa';
         if (titleStr.includes('تذاكر') || titleStr.includes('طيران')) docType = 'ticket';
@@ -106,9 +108,10 @@ export const getBookingDocuments = async (req: Request, res: Response): Promise<
               for (const tr of parsed) {
                 if (tr && tr.docUrl) {
                   documents.push({
-                    id: `stage-${st.id}-${tr.name || 'traveler'}`,
+                    id: `stage-${st.id}-${tr.name || 'traveler'}-${tr.docType || docType}`,
                     booking_id: booking.id,
-                    document_type: docType,
+                    // The company picks the kind per document; older entries fall back to the stage title
+                    document_type: ['visa', 'ticket', 'hotel', 'other'].includes(tr.docType) ? tr.docType : docType,
                     traveler_name: tr.name || 'مسافر',
                     document_number: tr.docNumber || '',
                     file_url: tr.docUrl,

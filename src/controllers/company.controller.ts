@@ -386,6 +386,9 @@ const formatPackage = (row: any) => ({
   exclusions: parseJson(row.exclusions, []),
   bookings_count: Number(row.bookings_count || 0),
   seats_booked: row.seats_booked !== undefined ? Number(row.seats_booked) : undefined,
+  views_count: Number(row.views_count || 0),
+  shares_count: Number(row.shares_count || 0),
+  favorites_count: Number(row.favorites_count || 0),
 });
 
 const findOwnPackage = async (req: CompanyRequest) => {
@@ -401,7 +404,8 @@ export const getCompanyPackagesList = async (req: CompanyRequest, res: Response)
   try {
     const result = await pool.query(
       `SELECT p.*, (SELECT COUNT(*) FROM bookings b WHERE b.package_id = p.id) AS bookings_count,
-         (SELECT COALESCE(SUM(b.travelers_count), 0) FROM bookings b WHERE b.package_id = p.id AND b.status <> 'cancelled')::int AS seats_booked
+         (SELECT COALESCE(SUM(b.travelers_count), 0) FROM bookings b WHERE b.package_id = p.id AND b.status <> 'cancelled')::int AS seats_booked,
+         (SELECT COUNT(*) FROM favorites f WHERE f.package_id = p.id)::int AS favorites_count
        FROM packages p WHERE p.company_id = $1 ORDER BY p.created_at DESC`,
       [req.company.id]
     );

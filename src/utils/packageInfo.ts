@@ -90,7 +90,9 @@ const asList = (value: any): string[] => {
  * seats left, and the company's rating (packages have no reviews of their own).
  * Expects company_rating, company_reviews_count and seats_booked when the query selected them.
  */
-export const enrichPackage = (row: any) => {
+export const enrichPackage = (fullRow: any) => {
+  // Statistics belong to the company only, so they are kept out of what customers receive
+  const { views_count: _views, shares_count: _shares, ...row } = fullRow;
   const gallery = asList(row.gallery);
   const seatsTotal = Number(row.seats_total) > 0 ? Number(row.seats_total) : null;
   const seatsBooked = Number(row.seats_booked || 0);

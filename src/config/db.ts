@@ -1079,6 +1079,19 @@ export const initDB = async () => {
       ALTER TABLE packages ADD COLUMN IF NOT EXISTS season VARCHAR(30);
       ALTER TABLE packages ADD COLUMN IF NOT EXISTS admin_status_reason TEXT;
     `);
+
+    // Package statistics for the company: shares are counted each time, views once per viewer per day
+    await pool.query(`
+      ALTER TABLE packages ADD COLUMN IF NOT EXISTS views_count INT NOT NULL DEFAULT 0;
+      ALTER TABLE packages ADD COLUMN IF NOT EXISTS shares_count INT NOT NULL DEFAULT 0;
+      CREATE TABLE IF NOT EXISTS package_views (
+        package_id VARCHAR(16) NOT NULL REFERENCES packages(id) ON DELETE CASCADE,
+        viewer_key VARCHAR(64) NOT NULL,
+        view_date DATE NOT NULL DEFAULT CURRENT_DATE,
+        PRIMARY KEY (package_id, viewer_key, view_date)
+      );
+      CREATE INDEX IF NOT EXISTS idx_package_views_date ON package_views(view_date);
+    `);
     // Packages had no reviews of their own; they show their company's rating
     await pool.query(`UPDATE packages p SET rating = COALESCE(c.rating, 0) FROM companies c WHERE p.company_id = c.id AND p.rating IS DISTINCT FROM COALESCE(c.rating, 0);`);
 

@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { pool } from '../config/db';
+import { AuthRequest } from '../middlewares/security.middleware';
 import { formatPackageId, formatCompanyId, parseIdOrToken } from '../utils/formatId';
 import { enrichPackage, PACKAGE_EXTRA_COLUMNS } from '../utils/packageInfo';
 import { companyReadySql } from '../utils/companyReadiness';
@@ -298,5 +299,53 @@ export const updatePackageStatusByAdmin = async (req: Request, res: Response): P
   } catch (error: any) {
     console.error('Error updating package status:', error);
     res.status(500).json({ error: 'فشل تغيير حالة الباقة' });
+  }
+};
+
+// The package a customer-facing id or public token points to, while customers can see it.
+// Visits and shares by the company's own owner and team are not counted.
+const findTrackablePackage = async (req: AuthRequest): Promise<string | null> => {
+  const rawId = String(req.params.id);
+  const parsed = parseIdOrToken(rawId);
+  const viewerId = String(req.user?.id || '');
+  const result = await pool.query(
+    `SELECT p.id FROM packages p JOIN companies c ON p.company_id = c.id
+     WHERE (p.public_id = $1 OR p.id = $2)
+       AND (p.status = 'active' OR p.status IS NULL)
+       AND c.user_id IS DISTINCT FROM $3
+       AND NOT EXISTS (SELECT 1 FROM company_members cm WHERE cm.company_id = c.id AND cm.user_id = $3)
+     LIMIT 1`,
+    [parsed.isToken ? parsed.value : rawId, parsed.isToken ? '' : parsed.value, viewerId]
+  );
+  return result.rows[0]?.id || null;
+};
+
+// Tracking never fails the customer's screen, so errors are logged and answered quietly
+export const trackPackageView = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const viewerKey = String(req.user?.id || '').slice(0, 64);
+    const packageId = viewerKey ? await findTrackablePackage(req) : null;
+    if (packageId) {
+      const inserted = await pool.query(
+        'INSERT INTO package_views (package_id, viewer_key) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [packageId, viewerKey]
+      );
+      if (inserted.rowCount) await pool.query('UPDATE packages SET views_count = views_count + 1 WHERE id = $1', [packageId]);
+    }
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Package view tracking error:', error);
+    res.json({ success: false });
+  }
+};
+
+export const trackPackageShare = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const packageId = await findTrackablePackage(req);
+    if (packageId) await pool.query('UPDATE packages SET shares_count = shares_count + 1 WHERE id = $1', [packageId]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Package share tracking error:', error);
+    res.json({ success: false });
   }
 };

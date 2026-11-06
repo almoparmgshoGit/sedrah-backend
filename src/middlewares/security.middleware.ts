@@ -70,9 +70,11 @@ export interface AuthRequest extends Request {
 
 // Helper to check if a route is in the Guest Allowlist
 const isGuestAllowedRoute = (method: string, originalUrl: string): boolean => {
-  if (method !== 'GET') return false;
-
   const pathName = originalUrl.split('?')[0];
+
+  // Visitors browsing without an account still count towards a package's views and shares
+  if (method === 'POST') return /^\/api\/packages\/[^/]+\/(view|share)$/.test(pathName);
+  if (method !== 'GET') return false;
 
   const allowedPrefixes = [
     '/api/public/settings',

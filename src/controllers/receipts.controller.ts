@@ -8,12 +8,12 @@ import { logAudit } from '../utils/auditLogger';
 import { notifyCompanyTeam } from '../utils/companyAccess';
 
 /*
- * Payment receipts are verified by the platform alone. The company sees the receipt of its own bookings,
- * but only an admin with the "receipts" permission approves or rejects it, since approval confirms the
+ * Only the customer uploads a payment receipt, after paying at the company's office. The company sees the
+ * receipt of its own bookings, but only an admin with the "receipts" permission approves or rejects it, since approval confirms the
  * booking and records the platform commission.
  */
 
-type ReceiptActor = { id: string | null; name: string; type: 'customer' | 'company' | 'admin' | 'system' };
+type ReceiptActor = { id: string | null; name: string; type: 'customer' | 'admin' | 'system' };
 
 const addHistory = async (
   db: { query: (text: string, params?: any[]) => Promise<any> },
@@ -50,15 +50,16 @@ const companyOwnerOf = async (bookingId: string): Promise<{ userId: string | nul
 };
 
 /**
- * Puts a receipt into the admin review queue. The caller has already checked who may submit it and that
- * the file belongs to them; this only enforces the booking state and records the submission.
+ * Puts the customer's receipt into the admin review queue. The caller has already checked that the booking
+ * is the customer's, that it awaits payment and that the file is theirs; this records the submission.
  */
 export const submitReceiptForReview = async (
   booking: any,
   receiptUrl: string,
   paidAmount: number | null,
-  actor: ReceiptActor
+  customer: { id: string; name: string }
 ): Promise<any> => {
+  const actor: ReceiptActor = { id: customer.id, name: customer.name, type: 'customer' };
   const result = await pool.query(
     `UPDATE bookings
      SET status = 'receipt_review',
@@ -71,10 +72,10 @@ export const submitReceiptForReview = async (
          receipt_reviewed_at = NULL,
          receipt_reviewed_by = NULL,
          receipt_verified_amount = NULL,
-         receipt_uploaded_by = $4
+         receipt_uploaded_by = 'customer'
      WHERE id = $2
      RETURNING *`,
-    [receiptUrl, booking.id, paidAmount, actor.type]
+    [receiptUrl, booking.id, paidAmount]
   );
   const updated = result.rows[0];
 
@@ -92,33 +93,16 @@ export const submitReceiptForReview = async (
 
   await addHistory(pool, booking.id, 'submitted', actor, { receiptUrl, paidAmount });
 
+  // The company follows along; it cannot act on the receipt
   const owner = await companyOwnerOf(booking.id);
   if (owner.companyId) {
-    // The team member who uploaded it does not need to hear about their own upload
-    await notifyCompanyTeam(
-      owner.companyId,
-      'orders.view',
-      {
-        title: 'إيصال دفع جديد',
-        subtitle: `${actor.type === 'company' ? `رفع ${actor.name}` : 'رفع العميل'} إيصال الدفع للحجز #${updated.booking_reference}، وهو الآن قيد مراجعة إدارة سدرة.`,
-        category: 'booking',
-        icon: 'receipt-outline',
-        iconBg: '#EFF6FF',
-        iconColor: '#2563EB',
-        data: { type: 'receipt_uploaded', bookingId: updated.id, bookingRef: updated.booking_reference },
-      },
-      actor.type === 'company' ? actor.id : null
-    );
-  }
-  if (actor.type === 'company') {
-    await createAndSendNotification({
-      userId: updated.user_id,
-      title: 'تم رفع إيصال الدفع',
-      subtitle: `رفعت ${owner.companyName || 'الشركة'} إيصال الدفع لحجزك #${updated.booking_reference}، وهو الآن قيد مراجعة إدارة سدرة.`,
+    await notifyCompanyTeam(owner.companyId, 'orders.view', {
+      title: 'إيصال دفع جديد',
+      subtitle: `رفع العميل إيصال الدفع للحجز #${updated.booking_reference}، وهو الآن قيد مراجعة إدارة سدرة.`,
       category: 'booking',
-      icon: 'document-text-outline',
+      icon: 'receipt-outline',
       iconBg: '#EFF6FF',
-      iconColor: '#3B82F6',
+      iconColor: '#2563EB',
       data: { type: 'receipt_uploaded', bookingId: updated.id, bookingRef: updated.booking_reference },
     });
   }

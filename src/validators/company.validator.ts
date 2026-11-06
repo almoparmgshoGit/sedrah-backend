@@ -119,13 +119,6 @@ export const cancelOrderSchema = z
   .object({ reason: shortText(500).min(2, 'اكتب سبب الإلغاء للعميل') })
   .strict();
 
-// The company only uploads; approving a receipt belongs to the platform
-export const companyReceiptSchema = z
-  .object({
-    receiptUrl: fileLink.min(1, 'أرفق صورة الإيصال'),
-    paidAmount: z.union([z.literal(''), z.string().regex(/^\d{1,8}(\.\d{1,2})?$/, 'المبلغ المدفوع غير صحيح')]).optional(),
-  })
-  .strict();
 
 export const updateStageSchema = z
   .object({

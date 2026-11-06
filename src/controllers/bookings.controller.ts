@@ -429,7 +429,6 @@ export const updateBookingReceipt = async (req: Request, res: Response): Promise
     const booking = await submitReceiptForReview(bookingRecord, finalReceiptUrl, parsedPaidAmount, {
       id: String(userId),
       name: customer.rows[0]?.name || 'العميل',
-      type: 'customer',
     });
 
     await createAndSendNotification({

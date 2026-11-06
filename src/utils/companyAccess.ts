@@ -26,7 +26,6 @@ export const COMPANY_PERMISSION_GROUPS: PermissionGroup[] = [
     permissions: [
       { key: 'orders.view', label: 'عرض طلبات الحجز وتفاصيلها' },
       { key: 'orders.manage', label: 'قبول الطلبات ورفضها وإلغاؤها', description: 'يشمل تذكير العميل بالدفع' },
-      { key: 'orders.receipts', label: 'رفع إيصال الدفع نيابة عن العميل' },
       { key: 'orders.view_amounts', label: 'رؤية أسعار الحجوزات والمبالغ المدفوعة' },
     ],
   },
@@ -136,7 +135,7 @@ const DEFAULT_ROLES: Array<{ name: string; description: string; color: string; p
     description: 'متابعة الطلبات والرحلات والمواعيد',
     color: '#2563EB',
     permissions: [
-      'orders.view', 'orders.manage', 'orders.receipts', 'orders.view_amounts', 'trips.view', 'trips.stages',
+      'orders.view', 'orders.manage', 'orders.view_amounts', 'trips.view', 'trips.stages',
       'packages.view', 'clients.view', 'clients.contact', 'clients.notes', 'clients.documents',
       'chats.view', 'chats.reply', 'appointments.view', 'appointments.manage',
     ],
@@ -151,7 +150,7 @@ const DEFAULT_ROLES: Array<{ name: string; description: string; color: string; p
     name: 'محاسب',
     description: 'متابعة المدفوعات والمبيعات',
     color: '#7C3AED',
-    permissions: ['orders.view', 'orders.view_amounts', 'orders.receipts', 'finance.view', 'packages.view'],
+    permissions: ['orders.view', 'orders.view_amounts', 'finance.view', 'packages.view'],
   },
 ];
 

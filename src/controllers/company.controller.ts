@@ -7,7 +7,6 @@ import { createAndSendNotification } from '../utils/notificationHelper';
 import { logAudit } from '../utils/auditLogger';
 import { resolveUserUpload } from '../utils/uploadAccess';
 import { updateBookingStatusByAdmin } from './admin.controller';
-import { submitReceiptForReview } from './receipts.controller';
 import {
   CompanyAccess,
   COMPANY_PERMISSION_GROUPS,
@@ -686,35 +685,6 @@ const isAwaitingPayment = async (booking: any): Promise<boolean> => {
     [booking.id]
   );
   return visit.rows.length > 0;
-};
-
-// A client who paid at the office may hand the receipt to the company; it still goes to the platform for review
-export const uploadCompanyReceipt = async (req: CompanyRequest, res: Response): Promise<void> => {
-  try {
-    const booking = req.booking;
-    if (!(await isAwaitingPayment(booking))) {
-      res.status(409).json({ error: 'لا يمكن رفع إيصال لهذا الطلب في حالته الحالية' });
-      return;
-    }
-    if (booking.receipt_status === 'rejected' && booking.allow_retry === false) {
-      res.status(409).json({ error: 'أغلقت الإدارة هذا الحجز ولا يمكن رفع إيصال جديد' });
-      return;
-    }
-
-    const receiptUrl = await resolveUserUpload(req.body.receiptUrl, req, req.user!.id, null);
-    if (!receiptUrl) {
-      res.status(400).json({ error: 'يرجى إرفاق صورة إيصال صالحة' });
-      return;
-    }
-    const paidAmount = req.body.paidAmount ? Number(req.body.paidAmount) : null;
-
-    await submitReceiptForReview(booking, receiptUrl, paidAmount, { id: String(req.user!.id), name: req.actor?.name || req.company.name, type: 'company' });
-    await activity(req, 'receipt_uploaded', `رفع إيصال الدفع للحجز #${booking.booking_reference}`, 'order', booking.id);
-    res.json({ success: true, message: 'تم رفع الإيصال وإرساله لمراجعة إدارة سدرة', data: await readOrder(booking.id, req.company.id) });
-  } catch (error) {
-    console.error('Company receipt upload error:', error);
-    res.status(500).json({ error: 'تعذر رفع الإيصال' });
-  }
 };
 
 // Before payment the company may still withdraw; after a receipt is sent only the platform decides

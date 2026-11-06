@@ -43,7 +43,6 @@ router.get('/orders', can('orders.view', 'trips.view'), company.getCompanyOrders
 router.get('/orders/:id', can('orders.view', 'trips.view'), booking, company.getCompanyOrderDetails as any);
 router.post('/orders/:id/accept', can('orders.manage'), booking, company.acceptCompanyOrder as any);
 router.post('/orders/:id/reject', can('orders.manage'), body(schemas.rejectOrderSchema), booking, company.rejectCompanyOrder as any);
-router.post('/orders/:id/receipt-upload', authLimiter, can('orders.receipts'), body(schemas.companyReceiptSchema), booking, company.uploadCompanyReceipt as any);
 router.post('/orders/:id/cancel', can('orders.manage'), body(schemas.cancelOrderSchema), booking, company.cancelCompanyOrder as any);
 router.post('/orders/:id/remind-payment', authLimiter, can('orders.manage'), booking, company.remindCompanyOrderPayment as any);
 router.post('/orders/:id/stages/:stageId/complete', can('trips.stages'), body(schemas.updateStageSchema), booking, company.completeCompanyStage as any);

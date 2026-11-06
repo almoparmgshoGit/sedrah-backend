@@ -6,8 +6,6 @@ import { generate16CharId } from '../utils/formatId';
 import { createAndSendNotification } from '../utils/notificationHelper';
 import { logAudit } from '../utils/auditLogger';
 import { normalizeUploadUrl, resolveUserUpload } from '../utils/uploadAccess';
-import { readTravelers, saveTravelers, TravelerError, travelersComplete } from '../utils/bookingTravelers';
-import { FORM_FIELDS, MAX_CUSTOM_QUESTIONS, METHOD_LABELS, parseBookingForm } from '../utils/bookingForm';
 import { updateBookingStatusByAdmin } from './admin.controller';
 import {
   CompanyAccess,
@@ -62,8 +60,7 @@ export const can = (...permissions: string[]) => (req: CompanyRequest, res: Resp
 // Fields a member sees only with the matching permission. Removing them from every response keeps
 // the rule in one place instead of in each endpoint.
 const AMOUNT_FIELDS = ['total_price', 'paid_amount', 'receipt_verified_amount'];
-const CONTACT_FIELDS = ['client_phone', 'customer_phone', 'customer_whatsapp', 'customer_email'];
-const PASSPORT_FIELDS = ['passport_number', 'passport_image_url', 'birth_date', 'passport_expiry', 'national_id'];
+const CONTACT_FIELDS = ['client_phone', 'customer_phone'];
 
 const stripFields = (value: any, fields: Set<string>): any => {
   if (Array.isArray(value)) return value.map((item) => stripFields(item, fields));
@@ -88,10 +85,7 @@ export const redactForMember = (req: CompanyRequest, res: Response, next: NextFu
     // In client records "phone" and "email" are the customer's own
     if (req.path.startsWith('/clients')) ['phone', 'email'].forEach((key) => hidden.add(key));
   }
-  if (!access.permissions.includes('clients.documents')) {
-    if (req.path.startsWith('/clients')) hidden.add('documents');
-    PASSPORT_FIELDS.forEach((key) => hidden.add(key));
-  }
+  if (!access.permissions.includes('clients.documents') && req.path.startsWith('/clients')) hidden.add('documents');
   if (hidden.size === 0) {
     next();
     return;
@@ -169,7 +163,6 @@ const ORDER_COLUMNS = `
   b.id, b.booking_reference, b.status, b.room_type, b.travelers_count, b.children_count, b.total_price, b.paid_amount,
   b.notes, b.created_at, b.receipt_url, b.receipt_status, b.rejection_reason, b.cancellation_reason, b.cancelled_by,
   b.allow_retry, b.receipt_submitted_at, b.receipt_reviewed_at, b.receipt_uploaded_by,
-  b.booking_method, b.customer_whatsapp, b.customer_email, b.national_id, b.custom_answers,
   b.appointment_date, b.appointment_time, b.appointment_status, b.user_id,
   COALESCE(b.customer_name, u.name) AS client_name, COALESCE(b.customer_phone, u.phone) AS client_phone,
   COALESCE(b.governorate, u.city) AS client_city, b.district AS client_district,
@@ -709,8 +702,7 @@ const readOrder = async (bookingId: string, companyId: string) => {
      FROM trip_stages WHERE booking_id = $1 ORDER BY stage_order`,
     [bookingId]
   );
-  const travelers = await readTravelers(bookingId);
-  return { ...order.rows[0], stages: stages.rows, travelers, travelers_complete: travelersComplete(order.rows[0] || {}, travelers) };
+  return { ...order.rows[0], stages: stages.rows };
 };
 
 export const getCompanyOrderDetails = async (req: CompanyRequest, res: Response): Promise<void> => {
@@ -735,7 +727,7 @@ export const acceptCompanyOrder = async (req: CompanyRequest, res: Response): Pr
       [booking.id]
     );
     if (done.rows.length === 0) {
-      res.status(409).json({ error: 'تم قبول هذا الطلب بالفعل' });
+      res.status(409).json({ error: 'سُجّلت زيارة هذا العميل بالفعل' });
       return;
     }
     await pool.query(
@@ -747,8 +739,8 @@ export const acceptCompanyOrder = async (req: CompanyRequest, res: Response): Pr
 
     await createAndSendNotification({
       userId: booking.user_id,
-      title: 'تم قبول طلب الحجز',
-      subtitle: `قبلت ${req.company.name} طلبك #${booking.booking_reference}. يرجى زيارة مكتب الشركة للدفع ثم رفع الإيصال.`,
+      title: 'تم تسجيل زيارتك',
+      subtitle: `سجّلت ${req.company.name} زيارتك للحجز #${booking.booking_reference}. يمكنك الآن رفع إيصال الدفع من تفاصيل الحجز.`,
       category: 'booking',
       icon: 'checkmark-circle-outline',
       iconBg: '#ECFDF5',
@@ -756,11 +748,11 @@ export const acceptCompanyOrder = async (req: CompanyRequest, res: Response): Pr
       data: { type: 'booking_status', status: 'accepted', bookingRef: booking.booking_reference },
     });
 
-    await activity(req, 'order_accepted', `قبل طلب الحجز #${booking.booking_reference}`, 'order', booking.id);
-    res.json({ success: true, message: 'تم قبول الطلب', data: await readOrder(booking.id, req.company.id) });
+    await activity(req, 'order_accepted', `سجّل زيارة العميل للحجز #${booking.booking_reference}`, 'order', booking.id);
+    res.json({ success: true, message: 'تم تسجيل الزيارة، ويمكن للعميل الآن رفع إيصال الدفع', data: await readOrder(booking.id, req.company.id) });
   } catch (error) {
     console.error('Accept order error:', error);
-    res.status(500).json({ error: 'تعذر قبول الطلب' });
+    res.status(500).json({ error: 'تعذر تسجيل الزيارة' });
   }
 };
 
@@ -1185,18 +1177,9 @@ export const getCompanyClientDetails = async (req: CompanyRequest, res: Response
       [companyName, clientId]
     );
     const documents = await pool.query(
-      // Passports the travelers entered, then any other documents linked to the client's bookings
-      `SELECT * FROM (
-         SELECT bt.id, bt.full_name AS traveler_name, 'جواز سفر' AS document_type,
-           COALESCE(bt.passport_number, 'رقم الجواز ناقص') AS status,
-           bt.passport_expiry AS valid_until, bt.passport_image_url AS file_url, b.booking_reference, bt.created_at
-         FROM booking_travelers bt JOIN bookings b ON bt.booking_id = b.id JOIN packages p ON b.package_id = p.id
-         WHERE p.company_id = $1 AND b.user_id = $2
-         UNION ALL
-         SELECT d.id, d.traveler_name, d.document_type, d.status, d.valid_until::text, d.file_url, b.booking_reference, d.created_at
-         FROM documents d JOIN bookings b ON d.booking_id = b.id JOIN packages p ON b.package_id = p.id
-         WHERE p.company_id = $1 AND b.user_id = $2
-       ) docs ORDER BY created_at DESC`,
+      `SELECT d.id, d.traveler_name, d.document_type, d.status, d.valid_until, d.file_url, b.booking_reference
+       FROM documents d JOIN bookings b ON d.booking_id = b.id JOIN packages p ON b.package_id = p.id
+       WHERE p.company_id = $1 AND b.user_id = $2 ORDER BY d.created_at DESC`,
       [companyId, clientId]
     );
     const note = await pool.query('SELECT note FROM company_client_notes WHERE company_id = $1 AND user_id = $2', [companyId, clientId]);
@@ -1567,94 +1550,5 @@ export const cancelCompanyAppointment = async (req: CompanyRequest, res: Respons
   } catch (error) {
     console.error('Cancel appointment error:', error);
     res.status(500).json({ error: 'تعذر إلغاء الموعد' });
-  }
-};
-
-// ───── Travelers ─────
-
-// The company completes or corrects the travelers after seeing their passports at the office
-export const updateCompanyOrderTravelers = async (req: CompanyRequest, res: Response): Promise<void> => {
-  try {
-    const booking = req.booking;
-    if (['cancelled', 'completed'].includes(booking.status)) {
-      res.status(409).json({ error: 'لا يمكن تعديل المسافرين في حجز ملغي أو مكتمل' });
-      return;
-    }
-    const travelers = await saveTravelers(req, booking, req.body.travelers, { userId: String(req.user!.id), type: 'company' });
-    await activity(req, 'travelers_updated', `حدّث بيانات المسافرين في الحجز #${booking.booking_reference} (${travelers.length} مسافر)`, 'order', booking.id);
-    res.json({ success: true, message: 'تم حفظ بيانات المسافرين', data: await readOrder(booking.id, req.company.id) });
-  } catch (error) {
-    if (error instanceof TravelerError) {
-      res.status(400).json({ error: error.message });
-      return;
-    }
-    console.error('Company travelers error:', error);
-    res.status(500).json({ error: 'تعذر حفظ بيانات المسافرين' });
-  }
-};
-
-// Asks the customer to enter the travelers' names and passports; at most once a day per booking
-export const requestOrderTravelers = async (req: CompanyRequest, res: Response): Promise<void> => {
-  try {
-    const booking = req.booking;
-    const recent = await pool.query(
-      `SELECT 1 FROM notifications WHERE user_id = $1 AND created_at > NOW() - INTERVAL '24 hours' AND data::text LIKE $2 LIMIT 1`,
-      [booking.user_id, `%"travelers_requested"%${booking.booking_reference}%`]
-    );
-    if (recent.rows.length > 0) {
-      res.status(429).json({ error: 'تم إرسال الطلب لهذا العميل خلال آخر 24 ساعة' });
-      return;
-    }
-    await createAndSendNotification({
-      userId: booking.user_id,
-      title: 'مطلوب بيانات المسافرين',
-      subtitle: `تطلب ${req.company.name} أسماء المسافرين وبيانات جوازات السفر لحجزك #${booking.booking_reference} لاستخراج التأشيرات. أضفها من تفاصيل الحجز.`,
-      category: 'booking',
-      icon: 'people-outline',
-      iconBg: '#FFFBEB',
-      iconColor: '#D97706',
-      data: { type: 'travelers_requested', bookingId: booking.id, bookingRef: booking.booking_reference },
-    });
-    await activity(req, 'travelers_requested', `طلب بيانات المسافرين للحجز #${booking.booking_reference}`, 'order', booking.id);
-    res.json({ success: true, message: 'تم إرسال الطلب للعميل' });
-  } catch (error) {
-    console.error('Request travelers error:', error);
-    res.status(500).json({ error: 'تعذر إرسال الطلب' });
-  }
-};
-
-// ───── Booking form ─────
-
-export const getCompanyBookingForm = async (req: CompanyRequest, res: Response): Promise<void> => {
-  const form = parseBookingForm(req.company.booking_form);
-  res.json({
-    success: true,
-    data: {
-      ...form,
-      available_fields: FORM_FIELDS.map(({ key, label, default: fallback }) => ({ key, label, default: fallback })),
-      method_labels: METHOD_LABELS,
-      max_custom: MAX_CUSTOM_QUESTIONS,
-      contact: { whatsapp: req.company.whatsapp || null, phone: req.company.phone || req.company.landline_phone || null, address: req.company.address || null },
-    },
-  });
-};
-
-export const updateCompanyBookingForm = async (req: CompanyRequest, res: Response): Promise<void> => {
-  try {
-    // Parsing drops unknown fields and modes, so only valid settings are stored
-    const form = parseBookingForm(req.body);
-    await pool.query('UPDATE companies SET booking_form = $1 WHERE id = $2', [JSON.stringify(form), req.company.id]);
-    const off = (['whatsapp', 'phone', 'office'] as const).filter((method) => !form.methods[method]).map((method) => METHOD_LABELS[method]);
-    await activity(
-      req,
-      'booking_form_updated',
-      `عدّل نموذج الحجز (${form.custom.length} سؤال إضافي${off.length ? ` · أوقف: ${off.join('، ')}` : ''})`,
-      'company',
-      req.company.id
-    );
-    res.json({ success: true, message: 'تم حفظ نموذج الحجز', data: form });
-  } catch (error) {
-    console.error('Booking form error:', error);
-    res.status(500).json({ error: 'تعذر حفظ نموذج الحجز' });
   }
 };

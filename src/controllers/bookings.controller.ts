@@ -1,15 +1,12 @@
 import { Request, Response } from 'express';
 import crypto from 'crypto';
 import { pool } from '../config/db';
-import { io } from '../server';
 import { parseIdOrToken, generate16CharId } from '../utils/formatId';
-import { isVisitSlotAvailable, suggestAppointmentForBooking } from '../utils/appointmentEngine';
-import { BOOKING_METHODS, BookingFormError, BookingFormValues, BookingMethod, METHOD_LABELS, parseBookingForm, validateBookingSubmission } from '../utils/bookingForm';
+import { suggestAppointmentForBooking } from '../utils/appointmentEngine';
 import { createAndSendNotification } from '../utils/notificationHelper';
 import { resolveUserUpload } from '../utils/uploadAccess';
 import { submitReceiptForReview } from './receipts.controller';
 import { BookingPriceError, calculateBookingTotal } from '../utils/packageInfo';
-import { readTravelers, saveTravelers, TravelerError, travelersBodySchema, travelersComplete } from '../utils/bookingTravelers';
 import { notifyCompanyTeam } from '../utils/companyAccess';
 
 
@@ -60,7 +57,14 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       return;
     }
 
-    const method: BookingMethod = BOOKING_METHODS.includes(bookingMethod) ? bookingMethod : 'sidra';
+    const customerName = cleanText(req.body.customerName, 255);
+    const customerPhone = cleanText(req.body.customerPhone, 50);
+    const governorate = cleanText(req.body.governorate, 255);
+    const district = cleanText(req.body.district, 255);
+    if (customerPhone && !/^\+?[0-9\s-]{7,20}$/.test(customerPhone)) {
+      res.status(400).json({ error: 'رقم الهاتف غير صالح' });
+      return;
+    }
 
     const parsedPkg = parseIdOrToken(packageId);
     let resolvedPackageId = parsedPkg.value;
@@ -81,45 +85,6 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       return;
     }
     const companyId = pkgRes.rows[0].company_id;
-    const companyRes = await pool.query('SELECT name, address, booking_form FROM companies WHERE id = $1', [companyId]);
-    const company = companyRes.rows[0] || {};
-    const bookingForm = parseBookingForm(company.booking_form);
-    if (!bookingForm.methods[method]) {
-      res.status(400).json({ error: `الشركة لا تستقبل الحجز عن طريق ${METHOD_LABELS[method]}` });
-      return;
-    }
-
-    // The customer's details, checked against the fields this company asks for
-    let formValues: BookingFormValues;
-    try {
-      formValues = validateBookingSubmission(bookingForm, req.body, method, {
-        adults: travelersCount - childrenCount,
-        children: childrenCount,
-      });
-    } catch (formError) {
-      if (formError instanceof BookingFormError) {
-        res.status(400).json({ error: formError.message });
-        return;
-      }
-      throw formError;
-    }
-    const customerName = formValues.customer_name;
-    const customerPhone = formValues.customer_phone;
-    const governorate = formValues.governorate;
-    const district = formValues.district;
-
-    // A visit time the customer picked must still be free; off-app bookings always pick one
-    const preferredDate = cleanText(req.body.visitDate, 10);
-    const preferredTime = cleanText(req.body.visitTime, 20);
-    const pickedVisit = Boolean(preferredDate && preferredTime);
-    if (method !== 'sidra' && !pickedVisit) {
-      res.status(400).json({ error: 'اختر موعد زيارة مكتب الشركة' });
-      return;
-    }
-    if (pickedVisit && !(await isVisitSlotAvailable(companyId, preferredDate!, preferredTime!))) {
-      res.status(409).json({ error: 'هذا الموعد لم يعد متاحاً، اختر موعداً آخر', code: 'SLOT_TAKEN' });
-      return;
-    }
 
     const childrenTotal = childrenCount;
     const adultsTotal = travelersCount - childrenCount;
@@ -162,8 +127,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
     }
 
     // Suggest appointment for booking
-    // The time the customer picked, or the first free one the scheduling system finds
-    let suggestedAppt = pickedVisit ? { date: preferredDate!, time: preferredTime! } : await suggestAppointmentForBooking(companyId);
+    let suggestedAppt = await suggestAppointmentForBooking(companyId);
     if (!suggestedAppt) {
       const tomorrow = new Date();
       tomorrow.setDate(tomorrow.getDate() + 1);
@@ -214,7 +178,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
     const currentDate = new Date().toLocaleDateString('ar-EG', { month: 'long', day: 'numeric', year: 'numeric' });
 
     const apptSubtitle = suggestedAppt
-      ? `${pickedVisit ? 'موعد الزيارة' : 'الموعد المقترح للزيارة'}: ${suggestedAppt.date} الساعة ${suggestedAppt.time}`
+      ? `الموعد المقترح للزيارة: ${suggestedAppt.date} الساعة ${suggestedAppt.time}`
       : 'يرجى مراجعة الشركة لتأكيد موعد الزيارة';
 
     // Seed default trip tracking stages
@@ -235,24 +199,23 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
     try {
       await client.query('BEGIN');
       result = await client.query(
-        `INSERT INTO bookings (id, user_id, package_id, booking_reference, status, booking_method, room_type, travelers_count, children_count, total_price, notes, appointment_date, appointment_time, appointment_status, commission_amount, commission_method_used, commission_rate_used, customer_name, customer_phone, governorate, district, customer_whatsapp, customer_email, national_id, custom_answers)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25) RETURNING *`,
+        `INSERT INTO bookings (id, user_id, package_id, booking_reference, status, booking_method, room_type, travelers_count, children_count, total_price, notes, appointment_date, appointment_time, appointment_status, commission_amount, commission_method_used, commission_rate_used, customer_name, customer_phone, governorate, district)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) RETURNING *`,
         [
           newBookingId,
           userId,
           resolvedPackageId,
           bookingRef,
           'new',
-          method,
+          cleanText(bookingMethod, 50) || 'sidra',
           roomType,
           travelersCount,
           childrenCount,
           totalPrice,
-          formValues.notes || '',
+          cleanText(notes, 2000) || '',
           suggestedAppt ? suggestedAppt.date : null,
           suggestedAppt ? suggestedAppt.time : null,
-          // A time the customer chose is already agreed; a suggested one waits for the customer to confirm
-          suggestedAppt ? (pickedVisit ? 'confirmed' : 'suggested') : 'none',
+          suggestedAppt ? 'suggested' : 'none',
           commissionAmount,
           commissionMethod,
           rateUsedDesc,
@@ -260,28 +223,23 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
           customerPhone,
           governorate,
           district,
-          formValues.whatsapp,
-          formValues.email,
-          formValues.national_id,
-          formValues.custom_answers.length ? JSON.stringify(formValues.custom_answers) : null,
         ]
       );
 
       // The visit also appears in the company's appointments, where it is confirmed, moved or marked attended
       if (suggestedAppt) {
+        const companyRow = await client.query('SELECT name, address FROM companies WHERE id = $1', [companyId]);
         await client.query(
           `INSERT INTO interview_appointments (id, user_id, company_name, title, appointment_date, appointment_time, location, notes, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, '', 'pending')`,
           [
             generate16CharId(),
             userId,
-            company.name,
+            companyRow.rows[0]?.name,
             `زيارة لإتمام الحجز #${bookingRef}`,
             suggestedAppt.date,
             suggestedAppt.time,
-            company.address || 'مقر الشركة',
-            method === 'sidra' ? '' : `الحجز عن طريق ${METHOD_LABELS[method]}`,
-            pickedVisit ? 'confirmed' : 'pending',
+            companyRow.rows[0]?.address || 'مقر الشركة',
           ]
         );
       }
@@ -308,32 +266,11 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       ).catch(() => {});
     }
 
-    // Traveler names asked for on the booking form start the booking's traveler list
-    if (formValues.travelers.length > 0) {
-      await saveTravelers(req, result.rows[0], formValues.travelers, { userId: String(userId), type: 'customer' }).catch((err) =>
-        console.error('Saving booking travelers failed:', err)
-      );
-    }
-
-    const visitText = suggestedAppt ? `${suggestedAppt.date} الساعة ${suggestedAppt.time}` : '';
-    // The platform sees every booking as it happens, including the ones that continue outside the app
-    if (io) {
-      io.to('staff').emit('booking_created', {
-        id: newBookingId,
-        booking_reference: bookingRef,
-        booking_method: method,
-        company_name: company.name,
-        customer_name: customerName,
-      });
-    }
     // Create real notification and send push for booking creation
     await createAndSendNotification({
       userId,
       title: 'تم إنشاء طلب حجز جديد',
-      subtitle:
-        method === 'sidra'
-          ? `تم استلام طلب حجزك برقم ${bookingRef} بنجاح. يرجى متابعة تفاصيل الحجز ورفع الإيصال.`
-          : `سُجّل حجزك #${bookingRef} عن طريق ${METHOD_LABELS[method]}. موعد زيارتك لمكتب ${company.name}: ${visitText}.`,
+      subtitle: `تم استلام طلب حجزك برقم ${bookingRef}. موعد زيارتك لمكتب الشركة: ${suggestedAppt ? `${suggestedAppt.date} الساعة ${suggestedAppt.time}` : "ستحدده الشركة"}. بعد الزيارة يمكنك رفع إيصال الدفع.`,
       category: 'الحجز',
       icon: 'checkmark-circle-outline',
       iconBg: 'bg-emerald-50 border-emerald-100',
@@ -343,11 +280,8 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
 
     // The company team that handles orders hears about the request right away
     await notifyCompanyTeam(companyId, 'orders.view', {
-      title: method === 'sidra' ? 'طلب حجز جديد' : `حجز جديد عن طريق ${METHOD_LABELS[method]}`,
-      subtitle:
-        method === 'sidra'
-          ? `وصل طلب حجز جديد #${bookingRef} (${travelersCount} مسافر). افتح الطلب لقبوله أو رفضه.`
-          : `${customerName} (${customerPhone}) سيتواصل معكم عن طريق ${METHOD_LABELS[method]} ويزور المكتب ${visitText}. الحجز #${bookingRef} · ${travelersCount} مسافر.`,
+      title: 'طلب حجز جديد',
+      subtitle: `وصل طلب حجز جديد #${bookingRef} (${travelersCount} مسافر)${suggestedAppt ? `، وموعد زيارة العميل للمكتب ${suggestedAppt.date} الساعة ${suggestedAppt.time}` : ""}. سجّل الزيارة عند حضوره.`,
       category: 'booking',
       icon: 'document-text-outline',
       iconBg: '#EFF6FF',
@@ -655,78 +589,5 @@ export const getBookingStages = async (req: Request, res: Response): Promise<voi
   } catch (error: any) {
     console.error('Error fetching booking stages:', error);
     res.status(500).json({ error: 'حدث خطأ أثناء جلب مراحل الرحلة' });
-  }
-};
-
-// ───── Travelers ─────
-
-const findCustomerBooking = async (req: Request) => {
-  const userId = (req as any).user?.id || (req as any).user?.userId;
-  const result = await pool.query(
-    `SELECT b.*, p.company_id FROM bookings b JOIN packages p ON b.package_id = p.id
-     WHERE (b.id::text = $1 OR b.booking_reference = $1) AND b.user_id = $2`,
-    [String(req.params.id), String(userId)]
-  );
-  return { userId: String(userId), booking: result.rows[0] || null };
-};
-
-export const getBookingTravelers = async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { booking } = await findCustomerBooking(req);
-    if (!booking) {
-      res.status(404).json({ error: 'الحجز غير موجود' });
-      return;
-    }
-    const travelers = await readTravelers(booking.id);
-    res.json({
-      success: true,
-      data: {
-        travelers,
-        adults_count: Number(booking.travelers_count || 0) - Number(booking.children_count || 0),
-        children_count: Number(booking.children_count || 0),
-        complete: travelersComplete(booking, travelers),
-        editable: !['cancelled', 'completed'].includes(booking.status),
-      },
-    });
-  } catch (error) {
-    console.error('Get travelers error:', error);
-    res.status(500).json({ error: 'تعذر جلب بيانات المسافرين' });
-  }
-};
-
-export const updateBookingTravelers = async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { userId, booking } = await findCustomerBooking(req);
-    if (!booking) {
-      res.status(404).json({ error: 'الحجز غير موجود' });
-      return;
-    }
-    if (['cancelled', 'completed'].includes(booking.status)) {
-      res.status(409).json({ error: 'لا يمكن تعديل المسافرين في حجز ملغي أو مكتمل' });
-      return;
-    }
-    const parsed = travelersBodySchema.safeParse(req.body);
-    if (!parsed.success) {
-      res.status(400).json({ error: parsed.error.errors[0]?.message || 'بيانات المسافرين غير صالحة' });
-      return;
-    }
-    const travelers = await saveTravelers(req, booking, parsed.data.travelers, { userId, type: 'customer' });
-    await notifyCompanyTeam(booking.company_id, 'orders.view', {
-      title: 'بيانات المسافرين',
-      subtitle: `حدّث العميل بيانات المسافرين للحجز #${booking.booking_reference} (${travelers.length} مسافر).`,
-      category: 'booking',
-      icon: 'people-outline',
-      iconBg: '#EFF6FF',
-      iconColor: '#2563EB',
-      data: { type: 'travelers_updated', bookingId: booking.id, bookingRef: booking.booking_reference },
-    }).catch(() => {});
-    res.json({ success: true, message: 'تم حفظ بيانات المسافرين', data: { travelers, complete: travelersComplete(booking, travelers) } });
-  } catch (error) {
-    if (error instanceof TravelerError) {
-      res.status(400).json({ error: error.message });
-      return;
-    }
-    console.error('Update travelers error:', error);
-    res.status(500).json({ error: 'تعذر حفظ بيانات المسافرين' });
   }
 };

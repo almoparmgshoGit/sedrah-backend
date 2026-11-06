@@ -1085,35 +1085,9 @@ export const initDB = async () => {
     // Travel instructions for a stage (meeting point and time before the airport, for example)
     await pool.query('ALTER TABLE trip_stages ADD COLUMN IF NOT EXISTS instructions TEXT;');
 
-    // The people travelling on a booking, entered by the customer or by the company at the office visit
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS booking_travelers (
-        id VARCHAR(16) PRIMARY KEY,
-        booking_id VARCHAR(16) REFERENCES bookings(id) ON DELETE CASCADE,
-        full_name VARCHAR(255) NOT NULL,
-        traveler_type VARCHAR(10) NOT NULL DEFAULT 'adult',
-        gender VARCHAR(10),
-        birth_date VARCHAR(10),
-        nationality VARCHAR(100),
-        passport_number VARCHAR(50),
-        passport_expiry VARCHAR(10),
-        passport_image_url TEXT,
-        added_by VARCHAR(20) NOT NULL DEFAULT 'customer',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    await pool.query('CREATE INDEX IF NOT EXISTS idx_booking_travelers_booking ON booking_travelers(booking_id);');
 
     // Each official company document has its own review status and rejection reason
     await pool.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS documents_review TEXT;');
-
-    // The fields a company asks for when booking through the app, and the booking methods it accepts
-    await pool.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS booking_form TEXT;');
-    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS customer_whatsapp VARCHAR(50);');
-    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS customer_email VARCHAR(255);');
-    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS national_id VARCHAR(30);');
-    await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS custom_answers TEXT;');
 
     // Settling the commission a company owes the platform
     await pool.query(`

@@ -5,7 +5,6 @@ import * as company from '../controllers/company.controller';
 import * as schemas from '../validators/company.validator';
 import * as team from '../controllers/companyTeam.controller';
 import * as support from '../controllers/companySupport.controller';
-import { travelersBodySchema } from '../utils/bookingTravelers';
 
 const router = Router();
 
@@ -50,11 +49,6 @@ router.post('/orders/:id/remind-payment', authLimiter, can('orders.manage'), boo
 router.post('/orders/:id/stages/:stageId/complete', can('trips.stages'), body(schemas.updateStageSchema), booking, company.saveCompanyStage as any);
 router.put('/orders/:id/stages/:stageId', can('trips.stages'), body(schemas.updateStageSchema), booking, company.saveCompanyStage as any);
 
-router.put('/orders/:id/travelers', can('orders.manage'), body(travelersBodySchema), booking, company.updateCompanyOrderTravelers as any);
-router.post('/orders/:id/request-travelers', authLimiter, can('orders.manage'), booking, company.requestOrderTravelers as any);
-
-router.get('/booking-form', company.getCompanyBookingForm as any);
-router.put('/booking-form', can('company.profile'), company.updateCompanyBookingForm as any);
 
 router.get('/finance', can('finance.view'), company.getCompanyFinance as any);
 router.get('/reviews', can('reviews.view', 'reviews.reply'), company.getCompanyReviews as any);

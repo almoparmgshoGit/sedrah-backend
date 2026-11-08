@@ -93,44 +93,8 @@ export async function sendPushToUsers(
       userIds
     );
 
-    let pushTokens = tokensResult.rows.map(r => r.token).filter(Boolean);
-
-    if (pushTokens.length === 0) {
-      console.log(`⚠️ لم يتم العثور على أجهزة مسجلة مسبقاً للمستخدمين: [${userIds.join(', ')}]، جاري البحث عن أجهزة نشطة احتياطية...`);
-      const fallbackResult = await pool.query(
-        `SELECT token FROM push_tokens 
-         WHERE (user_id IS NULL OR user_id IN (${placeholders})) AND is_active = true 
-         GROUP BY token 
-         ORDER BY MAX(updated_at) DESC LIMIT 10`,
-        userIds
-      );
-
-      pushTokens = fallbackResult.rows.map(r => r.token).filter(Boolean);
-
-      if (pushTokens.length > 0 && userIds.length === 1) {
-        try {
-          await pool.query(
-            `UPDATE push_tokens 
-             SET user_id = $1, updated_at = CURRENT_TIMESTAMP 
-             WHERE token = ANY($2::text[]) AND user_id IS NULL`,
-            [userIds[0], pushTokens]
-          );
-          console.log(`🔗 تم ربط (${pushTokens.length}) جهاز نشط تلقائياً بالمستخدم ${userIds[0]}`);
-        } catch (linkErr) {
-          console.error('Error auto-linking fallback tokens:', linkErr);
-        }
-      }
-
-      if (pushTokens.length === 0) {
-        const anyActiveResult = await pool.query(
-          `SELECT token FROM push_tokens WHERE is_active = true GROUP BY token ORDER BY MAX(updated_at) DESC LIMIT 5`
-        );
-        pushTokens = anyActiveResult.rows.map(r => r.token).filter(Boolean);
-        if (pushTokens.length > 0) {
-          console.log(`📲 تم استخدام أجهزة النظام النشطة كـ fallback للمستخدمين: [${userIds.join(', ')}] (${pushTokens.length} جهاز)`);
-        }
-      }
-    }
+    // Only devices signed in to these accounts; a user without one simply gets no push
+    const pushTokens = tokensResult.rows.map(r => r.token).filter(Boolean);
 
     if (pushTokens.length === 0) {
       console.log(`⚠️ لا توجد أي أجهزة نشطة متاحة حالياً للمستخدمين: [${userIds.join(', ')}]`);

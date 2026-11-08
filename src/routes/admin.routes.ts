@@ -55,11 +55,18 @@ import { updatePackageByAdmin, deletePackageByAdmin, updatePackageStatusByAdmin 
 import { sendNotificationByAdmin, getAllAdminNotifications, getPushTokenStats, deleteNotification } from '../controllers/notifications.controller';
 import { authenticate, authorize, idempotencyMiddleware } from '../middlewares/security.middleware';
 import { requireModulePermission } from '../middlewares/permission.middleware';
+import { listAdminAlerts, getAdminAlertsSummary, markAdminAlertRead, markAllAdminAlertsRead } from '../controllers/adminAlerts.controller';
 
 const router = Router();
 
 // All routes require authentication and admin/staff role
 router.use(authenticate, authorize(['admin', 'super_admin', 'support', 'moderator']));
+
+// Every admin sees the alerts of the modules it can open, so these routes filter by permission themselves
+router.get('/alerts', listAdminAlerts);
+router.get('/alerts/summary', getAdminAlertsSummary);
+router.patch('/alerts/read-all', markAllAdminAlertsRead);
+router.patch('/alerts/:id/read', markAdminAlertRead);
 
 router.get('/users-lookup', requireModulePermission('admins'), lookupUserByEmail);
 router.get('/users', requireModulePermission('users'), getAllUsers);

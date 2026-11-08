@@ -7,6 +7,7 @@ import { createAndSendNotification } from '../utils/notificationHelper';
 import { logAudit } from '../utils/auditLogger';
 import { normalizeUploadUrl, resolveUserUpload } from '../utils/uploadAccess';
 import { getCompanyReadiness } from '../utils/companyReadiness';
+import { createAdminAlert } from '../utils/adminAlerts';
 import { updateBookingStatusByAdmin } from './admin.controller';
 import {
   CompanyAccess,
@@ -228,7 +229,7 @@ export const getCompanyDashboard = async (req: CompanyRequest, res: Response): P
       [companyId]
     );
     const unread = await pool.query(
-      'SELECT COUNT(*)::int AS total FROM notifications WHERE user_id = $1 AND is_read = false',
+      "SELECT COUNT(*)::int AS total FROM notifications WHERE user_id = $1 AND is_read = false AND audience = 'company'",
       [req.user!.id]
     );
 
@@ -365,6 +366,19 @@ export const updateCompanyProfile = async (req: CompanyRequest, res: Response): 
       }
       await pool.query('UPDATE companies SET documents_review = $1 WHERE id = $2', [JSON.stringify(review), company.id]);
       if (io) io.to('staff').emit('company_documents_updated', { companyId: company.id });
+      if (replacedDocuments.some((field) => updates[field])) {
+        await createAdminAlert({
+          type: 'company_documents',
+          module: 'companies',
+          title: 'مستندات شركة بانتظار المراجعة',
+          body: `${company.name} رفعت أو عدّلت مستنداتها الرسمية`,
+          entityType: 'company',
+          entityId: company.id,
+          link: `/companies/${company.id}`,
+          requiresAction: true,
+          merge: true,
+        });
+      }
     }
 
     await activity(req, touchesDocuments ? 'documents_updated' : 'profile_updated', touchesDocuments ? 'عدّل المستندات الرسمية للشركة' : `عدّل بيانات الشركة (${columns.join('، ')})`, 'company', company.id);
@@ -830,9 +844,11 @@ export const remindCompanyOrderPayment = async (req: CompanyRequest, res: Respon
       return;
     }
     const recent = await pool.query(
-      `SELECT 1 FROM notifications WHERE user_id = $1 AND created_at > NOW() - INTERVAL '24 hours'
-         AND data::text LIKE $2 LIMIT 1`,
-      [booking.user_id, `%"payment_reminder"%${booking.booking_reference}%`]
+      `SELECT 1 FROM company_activity
+       WHERE company_id = $1 AND action = 'payment_reminder' AND target_type = 'order' AND target_id = $2
+         AND created_at > NOW() - INTERVAL '24 hours'
+       LIMIT 1`,
+      [req.company.id, booking.id]
     );
     if (recent.rows.length > 0) {
       res.status(429).json({ error: 'تم إرسال تذكير لهذا العميل خلال آخر 24 ساعة' });

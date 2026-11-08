@@ -6,6 +6,7 @@ import { generate16CharId } from '../utils/formatId';
 import { createAndSendNotification } from '../utils/notificationHelper';
 import { logAudit } from '../utils/auditLogger';
 import { notifyCompanyTeam } from '../utils/companyAccess';
+import { createAdminAlert, resolveAdminAlerts } from '../utils/adminAlerts';
 
 /*
  * Only the customer uploads a payment receipt, after paying at the company's office. The company sees the
@@ -106,6 +107,17 @@ export const submitReceiptForReview = async (
       data: { type: 'receipt_uploaded', bookingId: updated.id, bookingRef: updated.booking_reference },
     });
   }
+
+  await createAdminAlert({
+    type: 'receipt_submitted',
+    module: 'receipts',
+    title: 'إيصال دفع جديد بانتظار المراجعة',
+    body: `${customer.name || 'عميل'} رفع إيصال الحجز #${updated.booking_reference}${owner.companyName ? ` لدى ${owner.companyName}` : ''}`,
+    entityType: 'booking',
+    entityId: updated.id,
+    link: `/receipts?id=${updated.id}`,
+    requiresAction: true,
+  });
 
   if (io) io.to('staff').emit('receipt_submitted', { id: updated.id, booking_reference: updated.booking_reference });
   return updated;
@@ -423,6 +435,22 @@ export const reviewReceipt = async (req: AuthRequest, res: Response): Promise<vo
     null,
     { status: booking.status, receipt_status: booking.receipt_status, commission_amount: booking.commission_amount }
   );
+
+  // A reopened receipt goes back to the review queue; an approved or rejected one is handled
+  if (action === 'reopen') {
+    await createAdminAlert({
+      type: 'receipt_submitted',
+      module: 'receipts',
+      title: 'إيصال أُعيد للمراجعة',
+      body: `أعاد ${admin.name || admin.email} فتح مراجعة إيصال الحجز #${ref}`,
+      entityType: 'booking',
+      entityId: booking.id,
+      link: `/receipts?id=${booking.id}`,
+      requiresAction: true,
+    });
+  } else {
+    await resolveAdminAlerts('booking', booking.id, admin.name || admin.email, ['receipt_submitted']);
+  }
 
   if (io) io.to('staff').emit('receipt_reviewed', { id: booking.id, action });
   const messages: Record<string, string> = {

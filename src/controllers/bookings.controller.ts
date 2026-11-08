@@ -9,6 +9,7 @@ import { resolveUserUpload } from '../utils/uploadAccess';
 import { submitReceiptForReview } from './receipts.controller';
 import { BookingPriceError, calculateBookingTotal } from '../utils/packageInfo';
 import { notifyCompanyTeam } from '../utils/companyAccess';
+import { createAdminAlert } from '../utils/adminAlerts';
 
 
 const ROOM_TYPES = ['quad', 'triple', 'double', 'single'];
@@ -290,6 +291,17 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
       iconColor: '#2563EB',
       data: { type: 'new_booking', bookingRef, bookingId: newBookingId },
     }).catch(() => {});
+
+    // The company handles the booking; the admins are kept informed
+    await createAdminAlert({
+      type: 'booking_created',
+      module: 'bookings',
+      title: 'حجز جديد',
+      body: `${customerName || 'عميل'} حجز #${bookingRef} (${travelersCount} مسافر)`,
+      entityType: 'booking',
+      entityId: newBookingId,
+      link: `/bookings?id=${newBookingId}`,
+    });
 
     res.status(201).json({
       success: true,

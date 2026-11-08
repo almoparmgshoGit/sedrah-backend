@@ -248,6 +248,7 @@ export const updateMember = async (req: CompanyRequest, res: Response): Promise<
     if (member.user_id) {
       await createAndSendNotification({
         userId: member.user_id,
+        audience: 'company',
         title: status === 'suspended' ? `تم إيقاف حسابك في ${req.company.name}` : `تحديث عضويتك في ${req.company.name}`,
         subtitle: `تم تغيير ${changes.join('، ')}`,
         category: 'team',

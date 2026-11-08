@@ -5,6 +5,7 @@ import { generate16CharId } from '../utils/formatId';
 import { resolveUserUpload } from '../utils/uploadAccess';
 import { sendPushToUsers } from '../utils/pushNotification';
 import { logCompanyActivity } from '../utils/companyAccess';
+import { createAdminAlert, resolveAdminAlerts } from '../utils/adminAlerts';
 import type { CompanyRequest } from './company.controller';
 
 /*
@@ -96,6 +97,16 @@ export const createCompanyTicket = async (req: CompanyRequest, res: Response): P
       [generate16CharId(), chatId, req.user!.id, req.company.id, req.company.name, message, attachment || null, timeStr, req.actor?.name || null]
     );
     if (io) io.to('staff').emit('ticket_updated', created.rows[0]);
+    await createAdminAlert({
+      type: 'ticket_created',
+      module: 'support',
+      title: `تذكرة جديدة من شركة ${ticketNumber}`,
+      body: `${req.company.name}: ${title}`,
+      entityType: 'chat',
+      entityId: chatId,
+      link: `/chats?id=${chatId}`,
+      requiresAction: true,
+    });
     await notifyStaff('تذكرة جديدة من شركة', `${req.company.name}: ${title}`, { type: 'new_support_ticket', chatId, ticketNumber });
     await logCompanyActivity(req.company.id, req.actor || {}, 'ticket_created', `فتح تذكرة دعم ${ticketNumber}: ${title}`, 'ticket', chatId);
     res.status(201).json({ success: true, message: 'تم إرسال التذكرة لفريق دعم سدرة', data: { id: chatId, ticket_number: ticketNumber } });
@@ -171,6 +182,17 @@ export const sendCompanyTicketMessage = async (req: CompanyRequest, res: Respons
       io.to('staff').emit('ticket_updated', { id: ticket.id });
     }
     await notifyStaff(`رد من ${req.company.name}`, text.slice(0, 120), { type: 'chat_message', chatId: ticket.id });
+    await createAdminAlert({
+      type: 'ticket_message',
+      module: 'support',
+      title: `رد من ${req.company.name} على التذكرة ${ticket.ticket_number}`,
+      body: text.slice(0, 200),
+      entityType: 'chat',
+      entityId: ticket.id,
+      link: `/chats?id=${ticket.id}`,
+      requiresAction: true,
+      merge: true,
+    });
     res.status(201).json({ success: true, data: message });
   } catch (error) {
     console.error('Company ticket message error:', error);
@@ -187,6 +209,7 @@ export const closeCompanyTicket = async (req: CompanyRequest, res: Response): Pr
     }
     await pool.query(`UPDATE chats SET status = 'closed', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [ticket.id]);
     if (io) io.to('staff').emit('ticket_updated', { id: ticket.id, status: 'closed' });
+    await resolveAdminAlerts('chat', ticket.id, req.company.name);
     await logCompanyActivity(req.company.id, req.actor || {}, 'ticket_closed', `أغلق تذكرة الدعم ${ticket.ticket_number}`, 'ticket', ticket.id);
     res.json({ success: true, message: 'تم إغلاق التذكرة' });
   } catch (error) {

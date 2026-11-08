@@ -14,6 +14,8 @@ export interface NotificationPayload {
   statusKey?: string; // e.g. 'confirmed', 'shipped', 'delivered', etc.
   variables?: Record<string, any>;
   data?: Record<string, any>;
+  // 'company' shows in the company app only; everything else stays in the customer app
+  audience?: 'customer' | 'company';
 }
 
 /**
@@ -100,9 +102,9 @@ export async function createAndSendNotification(opts: NotificationPayload): Prom
 
     // 1. الحفظ في جدول الإشعارات الداخلية للتطبيق
     await pool.query(
-      `INSERT INTO notifications (id, user_id, title, subtitle, category, icon, icon_bg, icon_color, is_read)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)`,
-      [generate16CharId(), opts.userId, finalTitle, finalSubtitle, finalCategory, finalIcon, finalIconBg, finalIconColor]
+      `INSERT INTO notifications (id, user_id, title, subtitle, category, icon, icon_bg, icon_color, is_read, audience)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9)`,
+      [generate16CharId(), opts.userId, finalTitle, finalSubtitle, finalCategory, finalIcon, finalIconBg, finalIconColor, opts.audience || 'customer']
     );
 
     // 2. إرسال Push Notification حقيقي للجهاز (يظهر في لوحة إشعارات الهاتف)

@@ -6,6 +6,7 @@ import { notifyCompanyTeam, resolveCompanyAccess } from '../utils/companyAccess'
 import { logAudit } from '../utils/auditLogger';
 import { enrichPackage, PACKAGE_EXTRA_COLUMNS } from '../utils/packageInfo';
 import { companyReadySql } from '../utils/companyReadiness';
+import { createAdminAlert, resolveAdminAlerts } from '../utils/adminAlerts';
 import { formatCompanyId, formatPackageId, formatUserId, parseIdOrToken, generateRandomToken, generate16CharId } from '../utils/formatId';
 
 const findCompanyQuery = async (rawId: any) => {
@@ -409,6 +410,17 @@ export const addCompanyReview = async (req: AuthRequest, res: Response): Promise
     const rev = revRes.rows[0];
     const userRes = await pool.query('SELECT public_id FROM users WHERE id = $1', [userId]);
     const userPubId = userRes.rows[0]?.public_id;
+
+    await createAdminAlert({
+      type: 'review_created',
+      module: 'reviews',
+      title: result.rows.length > 0 ? 'تعديل تقييم شركة' : 'تقييم جديد',
+      body: `${'★'.repeat(rating)} لشركة ${compRes.rows[0].name || ''}${comment ? `: ${comment.slice(0, 120)}` : ''}`,
+      entityType: 'review',
+      entityId: rev.id,
+      link: '/reviews',
+      merge: true,
+    });
 
     rev.company_id = formatCompanyId(companyId, compRes.rows[0].public_id);
     rev.user_id = formatUserId(userId, userPubId);
@@ -857,6 +869,10 @@ export const reviewCompanyDocument = async (req: AuthRequest, res: Response): Pr
       reviewed_by: req.user?.email || 'الإدارة',
     };
     await pool.query('UPDATE companies SET documents_review = $1 WHERE id = $2', [JSON.stringify(review), company.id]);
+
+    // The alert stays open until every uploaded document has been reviewed
+    const stillPending = Object.values(review).some((r: any) => r?.status === 'pending');
+    if (!stillPending) await resolveAdminAlerts('company', company.id, req.user?.email || null, ['company_documents']);
 
     const label = COMPANY_DOCUMENT_LABELS[field];
     await notifyCompanyTeam(company.id, 'company.documents', {

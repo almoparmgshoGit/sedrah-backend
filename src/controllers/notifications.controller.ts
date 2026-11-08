@@ -6,6 +6,10 @@ import { logAudit } from '../utils/auditLogger';
 import { sendPushToUsers, sendPushToAllTokens } from '../utils/pushNotification';
 import { companyTeamUserIds } from '../utils/companyAccess';
 
+// The company app asks with ?audience=company; the customer app sends nothing
+const requestedAudience = (req: AuthRequest): 'customer' | 'company' =>
+  req.query.audience === 'company' ? 'company' : 'customer';
+
 export const getUserNotifications = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user?.id;
@@ -15,8 +19,8 @@ export const getUserNotifications = async (req: AuthRequest, res: Response): Pro
     }
 
     const result = await pool.query(
-      `SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC`,
-      [String(userId)]
+      `SELECT * FROM notifications WHERE user_id = $1 AND audience = $2 ORDER BY created_at DESC`,
+      [String(userId), requestedAudience(req)]
     );
 
     res.json({
@@ -309,8 +313,8 @@ export const markAllNotificationsAsRead = async (req: AuthRequest, res: Response
       return;
     }
     const result = await pool.query(
-      'UPDATE notifications SET is_read = true WHERE user_id = $1 AND is_read = false',
-      [String(req.user.id)]
+      'UPDATE notifications SET is_read = true WHERE user_id = $1 AND is_read = false AND audience = $2',
+      [String(req.user.id), requestedAudience(req)]
     );
     res.json({ success: true, message: 'تم تعليم كل الإشعارات كمقروءة', data: { updated: result.rowCount } });
   } catch (error: any) {

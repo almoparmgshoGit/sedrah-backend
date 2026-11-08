@@ -204,6 +204,7 @@ async function announceClosedAppointment(opts: {
       if (ownerId) {
         await createAndSendNotification({
           userId: ownerId,
+          audience: 'company',
           title: 'عميل لم يحضر موعده',
           subtitle: `لم يحضر ${await customerName(userId)} موعد ${when}، وتم إلغاء الموعد تلقائياً. يمكنك تحديد موعد جديد له.`,
           category: 'appointment',

@@ -9,6 +9,7 @@ import { logAudit } from '../utils/auditLogger';
 import { normalizeUploadUrl, resolveUserUpload } from '../utils/uploadAccess';
 import { expireOverdueAppointmentsThrottled, isPastAppointmentDay, localToday } from '../utils/appointmentLifecycle';
 import { companyTeamUserIds, notifyCompanyTeam } from '../utils/companyAccess';
+import { createAdminAlert, resolveAdminAlerts } from '../utils/adminAlerts';
 
 const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
 const INVALID_ATTACHMENT_ERROR = 'رابط المرفق غير صالح';
@@ -379,6 +380,22 @@ export const chatsController = {
 
       if (io) {
         io.to(`chat_${chatId}`).to(targetCompanyName).to('staff').emit('receive_message', createdMsg);
+      }
+
+      // A customer writing on a support ticket waits for the support desk; chats with companies are not the admins' to answer
+      const ticket = await pool.query('SELECT ticket_number, context FROM chats WHERE id = $1 AND ticket_number IS NOT NULL', [chatId]);
+      if (ticket.rows.length > 0) {
+        await createAdminAlert({
+          type: 'ticket_message',
+          module: 'support',
+          title: `رد جديد على التذكرة ${ticket.rows[0].ticket_number}`,
+          body: String(message || '[صورة مرفقة]').slice(0, 200),
+          entityType: 'chat',
+          entityId: String(chatId),
+          link: `/chats?id=${chatId}`,
+          requiresAction: true,
+          merge: true,
+        });
       }
 
       // Push notification to company owner for new chat message (skip if owner is currently viewing the chat)
@@ -767,6 +784,10 @@ export const chatsController = {
         io.to('staff').emit('ticket_updated', updateRes.rows[0]);
       }
 
+      if (status === 'resolved' || status === 'closed') {
+        await resolveAdminAlerts('chat', String(chatId), req.user?.email || null);
+      }
+
       if (statusChanged) {
         await logAudit(
           req.user?.email || 'admin',
@@ -869,6 +890,9 @@ export const chatsController = {
         io.to(`chat_${chatId}`).to(chat.company_name).to('staff').emit('receive_message', createdMsg);
         io.to('staff').emit('ticket_updated', { id: chatId });
       }
+
+      // The support desk answered, so the ticket's pending alerts are handled
+      await resolveAdminAlerts('chat', String(chatId), staffName);
 
       if (chat.department === 'companies' && chat.company_id && chat.ticket_number) {
         await notifyCompanyTeam(chat.company_id, 'support.tickets', {
@@ -1081,6 +1105,17 @@ export const chatsController = {
         io.to('staff').emit('ticket_updated', newChat.rows[0]);
       }
 
+      await createAdminAlert({
+        type: 'ticket_created',
+        module: 'support',
+        title: `تذكرة دعم جديدة ${ticketNumber}`,
+        body: `${title}: ${String(description).slice(0, 160)}`,
+        entityType: 'chat',
+        entityId: chatId,
+        link: `/chats?id=${chatId}`,
+        requiresAction: true,
+      });
+
       // Push notification to admins for new support ticket
       const adminUsers = await pool.query("SELECT id FROM users WHERE role IN ('admin', 'super_admin', 'support')");
       const adminIds = adminUsers.rows.map((r: any) => r.id);
@@ -1223,6 +1258,9 @@ export const chatsController = {
       if (io) {
         io.to('staff').emit('ticket_updated', updateRes.rows[0]);
       }
+
+      // Closed by the customer: nothing left for the support desk to do
+      await resolveAdminAlerts('chat', String(chatId), 'العميل');
 
       res.status(200).json({ success: true, message: 'تم إغلاق التذكرة بنجاح', data: updateRes.rows[0] });
     } catch (error: any) {

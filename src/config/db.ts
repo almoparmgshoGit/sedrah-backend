@@ -1080,6 +1080,25 @@ export const initDB = async () => {
       ALTER TABLE packages ADD COLUMN IF NOT EXISTS admin_status_reason TEXT;
     `);
 
+    // Which app shows a notification: one account can be a customer and also run or work for a company
+    const audienceColumn = await pool.query(
+      `SELECT 1 FROM information_schema.columns WHERE table_name = 'notifications' AND column_name = 'audience'`
+    );
+    await pool.query(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS audience VARCHAR(20) NOT NULL DEFAULT 'customer';`);
+    if (audienceColumn.rows.length === 0) {
+      // One-time sort of older notifications for company owners and team members. Categories only companies
+      // receive move to the company app; shared ones move too unless the account also books as a customer.
+      await pool.query(`
+        UPDATE notifications n SET audience = 'company'
+        WHERE (EXISTS (SELECT 1 FROM companies c WHERE c.user_id = n.user_id)
+               OR EXISTS (SELECT 1 FROM company_members m WHERE m.user_id = n.user_id))
+          AND (n.category IN ('package', 'finance', 'company')
+               OR (n.category IN ('booking', 'review', 'support')
+                   AND NOT EXISTS (SELECT 1 FROM bookings b WHERE b.user_id = n.user_id)))
+      `);
+    }
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_notifications_user_audience ON notifications(user_id, audience, created_at DESC);');
+
     // Package statistics for the company: shares are counted each time, views once per viewer per day
     await pool.query(`
       ALTER TABLE packages ADD COLUMN IF NOT EXISTS views_count INT NOT NULL DEFAULT 0;
@@ -1222,6 +1241,34 @@ export const initDB = async () => {
       DROP INDEX IF EXISTS idx_company_requests_active_email;
       CREATE UNIQUE INDEX IF NOT EXISTS idx_company_requests_active_user
         ON company_requests (user_id) WHERE status IN ('pending', 'under_review', 'on_hold');
+    `);
+
+    // Admin alerts: what happened on the platform and what waits for an admin. Read state is per admin.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS admin_alerts (
+        id VARCHAR(16) PRIMARY KEY,
+        type VARCHAR(50) NOT NULL,
+        module VARCHAR(50) NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT,
+        entity_type VARCHAR(50),
+        entity_id VARCHAR(64),
+        link TEXT,
+        requires_action BOOLEAN NOT NULL DEFAULT FALSE,
+        occurrences INTEGER NOT NULL DEFAULT 1,
+        resolved_at TIMESTAMP,
+        resolved_by VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_admin_alerts_module_updated ON admin_alerts (module, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_admin_alerts_entity ON admin_alerts (entity_type, entity_id) WHERE resolved_at IS NULL;
+      CREATE TABLE IF NOT EXISTS admin_alert_reads (
+        alert_id VARCHAR(16) REFERENCES admin_alerts(id) ON DELETE CASCADE,
+        admin_id VARCHAR(16) REFERENCES users(id) ON DELETE CASCADE,
+        read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (alert_id, admin_id)
+      );
     `);
 
     console.log('✅ Database tables initialized successfully with 16-character secure alphanumeric IDs.');

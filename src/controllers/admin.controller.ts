@@ -10,6 +10,7 @@ import { createAndSendNotification } from '../utils/notificationHelper';
 import { markAppointmentAttended } from '../utils/appointmentLifecycle';
 import { notifyCompanyTeam, recalcCompanyRating } from '../utils/companyAccess';
 import { companyReadySql } from '../utils/companyReadiness';
+import { resolveAdminAlerts } from '../utils/adminAlerts';
 
 const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
 // Both bypass every module permission, so only a super admin can grant or touch them
@@ -503,6 +504,7 @@ export const setCompanyOwner = async (req: AuthRequest, res: Response): Promise<
     if (ownerId && String(ownerId) !== previousOwner) {
       await createAndSendNotification({
         userId: ownerId,
+        audience: 'company',
         title: 'تم ربط حسابك بشركة',
         subtitle: `ربطت إدارة سدرة حسابك بشركة ${company.name} كمالك لها. افتح تطبيق سدرة للشركات لإدارتها.`,
         category: 'company',
@@ -1575,6 +1577,9 @@ export const adminUpdateOrderStatus = async (req: AuthRequest, res: Response): P
     }
 
     const order = result.rows[0];
+
+    // Once the order leaves "pending" an admin has taken it in hand
+    if (status !== 'pending') await resolveAdminAlerts('store_order', String(order.id), req.user?.email || null);
 
     await logAudit(
       req.user?.email || 'admin@sdra.com',

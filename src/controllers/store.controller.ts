@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { pool } from '../config/db';
 import { generate16CharId } from '../utils/formatId';
 import { createAndSendNotification } from '../utils/notificationHelper';
+import { createAdminAlert } from '../utils/adminAlerts';
 
 const MAX_ORDER_LINES = 50;
 const MAX_ITEM_QUANTITY = 100;
@@ -333,6 +334,17 @@ export const createOrder = async (req: any, res: Response) => {
         data: { type: 'order_created', orderNumber, orderId: createdOrder.id },
       });
     }
+
+    await createAdminAlert({
+      type: 'store_order',
+      module: 'store',
+      title: 'طلب متجر جديد',
+      body: `${customer_name || 'عميل'} طلب #${orderNumber} بإجمالي ${grandTotal}`,
+      entityType: 'store_order',
+      entityId: createdOrder.id,
+      link: `/store?tab=orders&order=${createdOrder.id}`,
+      requiresAction: true,
+    });
 
     return res.status(201).json({
       success: true,

@@ -278,7 +278,7 @@ export const notifyCompanyTeam = async (
   const ids = await companyTeamUserIds(companyId, permission);
   for (const userId of ids) {
     if (exceptUserId && String(userId) === String(exceptUserId)) continue;
-    await createAndSendNotification({ ...payload, userId });
+    await createAndSendNotification({ audience: 'company', ...payload, userId });
   }
 };
 

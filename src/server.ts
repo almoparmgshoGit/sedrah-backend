@@ -170,7 +170,11 @@ io.use((socket, next) => {
 io.on('connection', (socket) => {
   const user = socket.data.user;
   const isStaff = STAFF_ROLES.includes(user.role);
-  if (isStaff) socket.join('staff');
+  if (isStaff) {
+    socket.join('staff');
+    // Admin alerts are sent per admin, since each one only receives the modules it is allowed to open
+    socket.join(`admin_${user.id}`);
+  }
   logger.info(`Socket connected: ${socket.id}`);
 
   socket.on('join_room', async (room: string) => {

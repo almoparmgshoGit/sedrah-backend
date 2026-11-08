@@ -9,6 +9,7 @@ import { logAudit } from '../utils/auditLogger';
 import { sendPlatformEmail } from '../utils/mailer';
 import { getPublicServerUrl, recordUpload } from '../utils/uploadAccess';
 import { notifyCitySubscribers } from './cities.controller';
+import { createAdminAlert, resolveAdminAlerts } from '../utils/adminAlerts';
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_REASON_LENGTH = 1000;
@@ -123,6 +124,17 @@ export const createCompanyRequest = async (req: AuthRequest, res: Response): Pro
       ]
     );
 
+    await createAdminAlert({
+      type: 'company_request',
+      module: 'companies',
+      title: 'طلب انضمام شركة جديد',
+      body: `${companyName.trim()} · ${city.trim()}، ${governorate.trim()}`,
+      entityType: 'company_request',
+      entityId: created.rows[0].id,
+      link: `/companies/requests?id=${created.rows[0].id}`,
+      requiresAction: true,
+    });
+
     res.status(201).json({ success: true, message: 'تم إرسال طلب تسجيل الشركة بنجاح', data: created.rows[0] });
   } catch (error: any) {
     if (error instanceof InvalidImageError) {
@@ -178,6 +190,18 @@ export const resubmitMyCompanyRequestDocument = async (req: AuthRequest, res: Re
       res.status(409).json({ error: 'لا يوجد طلب بانتظار استكمال المستندات' });
       return;
     }
+
+    await createAdminAlert({
+      type: 'company_request',
+      module: 'companies',
+      title: 'طلب شركة عاد للمراجعة',
+      body: `${updated.rows[0].company_name} رفعت المستند المطلوب`,
+      entityType: 'company_request',
+      entityId: updated.rows[0].id,
+      link: `/companies/requests?id=${updated.rows[0].id}`,
+      requiresAction: true,
+      merge: true,
+    });
 
     res.json({ success: true, message: 'تم رفع المستند وإعادة الطلب للمراجعة', data: updated.rows[0] });
   } catch (error: any) {
@@ -299,6 +323,9 @@ export const updateCompanyRequestStatus = async (req: AuthRequest, res: Response
       req.ip,
       req.user?.email || 'المسؤول'
     );
+
+    // Approved, rejected or put on hold, the request has been dealt with; a resubmitted document raises a new alert
+    await resolveAdminAlerts('company_request', request.id, req.user?.email || null);
 
     const updated = await pool.query(`${ADMIN_SELECT} WHERE cr.id = $1`, [request.id]);
     await sendStatusEmail(updated.rows[0].owner_email || request.email, request.company_name, status, reason);

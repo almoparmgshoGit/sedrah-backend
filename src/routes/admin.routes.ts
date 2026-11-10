@@ -1,3 +1,4 @@
+import { setCompanySuspension } from '../controllers/companySuspension.controller';
 import { Router } from 'express';
 import { getCompanyStatement, settleCompanyCommission } from '../controllers/settlements.controller';
 import { listReceipts, getReceipt, reviewReceipt } from '../controllers/receipts.controller';
@@ -15,6 +16,8 @@ import {
   updateTripStageByAdmin,
   getBookingStagesByAdmin,
   getAllCompanies,
+  getAllPackagesByAdmin,
+  syncPackagePriceFromRooms,
   getAllCities,
   getAllReviews,
   deleteReviewByAdmin,
@@ -93,10 +96,12 @@ router.get('/companies', requireModulePermission('companies'), getAllCompanies);
 router.post('/companies', idempotencyMiddleware, requireModulePermission('companies'), createCompanyFull);
 router.put('/companies/:id', idempotencyMiddleware, requireModulePermission('companies'), updateCompany);
 router.patch('/companies/:id/owner', idempotencyMiddleware, requireModulePermission('companies'), setCompanyOwner);
+router.patch('/companies/:id/suspension', idempotencyMiddleware, requireModulePermission('companies'), setCompanySuspension);
 router.get('/companies/:id/details', requireModulePermission('companies'), getCompanyAdminDetails);
 router.patch('/companies/:id/documents/:field', idempotencyMiddleware, requireModulePermission('companies'), reviewCompanyDocument);
 router.post('/companies/:id/packages', idempotencyMiddleware, requireModulePermission('packages'), createCompanyPackage);
-router.put('/packages/:id', idempotencyMiddleware, requireModulePermission('packages'), updatePackageByAdmin);
+router.get('/packages', requireModulePermission('packages'), getAllPackagesByAdmin);
+router.put('/packages/:id', idempotencyMiddleware, requireModulePermission('packages'), syncPackagePriceFromRooms, updatePackageByAdmin);
 router.delete('/packages/:id', idempotencyMiddleware, requireModulePermission('packages'), deletePackageByAdmin);
 router.patch('/packages/:id/status', idempotencyMiddleware, requireModulePermission('packages'), updatePackageStatusByAdmin);
 

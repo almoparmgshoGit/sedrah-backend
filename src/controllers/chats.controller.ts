@@ -11,8 +11,17 @@ import { expireOverdueAppointmentsThrottled, isPastAppointmentDay, isPastAppoint
 import { availableVisitSlots, toMinutes } from '../utils/appointmentEngine';
 import { companyTeamUserIds, notifyCompanyTeam } from '../utils/companyAccess';
 import { createAdminAlert, resolveAdminAlerts } from '../utils/adminAlerts';
+import { getGrantedPermissions, canAccessModule } from '../middlewares/permission.middleware';
 
 const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
+
+/** Staff read or act on other people's chats only with the support permission (super admins always may). */
+const hasSupportAccess = async (req: AuthRequest): Promise<boolean> => {
+  const role = req.user?.role as string | undefined;
+  if (!req.user?.id || !role || !STAFF_ROLES.includes(role)) return false;
+  return canAccessModule(await getGrantedPermissions(String(req.user.id), role), 'support');
+};
+const CUSTOMER_COMPANY_READ_ONLY_ERROR = 'محادثات العملاء مع الشركات للعرض فقط';
 const INVALID_ATTACHMENT_ERROR = 'رابط المرفق غير صالح';
 
 const PLATFORM_DESK_NAME = 'إدارة منصة سدرة الرسمية';
@@ -24,6 +33,13 @@ const TICKET_STATUS_LABELS: Record<string, string> = {
   resolved: 'تم حلها',
   closed: 'مغلقة',
 };
+
+// What the support desk counts as a ticket (same rule as the is_ticket column of getAdminChats)
+const isTicketChat = (chat: any) => Boolean(chat?.ticket_number) || chat?.company_name === PLATFORM_DESK_NAME;
+const NOT_A_TICKET_ERROR = 'هذه محادثة بين عميل وشركة وليست تذكرة دعم';
+
+const REMINDER_TEXT = '🔔 تذكير: هذه التذكرة بانتظار ردك.';
+const REMINDER_COOLDOWN_MINUTES = 30;
 
 const generateTicketNumber = async (): Promise<string> => {
   for (let attempt = 0; attempt < 8; attempt++) {
@@ -251,7 +267,7 @@ export const chatsController = {
   async getChatMessages(req: AuthRequest, res: Response): Promise<void> {
     try {
       const userId = req.user?.id;
-      const isAdmin = req.user?.role === 'admin' || req.user?.role === 'super_admin';
+      const isAdmin = await hasSupportAccess(req);
       const { companyName: identifier } = req.params;
       const chatIdQuery = req.query.chatId;
 
@@ -267,7 +283,7 @@ export const chatsController = {
       const targetCompanyId = resolved.companyId;
 
       // IDOR Authorization check
-      const isStaffOrAdmin = req.user?.role === 'admin' || req.user?.role === 'super_admin' || (req.user?.role as string) === 'owner';
+      const isStaffOrAdmin = isAdmin;
       if (resolved.chat && resolved.chat.user_id !== userId && !isStaffOrAdmin) {
         res.status(403).json({ error: 'غير مصرح لك بعرض هذه المحادثة' });
         return;
@@ -349,7 +365,7 @@ export const chatsController = {
   async sendMessage(req: AuthRequest, res: Response): Promise<void> {
     try {
       const userId = req.user?.id;
-      const isAdmin = req.user?.role === 'admin' || req.user?.role === 'super_admin';
+      const isAdmin = await hasSupportAccess(req);
       const chatIdQuery = req.query.chatId || req.body.chatId;
       const { companyName: identifier } = req.params;
       const { message, imageUri } = req.body;
@@ -379,6 +395,11 @@ export const chatsController = {
       // IDOR Authorization check
       if (resolved.chat && resolved.chat.user_id !== userId && !isAdmin) {
         res.status(403).json({ error: 'غير مصرح لك بالإرسال في هذه المحادثة' });
+        return;
+      }
+      // Staff follow a customer's chat with a company without writing in it; support tickets stay writable
+      if (resolved.chat && resolved.chat.user_id !== userId && !isTicketChat(resolved.chat)) {
+        res.status(403).json({ error: CUSTOMER_COMPANY_READ_ONLY_ERROR });
         return;
       }
 
@@ -428,7 +449,7 @@ export const chatsController = {
       const createdMsg = msgRes.rows[0];
 
       if (io) {
-        io.to(`chat_${chatId}`).to(targetCompanyName).to('staff').emit('receive_message', createdMsg);
+        io.to(`chat_${chatId}`).to(targetCompanyName).to('support_staff').emit('receive_message', createdMsg);
       }
 
       // A customer writing on a support ticket waits for the support desk; chats with companies are not the admins' to answer
@@ -475,7 +496,7 @@ export const chatsController = {
   async markAsRead(req: AuthRequest, res: Response): Promise<void> {
     try {
       const userId = req.user?.id;
-      const isAdmin = req.user?.role === 'admin' || req.user?.role === 'super_admin';
+      const isAdmin = await hasSupportAccess(req);
       const { companyName: identifier } = req.params;
       const chatIdQuery = req.query.chatId;
 
@@ -508,7 +529,7 @@ export const chatsController = {
   async getAppointment(req: AuthRequest, res: Response): Promise<void> {
     try {
       const userId = req.user?.id;
-      const isAdmin = req.user?.role === 'admin' || req.user?.role === 'super_admin';
+      const isAdmin = await hasSupportAccess(req);
       const { companyName: identifier } = req.params;
       const chatIdQuery = req.query.chatId;
 
@@ -518,7 +539,7 @@ export const chatsController = {
       }
 
       const resolved = await resolveChatTarget(identifier, chatIdQuery, userId, isAdmin);
-      if (resolved.chat && resolved.chat.user_id !== userId && !STAFF_ROLES.includes(req.user?.role as string)) {
+      if (resolved.chat && resolved.chat.user_id !== userId && !isAdmin) {
         res.status(403).json({ error: 'غير مصرح لك بعرض موعد هذه المحادثة' });
         return;
       }
@@ -596,10 +617,29 @@ export const chatsController = {
 
   async setAppointment(req: AuthRequest, res: Response): Promise<void> {
     try {
-      const isAdmin = req.user?.role === 'admin' || req.user?.role === 'super_admin';
+      const isAdmin = await hasSupportAccess(req);
       const { companyName: identifier } = req.params;
       const { userId, chatId, appointmentDate, appointmentTime, title, location, notes } = req.body;
-      const targetUserId = userId || req.user?.id;
+
+      // The customer is the one of the chat; only staff call this, so never fall back to the caller's own id
+      let targetUserId = userId ? String(userId) : '';
+      if (chatId) {
+        const chatRes = await pool.query('SELECT id, user_id, department, ticket_number, company_name FROM chats WHERE id = $1', [String(chatId)]);
+        const chat = chatRes.rows[0];
+        if (!chat) {
+          res.status(404).json({ error: 'المحادثة غير موجودة' });
+          return;
+        }
+        if (chat.department === 'companies' && chat.ticket_number) {
+          res.status(400).json({ error: 'لا يمكن تحديد موعد زيارة على تذكرة شركة' });
+          return;
+        }
+        if (targetUserId && targetUserId !== String(chat.user_id)) {
+          res.status(400).json({ error: 'العميل المحدد لا يطابق صاحب المحادثة' });
+          return;
+        }
+        targetUserId = String(chat.user_id || '');
+      }
 
       if (!targetUserId) {
         res.status(400).json({ error: 'معرف المستخدم مطلوب' });
@@ -614,6 +654,20 @@ export const chatsController = {
       const resolved = await resolveChatTarget(identifier, chatId, targetUserId, isAdmin);
       const finalChatId = chatId || resolved.chatId;
       const targetCompanyName = resolved.companyName;
+
+      // The same appointment sent again moments later (double click, retried request) is not created twice
+      const duplicate = await pool.query(
+        `SELECT * FROM interview_appointments
+         WHERE user_id = $1 AND company_name = $2 AND COALESCE(chat_id, '') = COALESCE($3, '')
+           AND appointment_date = $4 AND appointment_time = $5 AND status = 'confirmed'
+           AND created_at > NOW() - INTERVAL '2 minutes'
+         ORDER BY created_at DESC LIMIT 1`,
+        [targetUserId, targetCompanyName, finalChatId ? String(finalChatId) : null, appointmentDate, appointmentTime || '10:00 ص']
+      );
+      if (duplicate.rows.length > 0) {
+        res.status(200).json({ success: true, message: 'تم تحديد هذا الموعد بالفعل', data: duplicate.rows[0] });
+        return;
+      }
 
       const apptId = generate16CharId();
       const insertRes = await pool.query(
@@ -682,7 +736,7 @@ export const chatsController = {
   async confirmAppointment(req: AuthRequest, res: Response): Promise<void> {
     try {
       const userId = req.user?.id;
-      const isAdmin = req.user?.role === 'admin' || req.user?.role === 'super_admin';
+      const isAdmin = await hasSupportAccess(req);
       const { companyName: identifier } = req.params;
       const { chatId } = req.body || req.query || {};
 
@@ -812,16 +866,43 @@ export const chatsController = {
         res.status(400).json({ error: 'حالة التذكرة غير صالحة' });
         return;
       }
+      if (department && !['users', 'companies'].includes(department)) {
+        res.status(400).json({ error: 'القسم غير صالح' });
+        return;
+      }
+      if (!status && !department) {
+        res.status(400).json({ error: 'لا يوجد تغيير مطلوب' });
+        return;
+      }
 
-      const previous = await pool.query('SELECT status FROM chats WHERE id = $1', [chatId]);
-      const statusChanged = Boolean(status) && previous.rows[0]?.status !== status;
+      const currentRes = await pool.query('SELECT * FROM chats WHERE id = $1', [chatId]);
+      const current = currentRes.rows[0];
+      if (!current) {
+        res.status(404).json({ error: 'التذكرة غير موجودة' });
+        return;
+      }
+      if (!isTicketChat(current)) {
+        res.status(400).json({ error: NOT_A_TICKET_ERROR });
+        return;
+      }
 
+      // Nothing changes: answer with the ticket as it is, without touching it or notifying anyone again
+      const sameStatus = !status || (current.status || 'open') === status;
+      const sameDepartment = !department || (current.department || 'users') === department;
+      if (sameStatus && sameDepartment) {
+        res.status(200).json({ success: true, data: current, unchanged: true });
+        return;
+      }
+
+      // The old status is read in the same statement, so two admins changing it at once each see what they replaced
       const updateRes = await pool.query(
-        `UPDATE chats
-         SET status = COALESCE($1, status),
-             department = COALESCE($2, department),
+        `UPDATE chats c
+         SET status = COALESCE($1, c.status),
+             department = COALESCE($2, c.department),
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = $3 RETURNING *`,
+         FROM (SELECT id, status AS old_status FROM chats WHERE id = $3 FOR UPDATE) o
+         WHERE c.id = o.id
+         RETURNING c.*, o.old_status`,
         [status || null, department || null, chatId]
       );
 
@@ -829,9 +910,11 @@ export const chatsController = {
         res.status(404).json({ error: 'التذكرة غير موجودة' });
         return;
       }
+      const statusChanged = Boolean(status) && (updateRes.rows[0].old_status || 'open') !== status;
+      delete updateRes.rows[0].old_status;
 
       if (io) {
-        io.to('staff').emit('ticket_updated', updateRes.rows[0]);
+        io.to('support_staff').emit('ticket_updated', updateRes.rows[0]);
       }
 
       if (status === 'resolved' || status === 'closed') {
@@ -919,6 +1002,11 @@ export const chatsController = {
       }
       const chat = chatRes.rows[0];
 
+      if (!isTicketChat(chat)) {
+        res.status(403).json({ error: CUSTOMER_COMPANY_READ_ONLY_ERROR });
+        return;
+      }
+
       if (chat.status === 'closed') {
         res.status(409).json({ error: 'التذكرة مغلقة، أعد فتحها أولاً' });
         return;
@@ -932,25 +1020,27 @@ export const chatsController = {
         [generate16CharId(), chatId, chat.user_id, chat.company_name, 'company', message || '[صورة مرفقة]', safeImageUri, timeStr, 'received']
       );
 
-      // The first staff member to reply takes ownership of an unassigned ticket
+      // On a ticket, the first staff member to reply takes ownership of it and the ticket moves to "in progress".
+      // A chat between a customer and a company is not the desk's: it gets no owner and no ticket status.
       const staffRes = await pool.query('SELECT name, email FROM users WHERE id = $1', [req.user?.id]);
       const staffName = staffRes.rows[0]?.name || staffRes.rows[0]?.email || null;
+      const ticket = isTicketChat(chat);
       await pool.query(
         `UPDATE chats
          SET last_message = $1,
              updated_at = CURRENT_TIMESTAMP,
-             status = CASE WHEN ticket_number IS NOT NULL AND status IN ('new', 'open') THEN 'in_progress' ELSE status END,
-             assigned_admin_id = COALESCE(assigned_admin_id, $2),
-             assigned_admin_name = COALESCE(assigned_admin_name, $3)
+             status = CASE WHEN $5::boolean AND COALESCE(status, 'open') IN ('new', 'open') THEN 'in_progress' ELSE status END,
+             assigned_admin_id = CASE WHEN $5::boolean THEN COALESCE(assigned_admin_id, $2) ELSE assigned_admin_id END,
+             assigned_admin_name = CASE WHEN $5::boolean THEN COALESCE(assigned_admin_name, $3) ELSE assigned_admin_name END
          WHERE id = $4`,
-        [message || '[صورة مرفقة]', req.user?.id || null, staffName, chatId]
+        [message || '[صورة مرفقة]', req.user?.id || null, staffName, chatId, ticket]
       );
 
       const createdMsg = msgRes.rows[0];
 
       if (io) {
-        io.to(`chat_${chatId}`).to(chat.company_name).to('staff').emit('receive_message', createdMsg);
-        io.to('staff').emit('ticket_updated', { id: chatId });
+        io.to(`chat_${chatId}`).to(chat.company_name).to('support_staff').emit('receive_message', createdMsg);
+        io.to('support_staff').emit('ticket_updated', { id: chatId });
       }
 
       // The support desk answered, so the ticket's pending alerts are handled
@@ -1027,6 +1117,17 @@ export const chatsController = {
       }
 
       const cleanBookingRef = bookingReference ? String(bookingReference).trim() : null;
+      // A ticket can only point at one of the customer's own bookings
+      if (cleanBookingRef) {
+        const bookingRes = await pool.query(
+          'SELECT 1 FROM bookings WHERE booking_reference = $1 AND user_id = $2',
+          [cleanBookingRef, targetUserId]
+        );
+        if (bookingRes.rows.length === 0) {
+          res.status(400).json({ error: 'الحجز المحدد لا يخص هذا المستخدم' });
+          return;
+        }
+      }
       const ticketNumber = await generateTicketNumber();
       const title = String(context).trim();
       const initialText = String(initialMessage).trim();
@@ -1073,7 +1174,7 @@ export const chatsController = {
       if (io) {
         io.to(`chat_${chatId}`).emit('receive_message', msgRes.rows[0]);
         io.to(targetCompanyName).emit('receive_message', msgRes.rows[0]);
-        io.to('staff').emit('ticket_updated', newChat.rows[0]);
+        io.to('support_staff').emit('ticket_updated', newChat.rows[0]);
       }
 
       // A ticket with a company reaches its whole support team, not only the owner
@@ -1165,7 +1266,7 @@ export const chatsController = {
 
       if (io) {
         io.to(`chat_${chatId}`).emit('receive_message', msgRes.rows[0]);
-        io.to('staff').emit('ticket_updated', newChat.rows[0]);
+        io.to('support_staff').emit('ticket_updated', newChat.rows[0]);
       }
 
       await createAdminAlert({
@@ -1217,11 +1318,31 @@ export const chatsController = {
       }
       const adminName = staffRes.rows[0].name || staffRes.rows[0].email;
 
+      const currentRes = await pool.query('SELECT * FROM chats WHERE id = $1', [chatId]);
+      const current = currentRes.rows[0];
+      if (!current) {
+        res.status(404).json({ error: 'التذكرة غير موجودة' });
+        return;
+      }
+      if (!isTicketChat(current)) {
+        res.status(400).json({ error: NOT_A_TICKET_ERROR });
+        return;
+      }
+      if (current.status === 'closed') {
+        res.status(409).json({ error: 'التذكرة مغلقة، أعد فتحها قبل إسنادها' });
+        return;
+      }
+      // Already with this staff member: nothing to change, log or announce
+      if (String(current.assigned_admin_id || '') === adminId) {
+        res.status(200).json({ success: true, message: `التذكرة مسندة بالفعل إلى ${adminName}`, data: current, unchanged: true });
+        return;
+      }
+
       const updateRes = await pool.query(
         `UPDATE chats
          SET assigned_admin_id = $1,
              assigned_admin_name = $2,
-             status = CASE WHEN status IN ('new', 'open') THEN 'in_progress' ELSE status END,
+             status = CASE WHEN COALESCE(status, 'open') IN ('new', 'open') THEN 'in_progress' ELSE status END,
              updated_at = CURRENT_TIMESTAMP
          WHERE id = $3 RETURNING *`,
         [adminId, adminName, chatId]
@@ -1241,7 +1362,7 @@ export const chatsController = {
       );
 
       if (io) {
-        io.to('staff').emit('ticket_updated', updateRes.rows[0]);
+        io.to('support_staff').emit('ticket_updated', updateRes.rows[0]);
       }
 
       res.status(200).json({
@@ -1259,6 +1380,13 @@ export const chatsController = {
     try {
       const chatId = await resolveChatId(req.params.chatId);
       const deleted = await pool.query('DELETE FROM chats WHERE id = $1 RETURNING ticket_number', [chatId]);
+      // Already gone (a second click, or another admin deleted it): nothing to log or announce
+      if (deleted.rows.length === 0) {
+        res.status(404).json({ error: 'التذكرة غير موجودة أو حُذفت بالفعل' });
+        return;
+      }
+      // Its pending alerts would otherwise point at a ticket that no longer exists
+      await resolveAdminAlerts('chat', String(chatId), req.user?.email || null);
       await logAudit(
         req.user?.email || 'admin',
         'حذف تذكرة',
@@ -1267,7 +1395,7 @@ export const chatsController = {
         req.user?.email
       );
       if (io) {
-        io.to('staff').emit('ticket_updated', { id: chatId, deleted: true });
+        io.to('support_staff').emit('ticket_updated', { id: chatId, deleted: true });
       }
       res.status(200).json({ success: true, message: 'تم حذف التذكرة بنجاح' });
     } catch (error: any) {
@@ -1319,7 +1447,7 @@ export const chatsController = {
       }
 
       if (io) {
-        io.to('staff').emit('ticket_updated', updateRes.rows[0]);
+        io.to('support_staff').emit('ticket_updated', updateRes.rows[0]);
       }
 
       // Closed by the customer: nothing left for the support desk to do
@@ -1343,34 +1471,70 @@ export const chatsController = {
       }
       const chat = chatRes.rows[0];
 
-      if (chat.status === 'closed') {
-        res.status(409).json({ error: 'لا يمكن إرسال تذكير على تذكرة مغلقة' });
+      if (!isTicketChat(chat)) {
+        res.status(400).json({ error: NOT_A_TICKET_ERROR });
+        return;
+      }
+
+      if (chat.status === 'closed' || chat.status === 'resolved') {
+        res.status(409).json({ error: 'لا يمكن إرسال تذكير على تذكرة مغلقة أو تم حلها' });
+        return;
+      }
+
+      // A reminder asks the customer to answer; when the customer wrote last, the desk is the one who owes a reply
+      const lastRes = await pool.query(
+        'SELECT sender FROM messages WHERE chat_id = $1 ORDER BY created_at DESC LIMIT 1',
+        [chatId]
+      );
+      if (lastRes.rows[0]?.sender === 'user') {
+        res.status(409).json({ error: 'العميل بانتظار ردك أنت، لا حاجة لتذكيره' });
+        return;
+      }
+
+      // One reminder per ticket in a cooldown window, so the customer is never flooded
+      const recentRes = await pool.query(
+        `SELECT 1 FROM messages WHERE chat_id = $1 AND sender = 'company' AND text = $2
+           AND created_at > NOW() - make_interval(mins => $3) LIMIT 1`,
+        [chatId, REMINDER_TEXT, REMINDER_COOLDOWN_MINUTES]
+      );
+      if (recentRes.rows.length > 0) {
+        res.status(429).json({ error: `تم إرسال تذكير مؤخراً، يمكنك التذكير مرة أخرى بعد ${REMINDER_COOLDOWN_MINUTES} دقيقة` });
         return;
       }
 
       const timeStr = new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' });
-      const reminderText = '🔔 تذكير: هذه التذكرة بانتظار ردك.';
+      const reminderText = REMINDER_TEXT;
 
       const msgRes = await pool.query(
         `INSERT INTO messages (id, chat_id, user_id, company_name, sender, text, time, status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
         [generate16CharId(), chatId, chat.user_id, chat.company_name, 'company', reminderText, timeStr, 'received']
       );
+      await pool.query('UPDATE chats SET last_message = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [reminderText, chatId]);
 
       if (io) {
-        io.to(`chat_${chatId}`).to('staff').emit('receive_message', msgRes.rows[0]);
+        io.to(`chat_${chatId}`).to('support_staff').emit('receive_message', msgRes.rows[0]);
+        io.to('support_staff').emit('ticket_updated', { id: chatId });
       }
 
-      // Push notification to user for ticket reminder
-      if (chat.user_id) {
+      const reminderPayload = {
+        title: 'تذكير بخصوص تذكرة الدعم',
+        subtitle: reminderText,
+        category: 'support',
+        icon: 'notifications-outline',
+        iconBg: '#FEF3C7',
+        iconColor: '#D97706',
+      };
+      // A company's ticket is answered from the company app by its support team, like every other reply on it
+      if (chat.department === 'companies' && chat.company_id && chat.ticket_number) {
+        notifyCompanyTeam(chat.company_id, 'support.tickets', {
+          ...reminderPayload,
+          data: { type: 'support_reply', ticketId: chat.id },
+        }).catch(() => {});
+      } else if (chat.user_id) {
         createAndSendNotification({
+          ...reminderPayload,
           userId: chat.user_id,
-          title: 'تذكير بخصوص تذكرة الدعم',
-          subtitle: reminderText,
-          category: 'support',
-          icon: 'notifications-outline',
-          iconBg: '#FEF3C7',
-          iconColor: '#D97706',
           data: { type: 'ticket_reminder', chatId }
         }).catch(() => {});
       }
@@ -1385,7 +1549,7 @@ export const chatsController = {
   async rejectAppointment(req: AuthRequest, res: Response): Promise<void> {
     try {
       const userId = req.user?.id;
-      const isAdmin = req.user?.role === 'admin' || req.user?.role === 'super_admin';
+      const isAdmin = await hasSupportAccess(req);
       const { companyName: identifier } = req.params;
       const { chatId } = req.body;
 

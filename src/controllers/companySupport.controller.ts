@@ -96,7 +96,7 @@ export const createCompanyTicket = async (req: CompanyRequest, res: Response): P
        VALUES ($1, $2, $3, $4, $5, 'user', $6, $7, $8, 'sent', $9)`,
       [generate16CharId(), chatId, req.user!.id, req.company.id, req.company.name, message, attachment || null, timeStr, req.actor?.name || null]
     );
-    if (io) io.to('staff').emit('ticket_updated', created.rows[0]);
+    if (io) io.to('support_staff').emit('ticket_updated', created.rows[0]);
     await createAdminAlert({
       type: 'ticket_created',
       module: 'support',
@@ -178,8 +178,8 @@ export const sendCompanyTicketMessage = async (req: CompanyRequest, res: Respons
     );
     const message = { ...inserted.rows[0], chat_id: ticket.id };
     if (io) {
-      io.to(`chat_${ticket.id}`).to('staff').emit('receive_message', message);
-      io.to('staff').emit('ticket_updated', { id: ticket.id });
+      io.to(`chat_${ticket.id}`).to('support_staff').emit('receive_message', message);
+      io.to('support_staff').emit('ticket_updated', { id: ticket.id });
     }
     await notifyStaff(`رد من ${req.company.name}`, text.slice(0, 120), { type: 'chat_message', chatId: ticket.id });
     await createAdminAlert({
@@ -208,7 +208,7 @@ export const closeCompanyTicket = async (req: CompanyRequest, res: Response): Pr
       return;
     }
     await pool.query(`UPDATE chats SET status = 'closed', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [ticket.id]);
-    if (io) io.to('staff').emit('ticket_updated', { id: ticket.id, status: 'closed' });
+    if (io) io.to('support_staff').emit('ticket_updated', { id: ticket.id, status: 'closed' });
     await resolveAdminAlerts('chat', ticket.id, req.company.name);
     await logCompanyActivity(req.company.id, req.actor || {}, 'ticket_closed', `أغلق تذكرة الدعم ${ticket.ticket_number}`, 'ticket', ticket.id);
     res.json({ success: true, message: 'تم إغلاق التذكرة' });

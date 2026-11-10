@@ -62,6 +62,12 @@ export const settleCompanyCommission = async (req: AuthRequest, res: Response): 
   const method = typeof req.body?.method === 'string' ? req.body.method.trim().slice(0, 50) : '';
   const reference = typeof req.body?.reference === 'string' ? req.body.reference.trim().slice(0, 255) : '';
   const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 1000) : '';
+  const rawExpected = req.body?.expected_total;
+  const expectedTotal = rawExpected === undefined || rawExpected === null || rawExpected === '' ? null : Number(rawExpected);
+  if (expectedTotal !== null && !Number.isFinite(expectedTotal)) {
+    res.status(400).json({ error: 'المبلغ المتوقع غير صالح' });
+    return;
+  }
 
   const client = await pool.connect();
   let settlement: any;
@@ -80,6 +86,13 @@ export const settleCompanyCommission = async (req: AuthRequest, res: Response): 
       return;
     }
     const amount = outstanding.rows.reduce((sum: number, row: any) => sum + Number(row.commission_amount || 0), 0);
+    // The admin confirms the total shown on the statement; if commissions changed since, nothing is settled
+    if (expectedTotal !== null && Math.abs(expectedTotal - amount) > 0.01) {
+      await client.query('ROLLBACK');
+      client.release();
+      res.status(409).json({ error: 'تغيّر المبلغ المستحق، حدّث الكشف وأعد المحاولة', commission_due: Math.round(amount * 100) / 100 });
+      return;
+    }
     const settlementId = generate16CharId();
     const created = await client.query(
       `INSERT INTO company_settlements (id, company_id, amount, earnings_count, method, reference, note, created_by)

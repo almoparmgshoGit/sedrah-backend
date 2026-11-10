@@ -26,6 +26,7 @@ router.use(company.redactForMember as any);
 // Every route below names the permission it needs; the owner holds all of them
 const can = (...permissions: string[]) => company.can(...permissions) as any;
 const booking = company.requireCompanyBooking as any;
+const active = company.blockWhenSuspended as any;
 
 router.get('/access', company.getCompanyAccess as any);
 router.get('/dashboard', company.getCompanyDashboard as any);
@@ -34,18 +35,18 @@ router.get('/profile', company.getCompanyProfile as any);
 router.put('/profile', authLimiter, can('company.profile', 'company.documents'), body(schemas.companyProfileSchema), company.updateCompanyProfile as any);
 
 router.get('/packages', can('packages.view', 'packages.manage'), company.getCompanyPackagesList as any);
-router.post('/packages', authLimiter, can('packages.manage'), body(schemas.companyPackageSchema), company.createCompanyOwnPackage as any);
+router.post('/packages', authLimiter, can('packages.manage'), active, body(schemas.companyPackageSchema), company.createCompanyOwnPackage as any);
 router.get('/packages/:id', can('packages.view', 'packages.manage'), company.getCompanyPackageDetails as any);
-router.put('/packages/:id', authLimiter, can('packages.manage'), body(schemas.companyPackageSchema), company.updateCompanyOwnPackage as any);
-router.patch('/packages/:id/status', can('packages.manage'), body(schemas.packageStatusSchema), company.updateCompanyPackageStatus as any);
+router.put('/packages/:id', authLimiter, can('packages.manage'), active, body(schemas.companyPackageSchema), company.updateCompanyOwnPackage as any);
+router.patch('/packages/:id/status', can('packages.manage'), body(schemas.packageStatusSchema), company.blockPublishWhenSuspended as any, company.updateCompanyPackageStatus as any);
 router.delete('/packages/:id', can('packages.delete'), company.deleteCompanyOwnPackage as any);
 
 router.get('/orders', can('orders.view', 'trips.view'), company.getCompanyOrders as any);
 router.get('/orders/:id', can('orders.view', 'trips.view'), booking, company.getCompanyOrderDetails as any);
-router.post('/orders/:id/accept', can('orders.manage'), booking, company.acceptCompanyOrder as any);
+router.post('/orders/:id/accept', can('orders.manage'), active, booking, company.acceptCompanyOrder as any);
 router.post('/orders/:id/reject', can('orders.manage'), body(schemas.rejectOrderSchema), booking, company.rejectCompanyOrder as any);
 router.post('/orders/:id/cancel', can('orders.manage'), body(schemas.cancelOrderSchema), booking, company.cancelCompanyOrder as any);
-router.post('/orders/:id/remind-payment', authLimiter, can('orders.manage'), booking, company.remindCompanyOrderPayment as any);
+router.post('/orders/:id/remind-payment', authLimiter, can('orders.manage'), active, booking, company.remindCompanyOrderPayment as any);
 router.post('/orders/:id/stages/:stageId/complete', can('trips.stages'), body(schemas.updateStageSchema), booking, company.saveCompanyStage as any);
 router.put('/orders/:id/stages/:stageId', can('trips.stages'), body(schemas.updateStageSchema), booking, company.saveCompanyStage as any);
 
@@ -54,7 +55,7 @@ router.put('/orders/:id/traveler-names', can('orders.manage', 'trips.stages'), b
 
 router.get('/finance', can('finance.view'), company.getCompanyFinance as any);
 router.get('/reviews', can('reviews.view', 'reviews.reply'), company.getCompanyReviews as any);
-router.put('/reviews/:id/reply', can('reviews.reply'), body(schemas.reviewReplySchema), company.replyCompanyReview as any);
+router.put('/reviews/:id/reply', can('reviews.reply'), active, body(schemas.reviewReplySchema), company.replyCompanyReview as any);
 
 // Scheduling an appointment needs the client list, so appointment managers may read it too
 router.get('/clients', can('clients.view', 'appointments.manage'), company.getCompanyClients as any);
@@ -62,12 +63,12 @@ router.get('/clients/:clientId', can('clients.view'), company.getCompanyClientDe
 router.put('/clients/:clientId/note', can('clients.notes'), body(schemas.clientNoteSchema), company.saveCompanyClientNote as any);
 
 router.get('/chats', can('chats.view', 'chats.reply'), company.getCompanyChats as any);
-router.post('/chats', can('chats.reply'), body(schemas.startChatSchema), company.startCompanyChat as any);
+router.post('/chats', can('chats.reply'), active, body(schemas.startChatSchema), company.startCompanyChat as any);
 router.get('/chats/:chatId/messages', can('chats.view', 'chats.reply'), company.getCompanyChatMessages as any);
 router.post('/chats/:chatId/messages', can('chats.reply'), body(schemas.chatMessageSchema), company.sendCompanyChatMessage as any);
 
 router.get('/appointments', can('appointments.view', 'appointments.manage'), company.getCompanyAppointments as any);
-router.post('/appointments', can('appointments.manage'), body(schemas.appointmentSchema), company.createCompanyAppointment as any);
+router.post('/appointments', can('appointments.manage'), active, body(schemas.appointmentSchema), company.createCompanyAppointment as any);
 router.put('/appointments/:id', can('appointments.manage'), body(schemas.rescheduleAppointmentSchema), company.rescheduleCompanyAppointment as any);
 router.post('/appointments/:id/cancel', can('appointments.manage'), body(schemas.cancelAppointmentSchema), company.cancelCompanyAppointment as any);
 router.post('/appointments/:id/attended', can('appointments.manage'), company.markCompanyAppointmentAttended as any);

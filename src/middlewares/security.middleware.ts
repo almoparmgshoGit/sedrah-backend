@@ -124,21 +124,24 @@ export const authenticate = async (req: AuthRequest, res: Response, next: NextFu
     }
 
     let userId = String(rawDecoded.id);
-    const userCheck = await pool.query('SELECT id, status FROM users WHERE id = $1', [userId]);
+    const userCheck = await pool.query('SELECT id, email, role, status, is_banned FROM users WHERE id = $1', [userId]);
     if (userCheck.rows.length === 0) {
       res.status(401).json({ error: 'المستخدم غير موجود أو انتهت صلاحية الجلسة' });
       return;
     }
 
     const user = userCheck.rows[0];
-    if (user.status === 'banned' || user.status === 'inactive') {
+    if (user.status === 'banned' || user.status === 'inactive' || user.is_banned === true) {
       res.status(401).json({ error: 'الحساب محظور أو غير نشط' });
       return;
     }
 
+    // The role comes from the database, so a demotion takes effect before the access token expires
     req.user = {
       ...rawDecoded,
       id: userId,
+      email: user.email || rawDecoded.email,
+      role: user.role,
     };
     next();
   } catch (err: any) {

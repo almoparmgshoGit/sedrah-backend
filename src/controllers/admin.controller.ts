@@ -1,7 +1,12 @@
+import { disconnectUserSockets } from '../server';
 import { Response, Request } from 'express';
 import { pool } from '../config/db';
+import type { PoolClient } from 'pg';
 import { AuthRequest } from '../middlewares/security.middleware';
-import { formatUserId, formatCompanyId, generateRandomToken, generate16CharId } from '../utils/formatId';
+import { formatUserId, formatCompanyId, formatPackageId, parseIdOrToken, generateRandomToken, generate16CharId } from '../utils/formatId';
+import { enrichPackage, PACKAGE_EXTRA_COLUMNS, lowestAdultPrice } from '../utils/packageInfo';
+import dns from 'dns';
+import net from 'net';
 import { logAudit } from '../utils/auditLogger';
 import argon2 from 'argon2';
 import nodemailer from 'nodemailer';
@@ -10,7 +15,9 @@ import { createAndSendNotification } from '../utils/notificationHelper';
 import { markAppointmentAttended } from '../utils/appointmentLifecycle';
 import { notifyCompanyTeam, recalcCompanyRating } from '../utils/companyAccess';
 import { companyReadySql } from '../utils/companyReadiness';
+import { companyActiveSql } from '../utils/companySuspension';
 import { resolveAdminAlerts } from '../utils/adminAlerts';
+import { ownerConflict, afterOwnerChange } from '../utils/companyOwner';
 
 const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
 // Both bypass every module permission, so only a super admin can grant or touch them
@@ -27,6 +34,43 @@ const canManageStaff = async (req: AuthRequest): Promise<boolean> => {
   );
   const row = res.rows[0] || {};
   return `${row.direct || ''} ${row.grouped || ''}`.includes('admins');
+};
+
+// Audit logs keep only these user fields, never the password hash or tokens
+const safeUserSnapshot = (row: any) => {
+  if (!row) return null;
+  return {
+    id: row.id,
+    public_id: row.public_id,
+    name: row.name,
+    email: row.email,
+    phone: row.phone,
+    role: row.role,
+    status: row.status,
+    permissions: row.permissions,
+    permission_group_id: row.permission_group_id,
+  };
+};
+
+// Ends every session of the user so new roles, permissions or a ban apply at once
+const revokeUserSessions = async (userId: string) => {
+  await pool.query('UPDATE refresh_tokens SET is_revoked = TRUE WHERE user_id = $1', [String(userId)]);
+  try { disconnectUserSockets(String(userId)); } catch { /* socket server may not be ready */ }
+};
+
+const countSuperAdmins = async (): Promise<number> => {
+  const result = await pool.query(`SELECT COUNT(*)::int AS total FROM users WHERE role = 'super_admin'`);
+  return Number(result.rows[0]?.total || 0);
+};
+
+const normalizePermissions = (value: any): string => {
+  if (value === undefined || value === null || value === '') return '[]';
+  try {
+    const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+    return JSON.stringify(Array.isArray(parsed) ? [...parsed].map(String).sort() : []);
+  } catch {
+    return '[]';
+  }
 };
 
 const resolveUserId = async (param: string | number) => {
@@ -58,7 +102,7 @@ export const getAllUsers = async (req: AuthRequest, res: Response): Promise<void
         id: user.public_id || formatUserId(user.id),
         name: user.name,
         email: user.email,
-        phone: user.phone || 'غير متوفر',
+        phone: user.phone || null,
         role: user.role || 'user',
         createdAt: user.created_at,
         status: user.status || 'active',
@@ -202,8 +246,13 @@ export const createUserByAdmin = async (req: AuthRequest, res: Response): Promis
       res.status(403).json({ error: 'منح دور المشرف العام متاح للمشرف العام فقط' });
       return;
     }
-    if (existing.rows.length > 0 && !manageStaff) {
+    // An existing account is only promoted when the admins page asks for it explicitly
+    if (existing.rows.length > 0 && req.body?.promote !== true) {
       res.status(409).json({ error: 'هذا البريد مسجل مسبقاً' });
+      return;
+    }
+    if (existing.rows.length > 0 && !manageStaff) {
+      res.status(403).json({ error: 'ترقية المستخدمين تتطلب صلاحية إدارة المشرفين' });
       return;
     }
     if (existing.rows.length > 0 && FULL_ACCESS_ROLES.includes(existing.rows[0].role) && req.user?.role !== 'super_admin') {
@@ -217,22 +266,39 @@ export const createUserByAdmin = async (req: AuthRequest, res: Response): Promis
     let targetUser;
 
     if (existing.rows.length > 0) {
-      // User exists -> Update/promote existing user role, permissions, and group (and password if provided)
+      // Promotes an existing account: role, permissions and group only. The password is never changed here.
       const user = existing.rows[0];
-      const passwordHash = password ? await argon2.hash(password) : user.password_hash;
+      const nextRole = role || user.role;
+      const nextPerms = permissions === undefined
+        ? user.permissions
+        : (Array.isArray(permissions) ? JSON.stringify(permissions) : JSON.stringify([]));
+      const nextGroup = permission_group_id === undefined ? user.permission_group_id : parsedGroupId;
+      const accessChanged = nextRole !== user.role
+        || normalizePermissions(nextPerms) !== normalizePermissions(user.permissions)
+        || String(nextGroup ?? '') !== String(user.permission_group_id ?? '');
+
+      if (accessChanged && String(user.id) === String(req.user?.id)) {
+        res.status(403).json({ error: 'لا يمكنك تعديل دورك أو صلاحياتك بنفسك' });
+        return;
+      }
+      if (user.role === 'super_admin' && nextRole !== 'super_admin' && (await countSuperAdmins()) <= 1) {
+        res.status(409).json({ error: 'لا يمكن تخفيض آخر مشرف عام في المنصة' });
+        return;
+      }
+
       const updateRes = await pool.query(
         `UPDATE users SET
            name = COALESCE($1, name),
-           role = COALESCE($2, role),
-           password_hash = $3,
-           permissions = $4,
-           permission_group_id = $5,
+           role = $2,
+           permissions = $3,
+           permission_group_id = $4,
            is_verified = true
-         WHERE id = $6
+         WHERE id = $5
          RETURNING id, name, email, phone, role, status, permissions, permission_group_id, created_at, public_id`,
-        [name || user.name, role || user.role, passwordHash, permsStr, parsedGroupId, user.id]
+        [name || user.name, nextRole, nextPerms, nextGroup, user.id]
       );
       targetUser = updateRes.rows[0];
+      if (accessChanged) await revokeUserSessions(user.id);
 
       await logAudit(
         req.user?.email || 'admin@sdra.com',
@@ -240,8 +306,8 @@ export const createUserByAdmin = async (req: AuthRequest, res: Response): Promis
         `تم تحديث صلاحيات ونظام المستخدم "${targetUser.name}" (${targetUser.email}) إلى دور: ${targetUser.role}`,
         req.ip,
         req.user?.email || 'المسؤول',
-        user,
-        targetUser
+        safeUserSnapshot(user),
+        safeUserSnapshot(targetUser)
       );
     } else {
       // User does not exist -> Create new user with password & name
@@ -267,8 +333,16 @@ export const createUserByAdmin = async (req: AuthRequest, res: Response): Promis
         req.ip,
         req.user?.email || 'المسؤول',
         null,
-        targetUser
+        safeUserSnapshot(targetUser)
       );
+    }
+
+    let savedPermissions: any[] = [];
+    try {
+      const parsed = typeof targetUser.permissions === 'string' ? JSON.parse(targetUser.permissions) : targetUser.permissions;
+      savedPermissions = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      savedPermissions = [];
     }
 
     res.status(200).json({
@@ -283,12 +357,12 @@ export const createUserByAdmin = async (req: AuthRequest, res: Response): Promis
         permission_group_id: targetUser.permission_group_id,
         createdAt: targetUser.created_at,
         status: targetUser.status,
-        permissions: Array.isArray(permissions) ? permissions : []
+        permissions: savedPermissions
       }
     });
   } catch (error: any) {
     console.error('Error creating/updating user by admin:', error);
-    res.status(500).json({ error: error.message || 'فشل معالجة بيانات المستخدم' });
+    res.status(500).json({ error: 'فشل معالجة بيانات المستخدم' });
   }
 };
 
@@ -323,14 +397,45 @@ export const updateUserByAdmin = async (req: AuthRequest, res: Response): Promis
       return;
     }
 
-    const { name, email, phone, role, country, city, permissions, permission_group_id } = req.body;
+    const { name, email, phone, role, country, city, permissions, permission_group_id, password } = req.body;
 
-    const currentRes = await pool.query('SELECT role, email, permissions, permission_group_id FROM users WHERE id = $1', [internalUserId]);
+    const currentRes = await pool.query(
+      'SELECT id, public_id, name, email, phone, role, status, permissions, permission_group_id FROM users WHERE id = $1',
+      [internalUserId]
+    );
     const current = currentRes.rows[0] || {};
     const changesStaffAccess = (role !== undefined && role !== current.role) || permissions !== undefined || permission_group_id !== undefined;
     if (changesStaffAccess && !(await canManageStaff(req))) {
       res.status(403).json({ error: 'ليس لديك صلاحية تعديل الأدوار أو الصلاحيات' });
       return;
+    }
+
+    const roleChanged = role !== undefined && role !== null && role !== '' && role !== current.role;
+    const permissionsChanged = permissions !== undefined && permissions !== null
+      && normalizePermissions(permissions) !== normalizePermissions(current.permissions);
+    const groupChanged = permission_group_id !== undefined
+      && String(permission_group_id || '') !== String(current.permission_group_id ?? '');
+    const accessChanged = roleChanged || permissionsChanged || groupChanged;
+
+    if (accessChanged && String(internalUserId) === String(req.user?.id)) {
+      res.status(403).json({ error: 'لا يمكنك تعديل دورك أو صلاحياتك بنفسك' });
+      return;
+    }
+    if (roleChanged && current.role === 'super_admin' && (await countSuperAdmins()) <= 1) {
+      res.status(409).json({ error: 'لا يمكن تخفيض آخر مشرف عام في المنصة' });
+      return;
+    }
+
+    const changesPassword = password !== undefined && password !== null && password !== '';
+    if (changesPassword) {
+      if (typeof password !== 'string' || password.length < 8) {
+        res.status(400).json({ error: 'كلمة المرور يجب أن تكون 8 أحرف على الأقل' });
+        return;
+      }
+      if (STAFF_ROLES.includes(current.role) && !(await canManageStaff(req))) {
+        res.status(403).json({ error: 'تغيير كلمة مرور المشرفين يتطلب صلاحية إدارة المشرفين' });
+        return;
+      }
     }
     // Changing a staff member's email is a route to taking over their account
     const changesStaffEmail = email !== undefined && email !== current.email && STAFF_ROLES.includes(current.role);
@@ -377,14 +482,23 @@ export const updateUserByAdmin = async (req: AuthRequest, res: Response): Promis
     );
 
     const updatedUser = result.rows[0];
+
+    if (changesPassword) {
+      const passwordHash = await argon2.hash(password);
+      await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, internalUserId]);
+    }
+    if (changesPassword || accessChanged) {
+      await revokeUserSessions(internalUserId);
+    }
+
     await logAudit(
       req.user?.email || 'admin@sdra.com',
       'تحديث بيانات مستخدم',
-      `تم تحديث بيانات المستخدم "${updatedUser.name}" (${updatedUser.email})`,
+      `تم تحديث بيانات المستخدم "${updatedUser.name}" (${updatedUser.email})${changesPassword ? ' مع تغيير كلمة المرور' : ''}`,
       req.ip,
       req.user?.email || 'المسؤول',
-      null,
-      updatedUser
+      safeUserSnapshot(current),
+      safeUserSnapshot(updatedUser)
     );
 
     res.json({ success: true, message: 'تم تحديث بيانات المستخدم بنجاح', data: updatedUser });
@@ -417,11 +531,16 @@ export const banUserByAdmin = async (req: AuthRequest, res: Response): Promise<v
       res.status(403).json({ error: 'لا يمكن حظر مشرف عام' });
       return;
     }
+    if (newStatus === 'banned' && targetRes.rows[0]?.role === 'super_admin' && (await countSuperAdmins()) <= 1) {
+      res.status(409).json({ error: 'لا يمكن حظر آخر مشرف عام في المنصة' });
+      return;
+    }
 
     await pool.query(
       'UPDATE users SET status = $1 WHERE id = $2',
       [newStatus, internalUserId]
     );
+    if (newStatus === 'banned') await revokeUserSessions(internalUserId);
 
     await logAudit(
       req.user?.email || 'admin@sdra.com',
@@ -463,23 +582,10 @@ export const setCompanyOwner = async (req: AuthRequest, res: Response): Promise<
         res.status(409).json({ error: 'هذه الشركة مرتبطة بمستخدم آخر' });
         return;
       }
-      const ownedRes = await pool.query('SELECT name FROM companies WHERE user_id = $1 AND id != $2', [ownerId, company.id]);
-      if (ownedRes.rows.length > 0) {
-        res.status(409).json({ error: `هذا المستخدم مرتبط بالفعل بشركة: ${ownedRes.rows[0].name}` });
+      const conflict = await ownerConflict(company, ownerId);
+      if (conflict) {
+        res.status(409).json({ error: conflict });
         return;
-      }
-      // A person belongs to one company: an employee elsewhere cannot become an owner here
-      const memberRes = await pool.query(
-        'SELECT c.name, m.company_id FROM company_members m JOIN companies c ON m.company_id = c.id WHERE m.user_id = $1',
-        [ownerId]
-      );
-      if (memberRes.rows.length > 0) {
-        if (memberRes.rows[0].company_id !== company.id) {
-          res.status(409).json({ error: `هذا المستخدم موظف في فريق شركة: ${memberRes.rows[0].name}` });
-          return;
-        }
-        // Promoted from employee to owner of the same company
-        await pool.query('DELETE FROM company_members WHERE user_id = $1', [ownerId]);
       }
     }
 
@@ -489,31 +595,7 @@ export const setCompanyOwner = async (req: AuthRequest, res: Response): Promise<
     );
 
     const previousOwner = company.user_id ? String(company.user_id) : null;
-    if (previousOwner && previousOwner !== String(ownerId || '')) {
-      await createAndSendNotification({
-        userId: previousOwner,
-        title: 'لم تعد مالكاً للشركة',
-        subtitle: `فكّت إدارة سدرة ربط حسابك بشركة ${company.name}. تواصل مع الدعم إذا كان ذلك غير متوقع.`,
-        category: 'company',
-        icon: 'business-outline',
-        iconBg: '#FEF2F2',
-        iconColor: '#DC2626',
-        data: { type: 'company_owner_removed', companyId: company.id },
-      });
-    }
-    if (ownerId && String(ownerId) !== previousOwner) {
-      await createAndSendNotification({
-        userId: ownerId,
-        audience: 'company',
-        title: 'تم ربط حسابك بشركة',
-        subtitle: `ربطت إدارة سدرة حسابك بشركة ${company.name} كمالك لها. افتح تطبيق سدرة للشركات لإدارتها.`,
-        category: 'company',
-        icon: 'business-outline',
-        iconBg: '#ECFDF5',
-        iconColor: '#059669',
-        data: { type: 'company_owner_added', companyId: company.id },
-      });
-    }
+    await afterOwnerChange(company, previousOwner, ownerId);
 
     await logAudit(
       req.user?.email || 'admin',
@@ -553,8 +635,13 @@ export const deleteUserByAdmin = async (req: AuthRequest, res: Response): Promis
       res.status(403).json({ error: 'لا يمكن حذف مشرف عام' });
       return;
     }
+    if (targetRes.rows[0]?.role === 'super_admin' && (await countSuperAdmins()) <= 1) {
+      res.status(409).json({ error: 'لا يمكن حذف آخر مشرف عام في المنصة' });
+      return;
+    }
 
     await pool.query('DELETE FROM users WHERE id = $1', [internalUserId]);
+    await revokeUserSessions(internalUserId);
 
     await logAudit(
       req.user?.email || 'admin@sdra.com',
@@ -578,12 +665,15 @@ export const getAllBookings = async (req: AuthRequest, res: Response): Promise<v
     await pool.query(`
       UPDATE bookings b
       SET status = 'completed'
-      WHERE b.status != 'cancelled' AND b.status != 'completed' AND b.receipt_approved = TRUE
+      WHERE b.status = 'confirmed' AND b.receipt_approved = TRUE
       AND NOT EXISTS (
         SELECT 1 FROM trip_stages ts WHERE ts.booking_id = b.id AND ts.status != 'completed'
       )
       AND EXISTS (
         SELECT 1 FROM trip_stages ts WHERE ts.booking_id = b.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM platform_earnings pe WHERE pe.booking_id = b.id AND pe.status = 'cancelled'
       )
     `);
     const result = await pool.query(`
@@ -607,19 +697,98 @@ const companyIdOfBooking = async (bookingId: string): Promise<string | null> => 
   return result.rows[0]?.company_id || null;
 };
 
+// Status moves an admin may make by hand. Confirming and receipt review belong to the receipts module,
+// and finished bookings (cancelled or completed) cannot be reopened.
+const ADMIN_BOOKING_TRANSITIONS: Record<string, string[]> = {
+  new: ['cancelled'],
+  pending: ['cancelled'],
+  receipt_review: ['cancelled'],
+  confirmed: ['cancelled', 'completed'],
+  completed: [],
+  cancelled: [],
+};
+
+/**
+ * Checks a manual booking status change inside the caller's transaction (the booking row is already locked).
+ * Returns the HTTP error to send, or null when the move is allowed.
+ */
+const bookingTransitionError = async (
+  client: PoolClient,
+  booking: any,
+  nextStatus: string,
+  reason: string
+): Promise<{ code: number; error: string } | null> => {
+  const currentStatus = booking.status || 'new';
+  if (nextStatus === 'confirmed' || nextStatus === 'receipt_review') {
+    return { code: 409, error: 'تأكيد الحجز ومراجعة الإيصال يتمان من قسم الإيصالات فقط' };
+  }
+  if (!(ADMIN_BOOKING_TRANSITIONS[currentStatus] || []).includes(nextStatus)) {
+    if (currentStatus === 'cancelled') return { code: 409, error: 'هذا الحجز ملغي ولا يمكن إعادة تفعيله' };
+    if (currentStatus === 'completed') return { code: 409, error: 'هذا الحجز مكتمل ولا يمكن تغيير حالته' };
+    return { code: 409, error: 'لا يمكن نقل الحجز إلى هذه الحالة من حالته الحالية' };
+  }
+  if (nextStatus === 'completed' && booking.receipt_approved !== true) {
+    return { code: 409, error: 'لا يمكن إكمال الحجز قبل اعتماد إيصال الدفع من قسم الإيصالات' };
+  }
+  if (nextStatus === 'cancelled') {
+    if (!reason) {
+      return { code: 400, error: 'يرجى كتابة سبب الإلغاء' };
+    }
+    const earning = await client.query(
+      'SELECT status, settlement_id FROM platform_earnings WHERE booking_id = $1 FOR UPDATE',
+      [booking.id]
+    );
+    const settled = earning.rows.some((row: any) => row.settlement_id && row.status !== 'cancelled');
+    if (settled) {
+      return { code: 409, error: 'لا يمكن إلغاء هذا الحجز لأن عمولته سُوّيت بالفعل مع الشركة' };
+    }
+  }
+  return null;
+};
+
 export const updateBookingStatusByAdmin = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { id } = req.params;
-    const { status, cancellation_reason, cancelled_by, appointment_date, appointment_time, appointment_status } = req.body;
-    // Confirming a booking means its receipt was verified, which only the receipts module records
-    if (status === 'confirmed' || status === 'receipt_review') {
-      const current = await pool.query('SELECT receipt_approved FROM bookings WHERE id = $1', [id]);
-      if (current.rows[0] && !(status === 'confirmed' && current.rows[0].receipt_approved)) {
-        res.status(409).json({ error: 'تأكيد الحجز ومراجعة الإيصال يتمان من قسم الإيصالات فقط' });
+    const id = String(req.params.id);
+    const { cancelled_by, appointment_date, appointment_time, appointment_status } = req.body;
+    const requestedStatus = req.body.status ? String(req.body.status) : undefined;
+    const rawReason = req.body.reason ?? req.body.cancellation_reason;
+    const cancellation_reason = typeof rawReason === 'string' ? rawReason.trim().slice(0, 500) : '';
+
+    const client = await pool.connect();
+    let result: any;
+    let status: string | undefined;
+    try {
+      await client.query('BEGIN');
+      const locked = await client.query('SELECT * FROM bookings WHERE id = $1 FOR UPDATE', [id]);
+      const current = locked.rows[0];
+      if (!current) {
+        await client.query('ROLLBACK');
+        res.status(404).json({ error: 'الحجز غير موجود' });
         return;
       }
-    }
-    const result = await pool.query(
+      const currentStatus = current.status || 'new';
+      // Sending the current status again changes nothing (the appointment form does that)
+      status = requestedStatus && requestedStatus !== currentStatus ? requestedStatus : undefined;
+
+      if (status) {
+        const check = await bookingTransitionError(client, current, status, cancellation_reason);
+        if (check) {
+          await client.query('ROLLBACK');
+          res.status(check.code).json({ error: check.error });
+          return;
+        }
+      }
+
+      if (status === 'cancelled') {
+        // Only commission that was not settled yet can be dropped; settled bookings were refused above
+        await client.query(
+          `UPDATE platform_earnings SET status = 'cancelled' WHERE booking_id = $1 AND settlement_id IS NULL`,
+          [id]
+        );
+        await client.query(`UPDATE trip_stages SET status = 'cancelled' WHERE booking_id = $1 AND status <> 'completed'`, [id]);
+      }
+
+      result = await client.query(
       `UPDATE bookings
        SET status = COALESCE($1, status),
            receipt_approved = CASE
@@ -641,7 +810,7 @@ export const updateBookingStatusByAdmin = async (req: AuthRequest, res: Response
        WHERE id = $2
        RETURNING *`,
       [
-        status ? String(status) : null,
+        status || null,
         id,
         cancellation_reason || null,
         cancelled_by || 'admin',
@@ -650,9 +819,12 @@ export const updateBookingStatusByAdmin = async (req: AuthRequest, res: Response
         appointment_status || null,
       ]
     );
-    if (result.rows.length === 0) {
-      res.status(404).json({ error: 'الحجز غير موجود' });
-      return;
+      await client.query('COMMIT');
+    } catch (txError) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw txError;
+    } finally {
+      client.release();
     }
     const booking = result.rows[0];
 
@@ -682,19 +854,23 @@ export const updateBookingStatusByAdmin = async (req: AuthRequest, res: Response
       new: 'طلب جديد',
       receipt_review: 'قيد مراجعة الإيصال',
       confirmed: 'مؤكد',
+      completed: 'مكتمل',
       cancelled: 'ملغي'
     };
-    const notifBody = `تم تحديث حالة حجزك رقم #${booking.booking_reference} إلى: ${statusLabels[status] || status}`;
-    await createAndSendNotification({
-      userId: booking.user_id,
-      title: 'تحديث حالة الحجز',
-      subtitle: notifBody,
-      category: 'booking',
-      icon: 'notifications-outline',
-      iconBg: '#EFF6FF',
-      iconColor: '#2563EB',
-      data: { type: 'booking_status', status, bookingRef: booking.booking_reference },
-    });
+    // Only an actual status change is announced (appointment-only updates send no status)
+    if (status) {
+      const notifBody = `تم تحديث حالة حجزك رقم #${booking.booking_reference} إلى: ${statusLabels[status] || status}${status === 'cancelled' && cancellation_reason ? `. السبب: ${cancellation_reason}` : ''}`;
+      await createAndSendNotification({
+        userId: booking.user_id,
+        title: 'تحديث حالة الحجز',
+        subtitle: notifBody,
+        category: 'booking',
+        icon: 'notifications-outline',
+        iconBg: '#EFF6FF',
+        iconColor: '#2563EB',
+        data: { type: 'booking_status', status, bookingRef: booking.booking_reference },
+      });
+    }
 
     // The company hears about changes the platform makes; its own cancellations come through here too and are skipped
     if (cancelled_by !== 'company') {
@@ -729,11 +905,13 @@ export const updateBookingStatusByAdmin = async (req: AuthRequest, res: Response
     await logAudit(
       req.user?.email || 'admin@sdra.com',
       'تحديث حالة الحجز',
-      `تم تحديث حالة الحجز رقم #${booking.booking_reference} إلى (${status})`,
+      status
+        ? `تم تحديث حالة الحجز رقم #${booking.booking_reference} إلى (${status})${status === 'cancelled' ? ` - السبب: ${cancellation_reason}` : ''}`
+        : `تم تحديث موعد الحجز رقم #${booking.booking_reference}`,
       req.ip,
       req.user?.email || 'المسؤول',
       null,
-      booking
+      { id: booking.id, booking_reference: booking.booking_reference, status: booking.status, cancellation_reason: booking.cancellation_reason, appointment_date: booking.appointment_date, appointment_time: booking.appointment_time }
     );
 
     res.json({ success: true, message: 'تم تحديث حالة الحجز بنجاح', data: booking });
@@ -747,6 +925,12 @@ export const updateTripStageByAdmin = async (req: AuthRequest, res: Response): P
   try {
     const { id, stageId } = req.params;
     const { status, traveler_name, document_url, document_number, details } = req.body;
+    if (status !== undefined && status !== null && !['pending', 'current', 'completed', 'cancelled'].includes(status)) {
+      res.status(400).json({ error: 'حالة المرحلة غير صالحة' });
+      return;
+    }
+    const rawReason = req.body.reason ?? details;
+    const cancelReason = typeof rawReason === 'string' ? rawReason.trim().slice(0, 500) : '';
 
     const bookingCheck = await pool.query('SELECT status FROM bookings WHERE id = $1', [id]);
     if (bookingCheck.rows.length > 0 && bookingCheck.rows[0].status === 'cancelled') {
@@ -782,16 +966,58 @@ export const updateTripStageByAdmin = async (req: AuthRequest, res: Response): P
       }
     }
 
-    const result = await pool.query(
-      `UPDATE trip_stages
+    const stageUpdateSql = `UPDATE trip_stages
        SET status = COALESCE($1, status),
            traveler_name = COALESCE($2, traveler_name),
            document_url = COALESCE($3, document_url),
            document_number = COALESCE($4, document_number),
            details = COALESCE($5, details)
-       WHERE id = $6 AND booking_id = $7 RETURNING *`,
-      [status, traveler_name, document_url, document_number, details, stageId, id]
-    );
+       WHERE id = $6 AND booking_id = $7 RETURNING *`;
+    const stageUpdateParams = [status, traveler_name, document_url, document_number, details, stageId, id];
+    let result: any;
+
+    if (status === 'cancelled') {
+      // Cancelling a stage cancels the whole booking, so it follows the same rules as a booking cancellation
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const locked = await client.query('SELECT * FROM bookings WHERE id = $1 FOR UPDATE', [id]);
+        if (!locked.rows[0]) {
+          await client.query('ROLLBACK');
+          res.status(404).json({ error: 'الحجز غير موجود' });
+          return;
+        }
+        const check = await bookingTransitionError(client, locked.rows[0], 'cancelled', cancelReason);
+        if (check) {
+          await client.query('ROLLBACK');
+          res.status(check.code).json({ error: check.error });
+          return;
+        }
+        result = await client.query(stageUpdateSql, stageUpdateParams);
+        await client.query(
+          `UPDATE platform_earnings SET status = 'cancelled' WHERE booking_id = $1 AND settlement_id IS NULL`,
+          [id]
+        );
+        await client.query(
+          `UPDATE bookings
+           SET status = 'cancelled',
+               cancellation_reason = $1,
+               cancelled_by = 'admin'
+           WHERE id = $2`,
+          [cancelReason, id]
+        );
+        // Set all stages for this booking to 'cancelled'
+        await client.query(`UPDATE trip_stages SET status = 'cancelled' WHERE booking_id = $1`, [id]);
+        await client.query('COMMIT');
+      } catch (txError) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw txError;
+      } finally {
+        client.release();
+      }
+    } else {
+      result = await pool.query(stageUpdateSql, stageUpdateParams);
+    }
 
     // Completing the visit stage means the customer came, so the appointment counts as attended
     if (targetStage.stage_order === 1 && status === 'completed') {
@@ -805,37 +1031,19 @@ export const updateTripStageByAdmin = async (req: AuthRequest, res: Response): P
       }
     }
 
-    // If stage is cancelled (or stage 1 cancelled), auto-cancel the entire booking!
-    if (status === 'cancelled') {
-      const cancelReason = details || `تم إلغاء مرحلة "${targetStage.title}" وبناءً عليه تم إلغاء الحجز بالكامل من الإدارة`;
-      await pool.query(
-        `UPDATE bookings
-         SET status = 'cancelled',
-             cancellation_reason = $1,
-             cancelled_by = 'admin'
-         WHERE id = $2`,
-        [cancelReason, id]
-      );
-
-      // Set all stages for this booking to 'cancelled'
-      await pool.query(
-        `UPDATE trip_stages
-         SET status = 'cancelled'
-         WHERE booking_id = $1`,
-        [id]
-      );
-    }
-
-    // Auto-update booking status to completed if all stages are completed
+    // Auto-update booking status to completed if all stages are completed (only a confirmed booking can complete)
     await pool.query(`
       UPDATE bookings b
       SET status = 'completed'
-      WHERE b.id = $1 AND b.status != 'cancelled' AND b.receipt_approved = TRUE
+      WHERE b.id = $1 AND b.status = 'confirmed' AND b.receipt_approved = TRUE
       AND NOT EXISTS (
         SELECT 1 FROM trip_stages ts WHERE ts.booking_id = b.id AND ts.status != 'completed'
       )
       AND EXISTS (
         SELECT 1 FROM trip_stages ts WHERE ts.booking_id = b.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM platform_earnings pe WHERE pe.booking_id = b.id AND pe.status = 'cancelled'
       )
     `, [id]);
 
@@ -853,7 +1061,10 @@ export const updateTripStageByAdmin = async (req: AuthRequest, res: Response): P
       if (traveler_name) extraInfo += ` (للمسافر: ${traveler_name})`;
       if (document_number) extraInfo += ` (رقم المرجع/الغرفة: ${document_number})`;
 
-      const notifBody = `حجزك #${booking.booking_reference}: تم تحديث مرحلة "${targetStage.title}" إلى (${stageStatusLabels[status] || status})${extraInfo}`;
+      const stageLabel = status ? (stageStatusLabels[status] || status) : (stageStatusLabels[targetStage.status] || targetStage.status);
+      const notifBody = status
+        ? `حجزك #${booking.booking_reference}: تم تحديث مرحلة "${targetStage.title}" إلى (${stageLabel})${extraInfo}`
+        : `حجزك #${booking.booking_reference}: تم تحديث بيانات مرحلة "${targetStage.title}"${extraInfo}`;
       await createAndSendNotification({
         userId: booking.user_id,
         title: 'تحديث مراحل الرحلة',
@@ -868,7 +1079,7 @@ export const updateTripStageByAdmin = async (req: AuthRequest, res: Response): P
         title: status === 'cancelled' ? 'ألغت الإدارة حجزاً' : 'حدّثت الإدارة مرحلة رحلة',
         subtitle: status === 'cancelled'
           ? `ألغت إدارة سدرة الحجز #${booking.booking_reference} من مرحلة "${targetStage.title}"`
-          : `حدّثت إدارة سدرة مرحلة "${targetStage.title}" في الحجز #${booking.booking_reference} إلى (${stageStatusLabels[status] || status})`,
+          : `حدّثت إدارة سدرة مرحلة "${targetStage.title}" في الحجز #${booking.booking_reference} إلى (${stageLabel})`,
         category: 'booking',
         icon: 'flag-outline',
         iconBg: '#F0FDF4',
@@ -900,13 +1111,159 @@ export const getBookingStagesByAdmin = async (req: AuthRequest, res: Response): 
 
 export const getAllCompanies = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const { cityId, minRating, verification_type, search, sort, status } = req.query;
     // is_ready: whether customers can see the company (complete profile and a published package)
-    const result = await pool.query(`SELECT c.*, ${companyReadySql('c')} AS is_ready FROM companies c ORDER BY c.created_at DESC`);
+    let query = `
+      SELECT c.*,
+             ${companyReadySql('c')} AS is_ready,
+             NOT ${companyActiveSql('c')} AS is_suspended,
+             ci.name AS city_name,
+             COALESCE(b_stats.total_bookings, 0)::int AS total_bookings,
+             COALESCE(b_stats.completed_bookings, 0)::int AS completed_bookings,
+             COALESCE(b_stats.in_progress_bookings, 0)::int AS in_progress_bookings,
+             COALESCE(b_stats.cancelled_bookings, 0)::int AS cancelled_bookings,
+             COALESCE(pe_stats.total_earnings, 0)::float AS platform_earnings,
+             CASE
+               WHEN c.field_verified = TRUE THEN 'field'
+               WHEN c.verified = TRUE THEN 'document'
+               ELSE 'none'
+             END AS verification_type
+      FROM companies c
+      LEFT JOIN cities ci ON c.city_id = ci.id
+      LEFT JOIN (
+        SELECT p.company_id,
+               COUNT(b.id) AS total_bookings,
+               COUNT(b.id) FILTER (WHERE b.status = 'completed') AS completed_bookings,
+               COUNT(b.id) FILTER (WHERE b.status IN ('new', 'pending', 'receipt_review', 'confirmed')) AS in_progress_bookings,
+               COUNT(b.id) FILTER (WHERE b.status = 'cancelled') AS cancelled_bookings
+        FROM bookings b
+        JOIN packages p ON b.package_id = p.id
+        GROUP BY p.company_id
+      ) b_stats ON c.id = b_stats.company_id
+      LEFT JOIN (
+        SELECT company_id, SUM(commission_amount) AS total_earnings
+        FROM platform_earnings
+        WHERE status = 'recorded'
+        GROUP BY company_id
+      ) pe_stats ON c.id = pe_stats.company_id
+    `;
+    const conditions: string[] = [];
+    const params: any[] = [];
+
+    if (typeof cityId === 'string' && cityId.trim() && cityId !== 'all') {
+      params.push(parseIdOrToken(cityId.trim()).value);
+      conditions.push(`c.city_id = $${params.length}`);
+    }
+    const rating = typeof minRating === 'string' ? parseFloat(minRating) : NaN;
+    if (Number.isFinite(rating) && rating > 0 && rating <= 5) {
+      params.push(rating);
+      conditions.push(`COALESCE(c.rating, 0) >= $${params.length}`);
+    }
+    if (verification_type === 'field') {
+      conditions.push('c.field_verified = TRUE');
+    } else if (verification_type === 'document') {
+      conditions.push('c.verified = TRUE AND (c.field_verified IS NOT TRUE)');
+    } else if (verification_type === 'none') {
+      conditions.push('(c.verified IS NOT TRUE) AND (c.field_verified IS NOT TRUE)');
+    }
+    if (typeof search === 'string' && search.trim()) {
+      params.push(`%${search.trim().slice(0, 100)}%`);
+      conditions.push(`(c.name ILIKE $${params.length} OR c.short_description ILIKE $${params.length} OR c.phone ILIKE $${params.length})`);
+    }
+    if (status === 'suspended') {
+      conditions.push(`NOT ${companyActiveSql('c')}`);
+    } else if (status === 'active') {
+      conditions.push(companyActiveSql('c'));
+    }
+    if (conditions.length > 0) query += ' WHERE ' + conditions.join(' AND ');
+
+    const SORTS: Record<string, string> = {
+      rating_desc: 'c.rating DESC NULLS LAST, c.created_at DESC',
+      earnings_desc: 'platform_earnings DESC, c.created_at DESC',
+      bookings_desc: 'total_bookings DESC, c.created_at DESC',
+      created_desc: 'c.created_at DESC',
+    };
+    query += ` ORDER BY ${SORTS[typeof sort === 'string' ? sort : ''] || SORTS.created_desc}`;
+
+    const result = await pool.query(query, params);
     res.json({ success: true, data: result.rows });
   } catch (error: any) {
     console.error('Error fetching companies:', error);
     res.status(500).json({ error: 'فشل جلب الشركات' });
   }
+};
+
+// Every package of every company and status, in the same shape as the public GET /packages plus `status`
+export const getAllPackagesByAdmin = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { cityId, companyId, minPrice, maxPrice, status, search } = req.query;
+    let query = `
+      SELECT p.*, COALESCE(p.status, 'active') AS status, c.name as company_name, c.logo_url as company_logo,
+             ci.name as city_name, c.public_id as company_public_id,
+             (SELECT COUNT(*) FROM bookings b WHERE b.package_id = p.id) as bookings_count, ${PACKAGE_EXTRA_COLUMNS}
+      FROM packages p
+      JOIN companies c ON p.company_id = c.id
+      LEFT JOIN cities ci ON p.city_id = ci.id
+      WHERE TRUE
+    `;
+    const params: any[] = [];
+
+    if (typeof cityId === 'string' && cityId.trim() && cityId !== 'all') {
+      params.push(parseIdOrToken(cityId.trim()).value);
+      query += ` AND p.city_id = $${params.length}`;
+    }
+    if (typeof companyId === 'string' && companyId.trim() && companyId !== 'all') {
+      params.push(companyId.trim());
+      query += ` AND (p.company_id = $${params.length} OR c.public_id = $${params.length} OR c.name = $${params.length})`;
+    }
+    const min = typeof minPrice === 'string' ? parseFloat(minPrice) : NaN;
+    if (Number.isFinite(min)) {
+      params.push(min);
+      query += ` AND p.price >= $${params.length}`;
+    }
+    const max = typeof maxPrice === 'string' ? parseFloat(maxPrice) : NaN;
+    if (Number.isFinite(max)) {
+      params.push(max);
+      query += ` AND p.price <= $${params.length}`;
+    }
+    if (typeof status === 'string' && ['active', 'paused', 'hidden'].includes(status)) {
+      params.push(status);
+      query += status === 'active' ? ` AND (p.status = $${params.length} OR p.status IS NULL)` : ` AND p.status = $${params.length}`;
+    }
+    if (typeof search === 'string' && search.trim()) {
+      params.push(`%${search.trim().slice(0, 100)}%`);
+      query += ` AND (p.title ILIKE $${params.length} OR c.name ILIKE $${params.length})`;
+    }
+
+    query += ' ORDER BY p.created_at DESC';
+
+    const result = await pool.query(query, params);
+    const formatted = result.rows.map((pkg) => ({
+      ...enrichPackage(pkg),
+      numeric_id: pkg.id,
+      id: formatPackageId(pkg.id, pkg.public_id),
+      company_id: formatCompanyId(pkg.company_id, pkg.company_public_id),
+      bookings_count: parseInt(pkg.bookings_count || '0', 10),
+      status: pkg.status,
+    }));
+    res.json({ success: true, data: formatted });
+  } catch (error: any) {
+    console.error('Error fetching admin packages:', error);
+    res.status(500).json({ error: 'فشل جلب الباقات' });
+  }
+};
+
+/**
+ * Runs before the admin package update: when room prices change, the package's listed price becomes the
+ * cheapest adult room, the same rule the company app uses, so search and sorting stay correct.
+ */
+export const syncPackagePriceFromRooms = (req: AuthRequest, _res: Response, next: () => void): void => {
+  const roomPrices = req.body?.room_prices;
+  if (roomPrices !== undefined && roomPrices !== null && roomPrices !== '') {
+    const lowest = lowestAdultPrice(roomPrices);
+    if (lowest !== null) req.body.price = lowest;
+  }
+  next();
 };
 
 export const getAllCities = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -1034,13 +1391,60 @@ export const getAuditLogs = async (req: AuthRequest, res: Response): Promise<voi
   }
 };
 
+// Keys the settings page manages; anything else is ignored unless it already exists in the table
+const ALLOWED_SETTING_KEYS = new Set([
+  'platform_name', 'support_email', 'support_phone', 'whatsapp_number', 'website_url', 'company_address', 'currency',
+  'commission_system_enabled', 'commission_method', 'commission_percentage', 'adult_commission_rate', 'child_commission_rate',
+  'fixed_commission_amount', 'platform_commission_fee',
+  'smtp_enabled', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass', 'smtp_secure', 'smtp_from_email', 'smtp_from_name', 'smtp_reply_to',
+  'google_login_enabled', 'google_client_id_web', 'google_client_id_android', 'google_client_id_ios', 'google_redirect_uri',
+  'privacy_policy_title', 'privacy_policy_content', 'privacy_policy_status', 'packages_disclaimer_note',
+  'about_us_content', 'terms_content', 'support_whatsapp_hours', 'support_email_note',
+  'profile_required_fields', 'profile_completion_enforced', 'auth_require_email_verification', 'auth_password_min_length',
+  'email_templates', 'shipping_mode', 'unified_shipping_fee',
+]);
+
+// [min, max] for settings that must be numbers
+const NUMERIC_SETTINGS: Record<string, [number, number]> = {
+  commission_percentage: [0, 100],
+  adult_commission_rate: [0, 100],
+  child_commission_rate: [0, 100],
+  fixed_commission_amount: [0, 10000000],
+  platform_commission_fee: [0, 10000000],
+  unified_shipping_fee: [0, 10000000],
+  auth_password_min_length: [4, 128],
+  smtp_port: [1, 65535],
+};
+
+const SECRET_SETTING_KEYS = ['smtp_pass'];
+const ALLOWED_SMTP_PORTS = [25, 465, 587, 2525];
+
+// Private, loopback, link-local and other non-public addresses an SMTP test must never reach
+const isPrivateAddress = (address: string): boolean => {
+  if (net.isIPv4(address)) {
+    const [a, b] = address.split('.').map(Number);
+    return a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 198 && (b === 18 || b === 19)) || a >= 224;
+  }
+  if (net.isIPv6(address)) {
+    const lower = address.toLowerCase();
+    if (lower.startsWith('::ffff:')) return isPrivateAddress(lower.slice(7));
+    return lower === '::' || lower === '::1' || lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea')
+      || lower.startsWith('feb') || lower.startsWith('fc') || lower.startsWith('fd') || lower.startsWith('ff');
+  }
+  return true;
+};
+
 export const getSettings = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const result = await pool.query('SELECT * FROM settings ORDER BY key ASC');
-    const settingsObj: Record<string, string> = {};
+    const settingsObj: Record<string, any> = {};
     for (const row of result.rows) {
       settingsObj[row.key] = row.value;
     }
+    // The SMTP password never leaves the server; the page only learns whether one is saved
+    settingsObj.smtp_pass_set = Boolean(settingsObj.smtp_pass);
+    settingsObj.smtp_pass = '';
     res.json({ success: true, data: settingsObj });
   } catch (error: any) {
     console.error('Error fetching settings:', error);
@@ -1050,15 +1454,62 @@ export const getSettings = async (req: AuthRequest, res: Response): Promise<void
 
 export const updateSettings = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const settingsMap = req.body;
+    const settingsMap = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+    const existingRes = await pool.query('SELECT key, value FROM settings');
+    const existing: Record<string, string> = {};
+    for (const row of existingRes.rows) existing[row.key] = row.value;
+
+    // Validate everything first so a bad value saves nothing
+    const updates: Array<[string, string]> = [];
     for (const key of Object.keys(settingsMap)) {
+      if (!ALLOWED_SETTING_KEYS.has(key) && !(key in existing)) continue;
+      const raw = settingsMap[key];
+      if (raw === undefined || raw === null) continue;
+      const value = typeof raw === 'object' ? JSON.stringify(raw) : String(raw);
+      // An empty password field means "keep the saved one"
+      if (key === 'smtp_pass' && value === '') continue;
+      if (existing[key] === value) continue;
+      const range = NUMERIC_SETTINGS[key];
+      if (range) {
+        const amount = Number(value);
+        if (value.trim() === '' || !Number.isFinite(amount) || amount < range[0] || amount > range[1]) {
+          res.status(400).json({ error: `قيمة الإعداد "${key}" غير صالحة (يجب أن تكون رقماً بين ${range[0]} و ${range[1]})` });
+          return;
+        }
+      }
+      if (key === 'smtp_port' && value.trim() !== '' && !ALLOWED_SMTP_PORTS.includes(Number(value))) {
+        res.status(400).json({ error: 'منفذ SMTP غير مسموح. المنافذ المتاحة: 25، 465، 587، 2525' });
+        return;
+      }
+      updates.push([key, value]);
+    }
+
+    for (const [key, value] of updates) {
       await pool.query(
         `INSERT INTO settings (key, value) VALUES ($1, $2)
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP`,
-        [key, String(settingsMap[key])]
+        [key, value]
       );
     }
-    await logAudit(req.user?.email || 'admin', 'تحديث إعدادات النظام العامة', 'تم حفظ التغييرات على إعدادات المنصة', req.ip);
+
+    if (updates.length > 0) {
+      const before: Record<string, string> = {};
+      const after: Record<string, string> = {};
+      for (const [key, value] of updates) {
+        const secret = SECRET_SETTING_KEYS.includes(key);
+        before[key] = secret ? '********' : (existing[key] ?? '');
+        after[key] = secret ? '********' : value;
+      }
+      await logAudit(
+        req.user?.email || 'admin',
+        'تحديث إعدادات النظام العامة',
+        `تم تعديل الإعدادات: ${updates.map(([key]) => key).join('، ')}`,
+        req.ip,
+        req.user?.email || 'المسؤول',
+        before,
+        after
+      );
+    }
     res.json({ success: true, message: 'تم حفظ إعدادات النظام بنجاح' });
   } catch (error: any) {
     console.error('Error updating settings:', error);
@@ -1068,17 +1519,45 @@ export const updateSettings = async (req: AuthRequest, res: Response): Promise<v
 
 export const testSmtpConnection = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { host, port, user, pass, secure, fromEmail, testEmail, templateSubject, templateHtml, variables } = req.body;
-    if (!host || !port) {
+    const { host, port, user, secure, fromEmail, testEmail, templateSubject, templateHtml, variables } = req.body;
+    if (!host || !port || typeof host !== 'string') {
       res.status(400).json({ error: 'يرجى إدخال خادم SMTP والمنفذ على الأقل' });
       return;
     }
+    const portNumber = Number(port);
+    if (!ALLOWED_SMTP_PORTS.includes(portNumber)) {
+      res.status(400).json({ error: 'منفذ SMTP غير مسموح. المنافذ المتاحة: 25، 465، 587، 2525' });
+      return;
+    }
+
+    // The test connects from the server, so it must not be usable to reach internal addresses
+    const cleanHost = host.trim();
+    let addresses: { address: string }[] = [];
+    try {
+      addresses = await dns.promises.lookup(cleanHost, { all: true });
+    } catch {
+      res.status(400).json({ success: false, error: 'تعذر العثور على خادم SMTP بهذا العنوان' });
+      return;
+    }
+    if (addresses.length === 0 || addresses.some((entry) => isPrivateAddress(entry.address))) {
+      res.status(400).json({ success: false, error: 'عنوان خادم SMTP غير مسموح' });
+      return;
+    }
+
+    // An empty password means the page is testing with the saved one
+    let pass = typeof req.body.pass === 'string' ? req.body.pass : '';
+    if (!pass) {
+      const saved = await pool.query('SELECT value FROM settings WHERE key = $1', ['smtp_pass']);
+      pass = saved.rows[0]?.value || '';
+    }
 
     const transporter = nodemailer.createTransport({
-      host,
-      port: Number(port),
-      secure: secure === true || secure === 'true' || Number(port) === 465,
+      // Connect to the address that was checked, so a second DNS answer cannot point elsewhere
+      host: addresses[0].address,
+      port: portNumber,
+      secure: secure === true || secure === 'true' || portNumber === 465,
       auth: user && pass ? { user, pass } : undefined,
+      tls: { servername: cleanHost },
     });
 
     await transporter.verify();
@@ -1116,7 +1595,7 @@ export const testSmtpConnection = async (req: AuthRequest, res: Response): Promi
     res.json({ success: true, message: 'تم التحقق من اتصال SMTP وإرسال رسالة الاختبار بنجاح' });
   } catch (error: any) {
     console.error('SMTP test error:', error);
-    res.status(400).json({ success: false, error: `فشل الاتصال بخادم SMTP: ${error.message}` });
+    res.status(400).json({ success: false, error: 'فشل الاتصال بخادم SMTP، تحقق من العنوان والمنفذ وبيانات الدخول' });
   }
 };
 
@@ -1188,7 +1667,7 @@ export const adminCreateCategory = async (req: AuthRequest, res: Response): Prom
     res.status(201).json({ success: true, data: result.rows[0] });
   } catch (error: any) {
     console.error('Create category error:', error);
-    res.status(500).json({ error: error.message || 'فشل إنشاء القسم' });
+    res.status(500).json({ error: 'فشل إنشاء القسم' });
   }
 };
 
@@ -1299,7 +1778,7 @@ export const adminCreateProduct = async (req: AuthRequest, res: Response): Promi
     res.status(201).json({ success: true, data: result.rows[0] });
   } catch (error: any) {
     console.error('Create product error:', error);
-    res.status(500).json({ error: error.message || 'فشل إنشاء المنتج' });
+    res.status(500).json({ error: 'فشل إنشاء المنتج' });
   }
 };
 
@@ -1329,7 +1808,7 @@ export const adminUpdateProduct = async (req: AuthRequest, res: Response): Promi
            name = COALESCE($2, name),
            description = COALESCE($3, description),
            price = COALESCE($4, price),
-           discount_price = $5,
+           discount_price = CASE WHEN $16::boolean THEN $5 ELSE discount_price END,
            category_id = COALESCE($6, category_id),
            image_url = COALESCE($7, image_url),
            images = COALESCE($8, images),
@@ -1356,6 +1835,8 @@ export const adminUpdateProduct = async (req: AuthRequest, res: Response): Promi
         is_featured !== undefined ? (is_featured === true || is_featured === 'true') : null,
         is_active !== undefined ? (is_active === true || is_active === 'true') : null,
         id,
+        // The discount is only touched when the request sends it; an explicit null or '' removes it
+        discount_price !== undefined,
       ]
     );
 
@@ -1536,12 +2017,6 @@ export const adminUpdateOrderStatus = async (req: AuthRequest, res: Response): P
       return;
     }
 
-    const currentOrder = await pool.query('SELECT status FROM store_orders WHERE id = $1', [id]);
-    if (currentOrder.rows.length === 0) {
-      res.status(404).json({ error: 'الطلب غير موجود' });
-      return;
-    }
-    const previousStatus = currentOrder.rows[0].status || 'pending';
     const allowedTransitions: Record<string, string[]> = {
       pending: ['processing', 'cancelled'],
       processing: ['shipped', 'cancelled'],
@@ -1549,31 +2024,47 @@ export const adminUpdateOrderStatus = async (req: AuthRequest, res: Response): P
       delivered: [],
       cancelled: [],
     };
-    if (status !== previousStatus && !(allowedTransitions[previousStatus] || []).includes(status)) {
-      res.status(409).json({ error: 'لا يمكن نقل الطلب إلى هذه الحالة من حالته الحالية' });
-      return;
-    }
 
-    // Cancelled orders give their reserved quantities back to the store
-    if (status === 'cancelled' && previousStatus !== 'cancelled') {
-      await pool.query(
-        `UPDATE store_products p SET stock = p.stock + i.quantity
-         FROM store_order_items i
-         WHERE i.order_id = $1 AND i.product_id = p.id`,
-        [id]
+    // Locked so two admins cannot cancel the same order at once and return its stock twice
+    const client = await pool.connect();
+    let result: any;
+    try {
+      await client.query('BEGIN');
+      const currentOrder = await client.query('SELECT status FROM store_orders WHERE id = $1 FOR UPDATE', [id]);
+      if (currentOrder.rows.length === 0) {
+        await client.query('ROLLBACK');
+        res.status(404).json({ error: 'الطلب غير موجود' });
+        return;
+      }
+      const previousStatus = currentOrder.rows[0].status || 'pending';
+      if (status !== previousStatus && !(allowedTransitions[previousStatus] || []).includes(status)) {
+        await client.query('ROLLBACK');
+        res.status(409).json({ error: 'لا يمكن نقل الطلب إلى هذه الحالة من حالته الحالية' });
+        return;
+      }
+
+      // Cancelled orders give their reserved quantities back to the store, once
+      if (status === 'cancelled' && previousStatus !== 'cancelled') {
+        await client.query(
+          `UPDATE store_products p SET stock = p.stock + i.quantity
+           FROM (SELECT product_id, SUM(quantity)::int AS quantity FROM store_order_items WHERE order_id = $1 GROUP BY product_id) i
+           WHERE i.product_id = p.id`,
+          [id]
+        );
+      }
+
+      result = await client.query(
+        `UPDATE store_orders
+         SET status = $1, updated_at = NOW()
+         WHERE id = $2 RETURNING *`,
+        [status, id]
       );
-    }
-
-    const result = await pool.query(
-      `UPDATE store_orders
-       SET status = $1, updated_at = NOW()
-       WHERE id = $2 RETURNING *`,
-      [status, id]
-    );
-
-    if (result.rows.length === 0) {
-      res.status(404).json({ error: 'الطلب غير موجود' });
-      return;
+      await client.query('COMMIT');
+    } catch (txError) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw txError;
+    } finally {
+      client.release();
     }
 
     const order = result.rows[0];

@@ -111,8 +111,18 @@ export const handleRefreshToken = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    // Revoke old token and rotate to a new token in the same family
-    await pool.query('UPDATE refresh_tokens SET is_revoked = TRUE WHERE id = $1', [tokenId]);
+    // Revoke old token and rotate to a new token in the same family. The revoke is atomic: when two requests
+    // race with the same token only one wins, and the other is treated as reuse
+    const claimed = await pool.query(
+      'UPDATE refresh_tokens SET is_revoked = TRUE WHERE id = $1 AND token_hash = $2 AND is_revoked = FALSE RETURNING id',
+      [tokenId, tokenHash]
+    );
+    if (claimed.rows.length === 0) {
+      console.warn(`⚠️ [Security Alert] Refresh token reuse detected for family ${tokenRow.family_id}! Revoking family.`);
+      await pool.query('UPDATE refresh_tokens SET is_revoked = TRUE WHERE family_id = $1', [tokenRow.family_id]);
+      res.status(401).json({ error: 'Security breach detected. All sessions in this family revoked.' });
+      return;
+    }
 
     const newRawRefreshToken = crypto.randomBytes(32).toString('hex');
     const newTokenHash = crypto.createHash('sha256').update(newRawRefreshToken).digest('hex');
@@ -590,6 +600,38 @@ export const resetPassword = async (req: Request, res: Response): Promise<void> 
 };
 
 const MAX_FAILED_LOGINS = 10;
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
+
+// Failed logins are counted per account and address, so someone guessing from one address cannot lock the
+// owner out everywhere; guessing from many addresses is still throttled per address by loginLimiter
+const failedLogins = new Map<string, { count: number; lockedUntil: number; lastAt: number }>();
+
+const loginLockKey = (userId: string, ip: string | undefined) => `${userId}|${ip || 'unknown'}`;
+
+const isLoginLocked = (key: string): boolean => {
+  const entry = failedLogins.get(key);
+  return !!entry && entry.lockedUntil > Date.now();
+};
+
+const recordFailedLogin = (key: string) => {
+  const now = Date.now();
+  const entry = failedLogins.get(key);
+  // Attempts older than the lock window are forgotten
+  const count = entry && now - entry.lastAt < LOGIN_LOCK_MS && entry.lockedUntil <= now ? entry.count + 1 : 1;
+  if (count >= MAX_FAILED_LOGINS) {
+    failedLogins.set(key, { count: 0, lockedUntil: now + LOGIN_LOCK_MS, lastAt: now });
+  } else {
+    failedLogins.set(key, { count, lockedUntil: 0, lastAt: now });
+  }
+};
+
+// Keeps the map small: entries whose lock and attempt window have passed are dropped
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of failedLogins) {
+    if (entry.lockedUntil <= now && now - entry.lastAt >= LOGIN_LOCK_MS) failedLogins.delete(key);
+  }
+}, 5 * 60 * 1000).unref();
 
 export const login = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -606,8 +648,9 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 
     const user = userResult.rows[0];
 
-    // Per-account lockout: guessing one account's password from many addresses is stopped too
-    if (user.login_locked_until && new Date(user.login_locked_until) > new Date()) {
+    // Per-account-and-address lockout
+    const lockKey = loginLockKey(String(user.id), req.ip);
+    if (isLoginLocked(lockKey)) {
       res.status(429).json({ error: 'تم إيقاف تسجيل الدخول لهذا الحساب مؤقتاً بسبب محاولات خاطئة متكررة، يرجى المحاولة بعد 15 دقيقة أو استعادة كلمة المرور' });
       return;
     }
@@ -625,17 +668,12 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     }
 
     if (!validPassword) {
-      await pool.query(
-        `UPDATE users
-         SET failed_login_attempts = CASE WHEN COALESCE(failed_login_attempts, 0) + 1 >= $2 THEN 0 ELSE COALESCE(failed_login_attempts, 0) + 1 END,
-             login_locked_until = CASE WHEN COALESCE(failed_login_attempts, 0) + 1 >= $2 THEN NOW() + INTERVAL '15 minutes' ELSE login_locked_until END
-         WHERE id = $1`,
-        [user.id, MAX_FAILED_LOGINS]
-      );
+      recordFailedLogin(lockKey);
       res.status(401).json({ error: 'البريد الإلكتروني أو كلمة المرور غير صحيحة' });
       return;
     }
 
+    failedLogins.delete(lockKey);
     if (user.failed_login_attempts || user.login_locked_until) {
       await pool.query('UPDATE users SET failed_login_attempts = 0, login_locked_until = NULL WHERE id = $1', [user.id]);
     }

@@ -143,6 +143,29 @@ export const updatePackageByAdmin = async (req: Request, res: Response): Promise
       image_url
     } = req.body;
 
+    // Validate dates against the stored values so a partial update can't invert them
+    if (departure_date || return_date) {
+      const cur = await pool.query('SELECT departure_date, return_date FROM packages WHERE id = $1', [pkgId]);
+      const dep = departure_date || cur.rows[0]?.departure_date;
+      const ret = return_date || cur.rows[0]?.return_date;
+      if (dep && ret && new Date(ret).getTime() < new Date(dep).getTime()) {
+        res.status(400).json({ error: 'تاريخ العودة يجب أن يكون بعد تاريخ المغادرة' });
+        return;
+      }
+    }
+    if (room_prices && typeof room_prices === 'object') {
+      const values: unknown[] = [];
+      const walk = (v: unknown) => {
+        if (v && typeof v === 'object') Object.values(v as Record<string, unknown>).forEach(walk);
+        else if (v !== null && v !== undefined && v !== '') values.push(v);
+      };
+      walk(room_prices);
+      if (values.some((v) => !Number.isFinite(Number(v)) || Number(v) < 0)) {
+        res.status(400).json({ error: 'أسعار الغرف يجب أن تكون أرقاماً موجبة' });
+        return;
+      }
+    }
+
     const result = await pool.query(
       `UPDATE packages SET
         title = COALESCE($1, title),

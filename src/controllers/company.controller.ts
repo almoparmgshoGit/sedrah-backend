@@ -1,3 +1,4 @@
+import { isCompanySuspended, suspensionInfo, SUSPENDED_ERROR } from '../utils/companySuspension';
 import { Response, NextFunction } from 'express';
 import { pool } from '../config/db';
 import { io } from '../server';
@@ -48,6 +49,25 @@ export const requireCompany = async (req: CompanyRequest, res: Response, next: N
     console.error('requireCompany error:', error);
     res.status(500).json({ error: 'تعذر التحقق من الشركة' });
   }
+};
+
+// Blocks new business while the platform has the company suspended. Serving existing bookings,
+// chats with current customers and support tickets stay open so nobody is left stranded.
+export const blockWhenSuspended = (req: CompanyRequest, res: Response, next: NextFunction): void => {
+  if (isCompanySuspended(req.company)) {
+    res.status(403).json({ error: SUSPENDED_ERROR, code: 'COMPANY_SUSPENDED', ...suspensionInfo(req.company) });
+    return;
+  }
+  next();
+};
+
+// Pausing or hiding a package is always allowed; publishing one is new business
+export const blockPublishWhenSuspended = (req: CompanyRequest, res: Response, next: NextFunction): void => {
+  if (req.body?.status === 'active') {
+    blockWhenSuspended(req, res, next);
+    return;
+  }
+  next();
 };
 
 // Passes when the owner or the member's role has any of the given permissions
@@ -114,6 +134,8 @@ export const getCompanyAccess = async (req: CompanyRequest, res: Response): Prom
       job_title: access.jobTitle,
       permissions: access.permissions,
       permission_groups: COMPANY_PERMISSION_GROUPS,
+      // The company app shows a banner and disables new-business actions while this is set
+      suspension: suspensionInfo(req.company),
     },
   });
 };
@@ -245,6 +267,7 @@ export const getCompanyDashboard = async (req: CompanyRequest, res: Response): P
         today_appointments: today.rows,
         // What the company still has to complete before customers can see it
         readiness: await getCompanyReadiness(companyId),
+        suspension: suspensionInfo(req.company),
       },
     });
   } catch (error) {

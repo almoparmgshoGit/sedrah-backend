@@ -10,6 +10,7 @@ import pinoHttp from 'pino-http';
 import { env } from './config/env';
 import { pool } from './config/db';
 import { globalLimiter, authLimiter, loginLimiter, sessionLimiter, passwordResetLimiter, authenticate, verifyOwnershipOrAdmin, AuthRequest } from './middlewares/security.middleware';
+import { getGrantedPermissions, canAccessModule } from './middlewares/permission.middleware';
 import { registerSchema, loginSchema, updateProfileSchema, sendOtpSchema, verifyOtpSchema, forgotPasswordSchema, resetPasswordSchema, companyRequestSchema, companyRequestDocumentSchema } from './validators/auth.validator';
 import { createCompanyRequest, getMyCompanyRequest, resubmitMyCompanyRequestDocument } from './controllers/companyRequests.controller';
 import { register, login, sendOtp, verifyOtp, forgotPassword, resetPassword, getUserProfile, updateUserProfile, getCurrentUser, updateMyProfile, getProfileStatus, googleLogin, deleteMyAccount, generateGuestToken, handleRefreshToken, logoutUser } from './controllers/auth.controller';
@@ -156,22 +157,42 @@ const io = new SocketIOServer(server, {
 
 const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
 
-io.use((socket, next) => {
+// The role, status and permissions come from the database, so a demoted or banned account loses access at once
+const loadSocketAccount = async (userId: string) => {
+  const result = await pool.query('SELECT id, email, role, status, is_banned FROM users WHERE id = $1', [userId]);
+  const row = result.rows[0];
+  if (!row || row.status === 'banned' || row.status === 'inactive' || row.is_banned === true) return null;
+  const isStaff = STAFF_ROLES.includes(row.role);
+  const canSupport = isStaff ? canAccessModule(await getGrantedPermissions(String(row.id), row.role), 'support') : false;
+  return { id: String(row.id), email: row.email, role: row.role, isStaff, canSupport };
+};
+
+io.use(async (socket, next) => {
   try {
     const decoded = jwt.verify(String(socket.handshake.auth?.token || ''), env.JWT_SECRET, { algorithms: ['HS256'] }) as any;
     if (decoded.role === 'guest' || decoded.aud === 'sdra-guest') return next(new Error('Unauthorized'));
-    socket.data.user = decoded;
+    const account = await loadSocketAccount(String(decoded.id));
+    if (!account) return next(new Error('Unauthorized'));
+    socket.data.user = { ...decoded, ...account };
     next();
   } catch {
     next(new Error('Unauthorized'));
   }
 });
 
+/** Ends every live socket of a user, e.g. after a ban or a permission change, so it reconnects with its new access. */
+export const disconnectUserSockets = (userId: string): void => {
+  io.in(`user_${userId}`).disconnectSockets(true);
+};
+
 io.on('connection', (socket) => {
   const user = socket.data.user;
-  const isStaff = STAFF_ROLES.includes(user.role);
+  const isStaff: boolean = user.isStaff;
+  socket.join(`user_${user.id}`);
   if (isStaff) {
+    // Support staff receive the live chat and ticket updates of the support desk
     socket.join('staff');
+    if (user.canSupport) socket.join('support_staff');
     // Admin alerts are sent per admin, since each one only receives the modules it is allowed to open
     socket.join(`admin_${user.id}`);
   }
@@ -180,7 +201,16 @@ io.on('connection', (socket) => {
   socket.on('join_room', async (room: string) => {
     try {
       if (typeof room !== 'string') return;
-      if (!isStaff) {
+      if (room.startsWith('admin_') || room.startsWith('user_') || room === 'staff' || room === 'support_staff') {
+        // Personal rooms are joined on connection only, and never another account's
+        return;
+      }
+      if (isStaff) {
+        // Staff open customer chats and tickets only with the support permission, checked again on each join
+        if (!room.startsWith('chat_')) return;
+        const account = await loadSocketAccount(String(user.id));
+        if (!account || !account.isStaff || !account.canSupport) return;
+      } else {
         // Customers may only join the rooms of their own chats, and a company owner those of its company's chats
         if (!room.startsWith('chat_')) return;
         const owned = await pool.query(

@@ -4,9 +4,11 @@ import { notifyCitySubscribers } from './cities.controller';
 import { AuthRequest } from '../middlewares/security.middleware';
 import { notifyCompanyTeam, resolveCompanyAccess } from '../utils/companyAccess';
 import { logAudit } from '../utils/auditLogger';
-import { enrichPackage, PACKAGE_EXTRA_COLUMNS } from '../utils/packageInfo';
+import { enrichPackage, PACKAGE_EXTRA_COLUMNS, lowestAdultPrice, ROOM_KEYS } from '../utils/packageInfo';
 import { companyReadySql } from '../utils/companyReadiness';
+import { isCompanySuspended, suspensionInfo } from '../utils/companySuspension';
 import { createAdminAlert, resolveAdminAlerts } from '../utils/adminAlerts';
+import { ownerConflict, afterOwnerChange } from '../utils/companyOwner';
 import { formatCompanyId, formatPackageId, formatUserId, parseIdOrToken, generateRandomToken, generate16CharId } from '../utils/formatId';
 
 const findCompanyQuery = async (rawId: any) => {
@@ -156,7 +158,8 @@ export const getCompanyById = async (req: Request, res: Response): Promise<void>
     const rawId = req.params.id;
     const result = await findCompanyQuery(rawId);
 
-    if (result.rows.length === 0) {
+    // Suspended companies are hidden from customers, exactly like a missing one
+    if (result.rows.length === 0 || isCompanySuspended(result.rows[0])) {
       res.status(404).json({ error: 'الشركة غير موجودة' });
       return;
     }
@@ -446,8 +449,18 @@ export const getCompanyAdminDetails = async (req: Request, res: Response): Promi
       return;
     }
 
-    const company = compRes.rows[0];
+    const company = { ...compRes.rows[0] };
     const companyId = company.id;
+
+    // 0. Owner account (companies only stores user_id); the edit form shows the owner's email
+    const ownerRes = await pool.query(
+      `SELECT u.name, u.email, u.phone FROM companies c LEFT JOIN users u ON u.id = c.user_id WHERE c.id = $1`,
+      [companyId]
+    );
+    const owner = ownerRes.rows[0];
+    company.owner_name = owner?.name || null;
+    company.owner_email = owner?.email || null;
+    company.owner_phone = owner?.phone || null;
 
     // 1. Packages
     const packagesRes = await pool.query('SELECT * FROM packages WHERE company_id = $1 ORDER BY created_at DESC', [companyId]);
@@ -485,7 +498,7 @@ export const getCompanyAdminDetails = async (req: Request, res: Response): Promi
     res.json({
       success: true,
       data: {
-        company,
+        company: { ...company, ...suspensionInfo(company) },
         packages: packagesRes.rows,
         reviews: reviewsRes.rows,
         bookings: bookingsRes.rows,
@@ -496,6 +509,39 @@ export const getCompanyAdminDetails = async (req: Request, res: Response): Promi
     console.error('Error fetching company admin details:', error);
     res.status(500).json({ error: 'فشل جلب بيانات وتفاصيل الشركة' });
   }
+};
+
+// Every room price the admin typed must be a non-negative number (blank means the room is not offered)
+const roomPricesError = (roomPrices: any): string | null => {
+  let prices: any = roomPrices;
+  if (typeof prices === 'string') {
+    if (!prices.trim()) return null;
+    try {
+      prices = JSON.parse(prices);
+    } catch {
+      return 'أسعار الغرف غير صالحة';
+    }
+  }
+  if (!prices || typeof prices !== 'object') return null;
+  const bad = (value: unknown) => {
+    if (value === undefined || value === null || (typeof value === 'string' && value.trim() === '')) return false;
+    const amount = Number(value);
+    return !Number.isFinite(amount) || amount < 0;
+  };
+  for (const key of ROOM_KEYS) {
+    const entry = prices[key];
+    const values = entry && typeof entry === 'object' ? [entry.adult, entry.price, entry.child] : [entry, prices[`${key}_child`]];
+    if (values.some(bad)) return 'أسعار الغرف يجب أن تكون أرقاماً لا تقل عن صفر';
+  }
+  return null;
+};
+
+const packageDatesError = (departure: unknown, ret: unknown): string | null => {
+  if (!departure || !ret) return null;
+  const from = new Date(String(departure)).getTime();
+  const to = new Date(String(ret)).getTime();
+  if (Number.isNaN(from) || Number.isNaN(to)) return 'تاريخ السفر أو العودة غير صالح';
+  return to < from ? 'تاريخ العودة يجب أن يكون في يوم السفر أو بعده' : null;
 };
 
 export const createCompanyPackage = async (req: Request, res: Response): Promise<void> => {
@@ -535,6 +581,15 @@ export const createCompanyPackage = async (req: Request, res: Response): Promise
       return;
     }
 
+    const validationError = packageDatesError(departure_date, return_date) || roomPricesError(room_prices);
+    if (validationError) {
+      res.status(400).json({ error: validationError });
+      return;
+    }
+    // The listed "starting from" price is the cheapest adult room, so it always matches the room prices
+    const fallbackPrice = Number(price);
+    const startingPrice = lowestAdultPrice(room_prices) ?? (Number.isFinite(fallbackPrice) && fallbackPrice > 0 ? fallbackPrice : null);
+
     let targetCityId = city_id || compRes.rows[0].city_id;
     if (!targetCityId) {
       const firstCityRes = await pool.query('SELECT id FROM cities ORDER BY created_at ASC LIMIT 1');
@@ -558,7 +613,7 @@ export const createCompanyPackage = async (req: Request, res: Response): Promise
         targetCityId,
         title,
         duration,
-        price ? parseFloat(price) : null,
+        startingPrice,
         image_url || '',
         description || '',
         typeof features === 'object' ? JSON.stringify(features) : (features || ''),
@@ -642,13 +697,34 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
       owner_email
     } = req.body;
 
-    let userId = undefined;
-    if (owner_email !== undefined) {
-      if (owner_email) {
-        const userCheck = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [owner_email.trim()]);
-        userId = userCheck.rows.length > 0 ? userCheck.rows[0].id : null;
-      } else {
-        userId = null;
+    // The owner only changes when a different, existing account is typed in. A blank field never
+    // unlinks the owner (that is done from the owner action, which notifies them).
+    const before0 = compRes.rows[0];
+    const previousOwner = before0.user_id ? String(before0.user_id) : null;
+    let userId: string | undefined = undefined;
+    // An email without an account is kept as pending (the current owner stays); it is linked once that account exists
+    let pendingOwnerEmail: string | undefined = undefined;
+    const ownerEmail = typeof owner_email === 'string' ? owner_email.trim().slice(0, 255) : '';
+    if (ownerEmail) {
+      const userCheck = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [ownerEmail]);
+      const foundId = userCheck.rows[0]?.id ? String(userCheck.rows[0].id) : null;
+      if (!foundId) {
+        const alreadyPending = before0.pending_owner_email
+          && String(before0.pending_owner_email).toLowerCase() === ownerEmail.toLowerCase();
+        if (!alreadyPending) {
+          if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(ownerEmail)) {
+            res.status(400).json({ error: 'بريد المالك غير صالح' });
+            return;
+          }
+          pendingOwnerEmail = ownerEmail;
+        }
+      } else if (foundId !== previousOwner) {
+        const conflict = await ownerConflict(before0, foundId);
+        if (conflict) {
+          res.status(409).json({ error: conflict });
+          return;
+        }
+        userId = foundId;
       }
     }
 
@@ -665,7 +741,7 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
       landline_phone,
       website_url,
       typeof social_links === 'object' ? JSON.stringify(social_links) : social_links,
-      city_id ? parseInt(String(city_id), 10) : null,
+      city_id !== undefined && city_id !== null && String(city_id).trim() !== '' ? String(city_id).trim() : null,
       address,
       google_maps_url,
       logo_url,
@@ -688,7 +764,10 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
     let userIdSql = '';
     if (userId !== undefined) {
       paramList.push(userId);
-      userIdSql = `, user_id = $${paramList.length}`;
+      userIdSql = `, user_id = $${paramList.length}, pending_owner_email = NULL`;
+    } else if (pendingOwnerEmail !== undefined) {
+      paramList.push(pendingOwnerEmail);
+      userIdSql = `, pending_owner_email = $${paramList.length}`;
     }
 
     paramList.push(companyId);
@@ -697,24 +776,24 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
     const result = await pool.query(
       `UPDATE companies SET
         name = COALESCE(NULLIF($1, ''), name),
-        short_description = COALESCE(NULLIF($2, ''), short_description),
+        short_description = CASE WHEN $2::text IS NULL THEN short_description ELSE NULLIF($2::text, '') END,
         description = COALESCE(NULLIF($3, ''), description),
         phone = COALESCE(NULLIF($4, ''), phone),
-        whatsapp = COALESCE(NULLIF($5, ''), whatsapp),
-        landline_phone = COALESCE(NULLIF($6, ''), landline_phone),
-        website_url = COALESCE(NULLIF($7, ''), website_url),
-        social_links = COALESCE($8, social_links),
+        whatsapp = CASE WHEN $5::text IS NULL THEN whatsapp ELSE NULLIF($5::text, '') END,
+        landline_phone = CASE WHEN $6::text IS NULL THEN landline_phone ELSE NULLIF($6::text, '') END,
+        website_url = CASE WHEN $7::text IS NULL THEN website_url ELSE NULLIF($7::text, '') END,
+        social_links = CASE WHEN $8::text IS NULL THEN social_links ELSE NULLIF($8::text, '') END,
         city_id = COALESCE($9, city_id),
         address = COALESCE(NULLIF($10, ''), address),
-        google_maps_url = COALESCE(NULLIF($11, ''), google_maps_url),
+        google_maps_url = CASE WHEN $11::text IS NULL THEN google_maps_url ELSE NULLIF($11::text, '') END,
         logo_url = COALESCE(NULLIF($12, ''), logo_url),
         banner_url = COALESCE(NULLIF($13, ''), banner_url),
         working_hours = COALESCE($14, working_hours),
-        holidays_notes = COALESCE(NULLIF($15, ''), holidays_notes),
-        commercial_register_url = COALESCE(NULLIF($16, ''), commercial_register_url),
-        tax_id_url = COALESCE(NULLIF($17, ''), tax_id_url),
-        manager_id_url = COALESCE(NULLIF($18, ''), manager_id_url),
-        manager_id_back_url = COALESCE(NULLIF($19, ''), manager_id_back_url),
+        holidays_notes = CASE WHEN $15::text IS NULL THEN holidays_notes ELSE NULLIF($15::text, '') END,
+        commercial_register_url = CASE WHEN $16::text IS NULL THEN commercial_register_url ELSE NULLIF($16::text, '') END,
+        tax_id_url = CASE WHEN $17::text IS NULL THEN tax_id_url ELSE NULLIF($17::text, '') END,
+        manager_id_url = CASE WHEN $18::text IS NULL THEN manager_id_url ELSE NULLIF($18::text, '') END,
+        manager_id_back_url = CASE WHEN $19::text IS NULL THEN manager_id_back_url ELSE NULLIF($19::text, '') END,
         field_verified = COALESCE($20, field_verified),
         verified = COALESCE($21, verified),
         working_days = COALESCE($22, working_days),
@@ -730,6 +809,7 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
 
     const updatedComp = result.rows[0];
     const before = compRes.rows[0];
+    if (userId !== undefined) await afterOwnerChange(updatedComp, previousOwner, userId);
 
     // The company team is told what the platform changed in its profile
     const FIELD_LABELS: Record<string, string> = {
@@ -800,6 +880,8 @@ export const getMyCompanyProfile = async (req: AuthRequest, res: Response): Prom
     const formatted = {
       ...comp,
       id: formatCompanyId(comp.id, comp.public_id),
+      // The company app shows a banner and disables new-business actions while suspended
+      ...suspensionInfo(comp),
       access: {
         is_owner: access.isOwner,
         role_name: access.roleName,

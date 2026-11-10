@@ -1124,6 +1124,16 @@ export const initDB = async () => {
     // Each official company document has its own review status and rejection reason
     await pool.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS documents_review TEXT;');
 
+    // Suspension by the platform: hidden from customers and blocked from new business until lifted
+    // (or until suspended_until passes, when it is temporary)
+    await pool.query(`
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'active';
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS suspension_reason TEXT;
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMP;
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS suspended_until TIMESTAMP;
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS suspended_by VARCHAR(255);
+    `);
+
     // The travelers' names, entered by the company from the papers handed over at its office;
     // every trip document (visa, ticket, hotel) is attached to one of these names
     await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS traveler_names TEXT;');

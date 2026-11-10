@@ -1,4 +1,5 @@
 import { pool } from '../config/db';
+import { companyActiveSql, isCompanySuspended } from './companySuspension';
 
 /*
  * A company appears to customers only once its public profile is complete: logo, description, contact,
@@ -10,7 +11,8 @@ const filled = (column: string) => `NULLIF(TRIM(COALESCE(${column}, '')), '') IS
 
 // SQL condition that is true when the company behind `alias` is complete
 export const companyReadySql = (alias = 'c') => `(
-  ${filled(`${alias}.logo_url`)}
+  ${companyActiveSql(alias)}
+  AND ${filled(`${alias}.logo_url`)}
   AND (${filled(`${alias}.short_description`)} OR ${filled(`${alias}.description`)})
   AND (${filled(`${alias}.phone`)} OR ${filled(`${alias}.whatsapp`)} OR ${filled(`${alias}.landline_phone`)})
   AND ${alias}.city_id IS NOT NULL AND ${filled(`${alias}.address`)}
@@ -67,5 +69,6 @@ export const getCompanyReadiness = async (companyId: string): Promise<{ ready: b
     },
     { key: 'packages', label: 'باقة منشورة', hint: 'أضف باقة واحدة على الأقل وانشرها', done: Number(c.active_packages || 0) > 0, section: 'packages' },
   ];
-  return { ready: items.every((item) => item.done), items };
+  // A suspended company stays hidden even with a complete profile
+  return { ready: items.every((item) => item.done) && !isCompanySuspended(c), items };
 };

@@ -276,10 +276,28 @@ export const reviewReceipt = async (req: AuthRequest, res: Response): Promise<vo
       res.status(409).json({ error: 'تمت مراجعة هذا الإيصال بالفعل، حدّث الصفحة' });
       return;
     }
-    if (action === 'reopen' && (current.status === 'receipt_review' || current.status === 'completed')) {
+    if (action === 'reopen' && (current.status === 'receipt_review' || current.status === 'completed' || current.status === 'cancelled')) {
       await client.query('ROLLBACK');
-      res.status(409).json({ error: current.status === 'completed' ? 'لا يمكن إعادة فتح إيصال رحلة مكتملة' : 'الإيصال قيد المراجعة بالفعل' });
+      res.status(409).json({
+        error: current.status === 'completed'
+          ? 'لا يمكن إعادة فتح إيصال رحلة مكتملة'
+          : current.status === 'cancelled'
+            ? 'لا يمكن إعادة فتح إيصال حجز ملغي'
+            : 'الإيصال قيد المراجعة بالفعل',
+      });
       return;
+    }
+    if (action === 'reopen' || action === 'reject') {
+      // A commission already included in a settlement cannot be cancelled from under it
+      const settled = await client.query(
+        'SELECT 1 FROM platform_earnings WHERE booking_id = $1 AND settlement_id IS NOT NULL FOR UPDATE',
+        [current.id]
+      );
+      if (settled.rows.length > 0) {
+        await client.query('ROLLBACK');
+        res.status(409).json({ error: 'لا يمكن إعادة فتح/رفض إيصال تمت تسوية عمولته' });
+        return;
+      }
     }
 
     if (action === 'approve') {
@@ -304,13 +322,28 @@ export const reviewReceipt = async (req: AuthRequest, res: Response): Promise<vo
         `UPDATE trip_stages SET status = 'current' WHERE booking_id = $1 AND stage_order = 4 AND status = 'pending'`,
         [booking.id]
       );
+      // When the admin verified a different amount than the booking total, the commission follows the amount
+      // actually paid, at the same rate recorded on the booking (a fixed-amount commission does not change)
+      let commission = Number(booking.commission_amount || 0);
+      const verified = Number(booking.receipt_verified_amount);
+      const total = Number(booking.total_price);
+      if (
+        booking.commission_method_used !== 'fixed_amount' &&
+        Number.isFinite(verified) && verified > 0 &&
+        Number.isFinite(total) && total > 0 &&
+        Math.abs(verified - total) > 0.009
+      ) {
+        commission = Math.round(commission * (verified / total) * 100) / 100;
+        const recalculated = await client.query('UPDATE bookings SET commission_amount = $2 WHERE id = $1 RETURNING *', [booking.id, commission]);
+        booking = recalculated.rows[0];
+      }
       const pkg = await client.query('SELECT company_id FROM packages WHERE id = $1', [booking.package_id]);
       if (pkg.rows[0]?.company_id) {
         await client.query(
           `INSERT INTO platform_earnings (id, booking_id, company_id, commission_amount, status)
            VALUES ($1, $2, $3, $4, 'recorded')
            ON CONFLICT (booking_id) DO UPDATE SET commission_amount = EXCLUDED.commission_amount, status = 'recorded'`,
-          [generate16CharId(), booking.id, pkg.rows[0].company_id, booking.commission_amount || 0]
+          [generate16CharId(), booking.id, pkg.rows[0].company_id, commission]
         );
       }
       await addHistory(client, booking.id, 'approved', actor, { receiptUrl: booking.receipt_url, verifiedAmount: booking.receipt_verified_amount, note });
@@ -335,7 +368,7 @@ export const reviewReceipt = async (req: AuthRequest, res: Response): Promise<vo
           : `UPDATE trip_stages SET status = 'cancelled' WHERE booking_id = $1 AND status <> 'completed'`,
         [booking.id]
       );
-      await client.query(`UPDATE platform_earnings SET status = 'cancelled' WHERE booking_id = $1`, [booking.id]);
+      await client.query(`UPDATE platform_earnings SET status = 'cancelled' WHERE booking_id = $1 AND settlement_id IS NULL`, [booking.id]);
       await addHistory(client, booking.id, 'rejected', actor, { receiptUrl: booking.receipt_url, reason, note });
     } else {
       const updated = await client.query(
@@ -351,7 +384,7 @@ export const reviewReceipt = async (req: AuthRequest, res: Response): Promise<vo
          WHERE booking_id = $1 AND stage_order >= 1`,
         [booking.id]
       );
-      await client.query(`UPDATE platform_earnings SET status = 'cancelled' WHERE booking_id = $1`, [booking.id]);
+      await client.query(`UPDATE platform_earnings SET status = 'cancelled' WHERE booking_id = $1 AND settlement_id IS NULL`, [booking.id]);
       await addHistory(client, booking.id, 'reopened', actor, { receiptUrl: booking.receipt_url, reason, note });
     }
     await client.query('COMMIT');

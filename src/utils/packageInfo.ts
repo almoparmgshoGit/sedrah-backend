@@ -71,6 +71,19 @@ export const getRoomOptions = (pkg: { room_prices?: any; price?: any }): RoomOpt
   return options;
 };
 
+/**
+ * The package's "starting from" price: the cheapest adult room the company priced. The customer app sorts and
+ * filters by it. Accepts both stored room_prices shapes (flat or nested) and a JSON string.
+ */
+export const lowestAdultPrice = (roomPrices: any): number | null => {
+  const prices = parseJson(roomPrices, {}) || {};
+  const amounts = ROOM_KEYS.map((key) => {
+    const entry = prices[key];
+    return entry && typeof entry === 'object' ? positive(entry.adult ?? entry.price) : positive(entry);
+  }).filter((value) => value > 0);
+  return amounts.length > 0 ? Math.min(...amounts) : null;
+};
+
 export class BookingPriceError extends Error {}
 
 export const calculateBookingTotal = (pkg: any, roomType: string, adults: number, children: number): number => {

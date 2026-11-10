@@ -2,6 +2,7 @@ import { pool } from '../config/db';
 import { env } from '../config/env';
 import { io } from '../server';
 import { generate16CharId } from './formatId';
+import { toMinutes } from './appointmentEngine';
 import { createAndSendNotification } from './notificationHelper';
 
 /**
@@ -33,6 +34,24 @@ const localHour = (): number =>
 export const isPastAppointmentDay = (date: unknown): boolean => {
   const day = String(date || '').slice(0, 10);
   return /^\d{4}-\d{2}-\d{2}$/.test(day) && day < localToday();
+};
+
+const localMinutes = (): number => {
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone: env.APP_TIMEZONE, hour: 'numeric', minute: 'numeric', hourCycle: 'h23' })
+    .formatToParts(new Date());
+  const part = (type: string) => Number(parts.find((p) => p.type === type)?.value || 0);
+  return part('hour') * 60 + part('minute');
+};
+
+/**
+ * True when the appointment's day has ended, or it is today and its time has already come (platform time zone).
+ * A time that cannot be read is judged by its day only.
+ */
+export const isPastAppointmentTime = (date: unknown, time: unknown): boolean => {
+  if (isPastAppointmentDay(date)) return true;
+  if (String(date || '').slice(0, 10) !== localToday()) return false;
+  const minutes = toMinutes(String(time || ''));
+  return minutes !== null && minutes <= localMinutes();
 };
 
 const notifyChat = async (chatId: string | null, userId: string, companyName: string, text: string, appointment: any) => {

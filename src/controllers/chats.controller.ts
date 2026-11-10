@@ -7,7 +7,8 @@ import { sendPushToUsers } from '../utils/pushNotification';
 import { generate16CharId } from '../utils/formatId';
 import { logAudit } from '../utils/auditLogger';
 import { normalizeUploadUrl, resolveUserUpload } from '../utils/uploadAccess';
-import { expireOverdueAppointmentsThrottled, isPastAppointmentDay, localToday } from '../utils/appointmentLifecycle';
+import { expireOverdueAppointmentsThrottled, isPastAppointmentDay, isPastAppointmentTime, localToday } from '../utils/appointmentLifecycle';
+import { availableVisitSlots, toMinutes } from '../utils/appointmentEngine';
 import { companyTeamUserIds, notifyCompanyTeam } from '../utils/companyAccess';
 import { createAdminAlert, resolveAdminAlerts } from '../utils/adminAlerts';
 
@@ -162,7 +163,7 @@ async function resolveChatId(param: string | string[] | number | undefined): Pro
   const rawStr = Array.isArray(param) ? param[0] : param;
   const str = String(rawStr).trim();
   try {
-    const res = await pool.query('SELECT id FROM chats WHERE id = $1 OR ticket_number = $1', [str, str]);
+    const res = await pool.query('SELECT id FROM chats WHERE id = $1 OR ticket_number = $1', [str]);
     return res.rows.length > 0 ? res.rows[0].id : str;
   } catch (err) {
     try {
@@ -171,6 +172,54 @@ async function resolveChatId(param: string | string[] | number | undefined): Pro
     } catch {
       return str;
     }
+  }
+}
+
+// Statuses in which the customer may pick a different visit time themselves; never after the visit or a company cancellation
+const CUSTOMER_CHOOSABLE_STATUSES = ['pending', 'suggested', 'confirmed', 'rejected', 'expired', 'missed'];
+
+/**
+ * The company behind a customer's chat, and the customer's latest appointment with it (a company proposal,
+ * or else the date set on a booking still waiting for its visit). Null when the chat is not this customer's.
+ */
+async function customerAppointmentContext(identifier: string | string[] | undefined, chatId: any, userId: string) {
+  const resolved = await resolveChatTarget(identifier, chatId, userId);
+  if (resolved.chat && resolved.chat.user_id !== userId) return null;
+  const companyRes = await pool.query(
+    'SELECT id, name, address FROM companies WHERE id::text = $1 OR name = $2 LIMIT 1',
+    [String(resolved.companyId || ''), resolved.companyName || '']
+  );
+  const company = companyRes.rows[0];
+  if (!company) return null;
+
+  const apptRes = await pool.query(
+    'SELECT * FROM interview_appointments WHERE user_id = $1 AND company_name = $2 ORDER BY created_at DESC LIMIT 1',
+    [userId, company.name]
+  );
+  let latest: any = apptRes.rows[0] || null;
+  if (!latest) {
+    const bookingRes = await pool.query(
+      `SELECT COALESCE(b.appointment_status, 'pending') AS status FROM bookings b JOIN packages p ON b.package_id = p.id
+       WHERE b.user_id = $1 AND p.company_id = $2 AND b.status = 'new' AND b.appointment_date IS NOT NULL
+       ORDER BY b.created_at DESC LIMIT 1`,
+      [userId, company.id]
+    );
+    latest = bookingRes.rows[0] || null;
+  }
+  return { chatId: resolved.chatId, company, latest };
+}
+
+const NOT_CHOOSABLE_ERROR = 'لا يوجد موعد زيارة مع هذه الشركة يمكنك تغييره. تواصل مع الشركة';
+
+// Choosing a time is checked and saved one customer at a time per company, so two customers never get the same slot
+const companyLocks = new Map<string, Promise<unknown>>();
+async function withCompanyLock<T>(companyId: string, task: () => Promise<T>): Promise<T> {
+  const run = (companyLocks.get(companyId) || Promise.resolve()).catch(() => undefined).then(task);
+  companyLocks.set(companyId, run);
+  try {
+    return await run;
+  } finally {
+    if (companyLocks.get(companyId) === run) companyLocks.delete(companyId);
   }
 }
 
@@ -409,7 +458,8 @@ export const chatsController = {
               teamIds,
               'رسالة جديدة',
               message || 'أرسل لك صورة جديدة',
-              { type: 'chat_message', chatId, companyName: targetCompanyName }
+              { type: 'chat_message', chatId, companyName: targetCompanyName },
+              'company'
             ).catch(() => {});
           }
         }
@@ -556,8 +606,8 @@ export const chatsController = {
         return;
       }
 
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(appointmentDate || '')) || isPastAppointmentDay(appointmentDate)) {
-        res.status(400).json({ error: 'يرجى اختيار تاريخ صحيح للموعد (اليوم أو بعده)' });
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(appointmentDate || '')) || isPastAppointmentTime(appointmentDate, appointmentTime || '10:00 ص')) {
+        res.status(400).json({ error: 'يرجى اختيار موعد لم يمضِ وقته بعد' });
         return;
       }
 
@@ -799,18 +849,30 @@ export const chatsController = {
       }
 
       if (statusChanged && updateRes.rows[0]?.user_id) {
-        const ticketNum = updateRes.rows[0].ticket_number || `#T-${chatId}`;
+        const ticket = updateRes.rows[0];
+        const ticketNum = ticket.ticket_number || `#T-${chatId}`;
         const statusArabic = TICKET_STATUS_LABELS[status];
-        createAndSendNotification({
-          userId: updateRes.rows[0].user_id,
+        const payload = {
           title: 'تحديث حالة تذكرة الدعم',
           subtitle: `تم تحديث حالة تذكرتك ${ticketNum} إلى: (${statusArabic})`,
           category: 'support',
           icon: 'help-circle-outline',
           iconBg: '#F0FDF4',
           iconColor: '#16A34A',
-          data: { type: 'ticket_update', chatId, status }
-        }).catch(() => {});
+        };
+        // A company's ticket belongs to the company app and its support team, like the replies on it
+        if (ticket.department === 'companies' && ticket.company_id && ticket.ticket_number) {
+          notifyCompanyTeam(ticket.company_id, 'support.tickets', {
+            ...payload,
+            data: { type: 'support_reply', ticketId: ticket.id, status },
+          }).catch(() => {});
+        } else {
+          createAndSendNotification({
+            ...payload,
+            userId: ticket.user_id,
+            data: { type: 'ticket_update', chatId, status },
+          }).catch(() => {});
+        }
       }
 
       res.status(200).json({ success: true, data: updateRes.rows[0] });
@@ -911,7 +973,8 @@ export const chatsController = {
             [chat.user_id],
             chat.company_name || 'إدارة منصة سدرة',
             message || 'أرسل لك صورة جديدة',
-            { type: 'chat_message', chatId: chat.id, companyName: chat.company_name }
+            { type: 'chat_message', chatId: chat.id, companyName: chat.company_name },
+            'customer'
           ).catch(() => {});
         }
       }
@@ -1375,6 +1438,128 @@ export const chatsController = {
     } catch (error: any) {
       console.error('Error in rejectAppointment:', error);
       res.status(500).json({ error: 'فشل رفض الموعد' });
+    }
+  },
+
+  /** The company's free visit times, for a customer who wants a different time than the one proposed. */
+  async getAppointmentSlots(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const userId = req.user?.id;
+      if (!userId) {
+        res.status(401).json({ error: 'غير مصرح' });
+        return;
+      }
+      const ctx = await customerAppointmentContext(req.params.companyName, req.query.chatId, userId);
+      if (!ctx) {
+        res.status(404).json({ error: 'الشركة غير موجودة' });
+        return;
+      }
+      if (!ctx.latest || !CUSTOMER_CHOOSABLE_STATUSES.includes(ctx.latest.status)) {
+        res.status(409).json({ error: NOT_CHOOSABLE_ERROR });
+        return;
+      }
+      res.status(200).json({ success: true, data: await availableVisitSlots(ctx.company.id) });
+    } catch (error: any) {
+      console.error('Error in getAppointmentSlots:', error);
+      res.status(500).json({ error: 'تعذر جلب المواعيد المتاحة' });
+    }
+  },
+
+  /**
+   * The customer picks one of the company's free times instead of the proposed one. It is checked again
+   * against the company's free times, saved as confirmed, and the company is told.
+   */
+  async chooseAppointment(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const userId = req.user?.id;
+      if (!userId) {
+        res.status(401).json({ error: 'غير مصرح' });
+        return;
+      }
+      const { appointmentDate, appointmentTime, chatId } = req.body || {};
+      const wantedMinutes = toMinutes(String(appointmentTime || ''));
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(appointmentDate || '')) || wantedMinutes === null) {
+        res.status(400).json({ error: 'اختر يوماً ووقتاً صحيحين' });
+        return;
+      }
+      if (isPastAppointmentTime(appointmentDate, appointmentTime)) {
+        res.status(400).json({ error: 'لا يمكن اختيار موعد مضى وقته' });
+        return;
+      }
+
+      const ctx = await customerAppointmentContext(req.params.companyName, chatId, userId);
+      if (!ctx) {
+        res.status(404).json({ error: 'الشركة غير موجودة' });
+        return;
+      }
+      if (!ctx.latest || !CUSTOMER_CHOOSABLE_STATUSES.includes(ctx.latest.status)) {
+        res.status(409).json({ error: NOT_CHOOSABLE_ERROR });
+        return;
+      }
+      const { company, latest } = ctx;
+
+      const appointment = await withCompanyLock(String(company.id), async () => {
+        const freeDay = (await availableVisitSlots(company.id)).find((day) => day.date === appointmentDate);
+        const slot = freeDay?.times.find((time) => toMinutes(time) === wantedMinutes);
+        if (!slot) return null;
+
+        await pool.query(
+          `UPDATE interview_appointments SET status = 'cancelled', status_changed_at = NOW(), status_reason = 'اختار العميل موعداً آخر'
+           WHERE user_id = $1 AND company_name = $2 AND status IN ('pending', 'suggested', 'confirmed')`,
+          [userId, company.name]
+        );
+        // The company's instructions (what to bring, where) carry over to the new time
+        const inserted = await pool.query(
+          `INSERT INTO interview_appointments (id, user_id, company_name, chat_id, title, appointment_date, appointment_time, location, notes, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'confirmed') RETURNING *`,
+          [
+            generate16CharId(), userId, company.name, ctx.chatId || null, latest.title || 'موعد مقابلة وزيارة',
+            appointmentDate, slot, latest.location || company.address || 'مقر الشركة', latest.notes || '',
+          ]
+        );
+        await pool.query(
+          `UPDATE bookings b SET appointment_date = $1, appointment_time = $2, appointment_status = 'confirmed', appointment_reminder_sent_at = NULL
+           FROM packages p WHERE b.package_id = p.id AND p.company_id = $3 AND b.user_id = $4 AND b.status = 'new'`,
+          [appointmentDate, slot, company.id, userId]
+        );
+        return inserted.rows[0];
+      });
+
+      if (!appointment) {
+        res.status(409).json({ error: 'هذا الموعد لم يعد متاحاً، اختر وقتاً آخر' });
+        return;
+      }
+
+      const text = `📅 اخترت موعداً جديداً للزيارة: ${appointmentDate} الساعة ${appointment.appointment_time}`;
+      if (ctx.chatId) {
+        const timeStr = new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' });
+        const msgRes = await pool.query(
+          `INSERT INTO messages (id, chat_id, user_id, company_name, company_id, sender, text, time, status)
+           VALUES ($1, $2, $3, $4, $5, 'user', $6, $7, 'sent') RETURNING *`,
+          [generate16CharId(), ctx.chatId, userId, company.name, company.id, text, timeStr]
+        );
+        await pool.query('UPDATE chats SET last_message = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [text, ctx.chatId]);
+        if (io) {
+          io.to(`chat_${ctx.chatId}`).to(company.name).emit('receive_message', msgRes.rows[0]);
+          io.to(`chat_${ctx.chatId}`).emit('appointment_updated', appointment);
+        }
+      }
+
+      const customer = await pool.query('SELECT name FROM users WHERE id = $1', [userId]);
+      notifyCompanyTeam(company.id, 'appointments.view', {
+        title: 'عميل اختار موعداً جديداً',
+        subtitle: `اختار ${customer.rows[0]?.name || 'العميل'} موعد الزيارة ${appointmentDate} الساعة ${appointment.appointment_time}`,
+        category: 'appointment',
+        icon: 'calendar-outline',
+        iconBg: '#EFF6FF',
+        iconColor: '#2563EB',
+        data: { type: 'appointment_chosen', appointmentDate },
+      }).catch((err) => console.error('Failed to notify company of chosen appointment:', err));
+
+      res.status(200).json({ success: true, message: 'تم حجز الموعد الجديد', data: appointment });
+    } catch (error: any) {
+      console.error('Error in chooseAppointment:', error);
+      res.status(500).json({ error: 'تعذر حجز الموعد' });
     }
   }
 };

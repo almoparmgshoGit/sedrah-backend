@@ -72,6 +72,8 @@ export const registerPushToken = async (req: AuthRequest, res: Response): Promis
     const { token, platform, projectId } = req.body;
     // The owner is always the logged-in user; a user id in the body is ignored
     const effectiveUserId: string | null = req.user?.id ? String(req.user.id) : null;
+    // The company app says so explicitly; its session token also carries the company audience
+    const app = req.body?.app === 'company' || (req.user as any)?.aud === 'sdra-company' ? 'company' : 'customer';
 
     if (!token || typeof token !== 'string') {
       res.status(400).json({ error: 'التوكن مطلوب وصالح' });
@@ -86,14 +88,15 @@ export const registerPushToken = async (req: AuthRequest, res: Response): Promis
       );
 
       await pool.query(
-        `INSERT INTO push_tokens (id, user_id, token, platform, project_id, is_active, updated_at)
-         VALUES ($1, $2, $3, $4, $5, true, CURRENT_TIMESTAMP)
+        `INSERT INTO push_tokens (id, user_id, token, platform, project_id, app, is_active, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, true, CURRENT_TIMESTAMP)
          ON CONFLICT (user_id, token) DO UPDATE SET
            is_active = true,
            platform = EXCLUDED.platform,
            project_id = EXCLUDED.project_id,
+           app = EXCLUDED.app,
            updated_at = CURRENT_TIMESTAMP`,
-        [generate16CharId(), effectiveUserId, token, platform || 'android', projectId || 'sdra-app']
+        [generate16CharId(), effectiveUserId, token, platform || 'android', projectId || (app === 'company' ? 'sedra-company' : 'sdra-app'), app]
       );
 
       console.log(`✅ Push token registered & bound to user ${effectiveUserId}: ${token.substring(0, 30)}...`);
@@ -101,9 +104,9 @@ export const registerPushToken = async (req: AuthRequest, res: Response): Promis
       const existing = await pool.query('SELECT id FROM push_tokens WHERE token = $1', [token]);
       if (existing.rows.length === 0) {
         await pool.query(
-          `INSERT INTO push_tokens (id, user_id, token, platform, project_id, is_active, updated_at)
-           VALUES ($1, NULL, $2, $3, $4, true, CURRENT_TIMESTAMP)`,
-          [generate16CharId(), token, platform || 'android', projectId || 'sdra-app']
+          `INSERT INTO push_tokens (id, user_id, token, platform, project_id, app, is_active, updated_at)
+           VALUES ($1, NULL, $2, $3, $4, $5, true, CURRENT_TIMESTAMP)`,
+          [generate16CharId(), token, platform || 'android', projectId || 'sdra-app', app]
         );
       } else {
         await pool.query(
@@ -195,17 +198,20 @@ export const sendNotificationByAdmin = async (req: AuthRequest, res: Response): 
 
     let pushResult;
     if (targetType === 'everyone' || targetType === 'all_users') {
+      // These notifications are stored for the customer app, so their pushes go there too
       pushResult = await sendPushToAllTokens(
         notifTitle,
         notifSub || notifTitle,
-        { type: 'admin_notification', category: notifCat }
+        { type: 'admin_notification', category: notifCat },
+        'customer'
       );
     } else {
       pushResult = await sendPushToUsers(
         targetUserIds,
         notifTitle,
         notifSub || notifTitle,
-        { type: 'admin_notification', category: notifCat }
+        { type: 'admin_notification', category: notifCat },
+        'customer'
       );
     }
 

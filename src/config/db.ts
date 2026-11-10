@@ -574,6 +574,9 @@ export const initDB = async () => {
         UNIQUE(user_id, token)
       );
     `);
+    // Which app registered the device: a company owner signed in to both apps must get company pushes only in
+    // the company app. Tokens registered before this column existed all came from the customer app.
+    await pool.query(`ALTER TABLE push_tokens ADD COLUMN IF NOT EXISTS app VARCHAR(20) NOT NULL DEFAULT 'customer';`);
 
     // 9.2 Notification Templates table
     await pool.query(`

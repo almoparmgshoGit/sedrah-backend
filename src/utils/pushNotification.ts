@@ -3,6 +3,9 @@ import { pool } from '../config/db';
 
 const expo = new Expo();
 
+/** The app a device token was registered from (push_tokens.app) */
+export type PushApp = 'customer' | 'company';
+
 /**
  * إرسال إشعار Push عبر مصفوفة من التوكنات مباشرة
  */
@@ -80,17 +83,19 @@ export async function sendPushToUsers(
   userIds: string[],
   title: string,
   body: string,
-  data?: Record<string, any>
+  data?: Record<string, any>,
+  // Only devices of this app; left out (staff alerts) reaches every device of the users
+  app?: PushApp
 ): Promise<{ sent: number; failed: number }> {
   if (!userIds || userIds.length === 0) {
     return { sent: 0, failed: 0 };
   }
 
   try {
-    const placeholders = userIds.map((_, i) => `$${i + 1}`).join(', ');
     const tokensResult = await pool.query(
-      `SELECT DISTINCT token FROM push_tokens WHERE user_id IN (${placeholders}) AND is_active = true`,
-      userIds
+      `SELECT DISTINCT token FROM push_tokens
+       WHERE user_id = ANY($1::varchar[]) AND is_active = true AND ($2::varchar IS NULL OR app = $2::varchar)`,
+      [userIds.map(String), app || null]
     );
 
     // Only devices signed in to these accounts; a user without one simply gets no push
@@ -115,11 +120,13 @@ export async function sendPushToUsers(
 export async function sendPushToAllTokens(
   title: string,
   body: string,
-  data?: Record<string, any>
+  data?: Record<string, any>,
+  app?: PushApp
 ): Promise<{ sent: number; failed: number }> {
   try {
     const tokensResult = await pool.query(
-      `SELECT DISTINCT token FROM push_tokens WHERE is_active = true`
+      `SELECT DISTINCT token FROM push_tokens WHERE is_active = true AND ($1::varchar IS NULL OR app = $1::varchar)`,
+      [app || null]
     );
 
     const pushTokens = tokensResult.rows.map(r => r.token).filter(Boolean);

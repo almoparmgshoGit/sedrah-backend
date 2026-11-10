@@ -93,7 +93,8 @@ export const canAccessUpload = async (userId: string, filename: string): Promise
        )
        OR EXISTS (
          SELECT 1 FROM chats c
-         LEFT JOIN companies co ON c.company_id = co.id
+         -- Same match as the company chat list: older chats may carry only the company name
+         LEFT JOIN companies co ON (c.company_id = co.id OR (c.ticket_number IS NULL AND c.company_name = co.name))
          LEFT JOIN messages m ON m.chat_id = c.id
          WHERE (c.user_id = $1 OR (co.user_id = $1 OR EXISTS (SELECT 1 FROM company_members cm WHERE cm.company_id = co.id AND cm.user_id = $1 AND cm.status = 'active')))
            AND (${refersTo('c.attachment_url')} OR ${refersTo('m.image_uri')})

@@ -35,7 +35,7 @@ export const toArabicTime = (hhmm: string): string => {
 };
 
 // Accepts both stored formats ("14:30" and "2:30 م") so taken slots are compared reliably
-const toMinutes = (value: string): number | null => {
+export const toMinutes = (value: string): number | null => {
   const text = String(value || '').trim();
   const match = text.match(/^(\d{1,2}):(\d{2})\s*(ص|م|AM|PM|am|pm)?$/);
   if (!match) return null;

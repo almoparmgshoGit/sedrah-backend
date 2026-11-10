@@ -16,7 +16,7 @@ import {
   notifyCompanyTeam,
   resolveCompanyAccess,
 } from '../utils/companyAccess';
-import { expireOverdueAppointmentsThrottled, isPastAppointmentDay, localToday, markAppointmentAttended } from '../utils/appointmentLifecycle';
+import { expireOverdueAppointmentsThrottled, isPastAppointmentTime, localToday, markAppointmentAttended } from '../utils/appointmentLifecycle';
 
 export interface CompanyRequest extends AuthRequest {
   company?: any;
@@ -1504,8 +1504,8 @@ export const createCompanyAppointment = async (req: CompanyRequest, res: Respons
   try {
     const { id: companyId, name: companyName, address } = req.company;
     const { userId, appointmentDate, appointmentTime, location, title, notes, chatId } = req.body;
-    if (isPastAppointmentDay(appointmentDate)) {
-      res.status(400).json({ error: 'لا يمكن تحديد موعد في تاريخ مضى' });
+    if (isPastAppointmentTime(appointmentDate, appointmentTime)) {
+      res.status(400).json({ error: 'لا يمكن تحديد موعد في وقت مضى' });
       return;
     }
     if (!(await isCompanyClient(companyId, companyName, userId))) {
@@ -1562,8 +1562,8 @@ export const rescheduleCompanyAppointment = async (req: CompanyRequest, res: Res
       res.status(409).json({ error: 'حضر العميل هذا الموعد بالفعل، أنشئ موعداً جديداً إذا لزم الأمر' });
       return;
     }
-    if (isPastAppointmentDay(appointmentDate)) {
-      res.status(400).json({ error: 'لا يمكن تحديد موعد في تاريخ مضى' });
+    if (isPastAppointmentTime(appointmentDate, appointmentTime)) {
+      res.status(400).json({ error: 'لا يمكن تحديد موعد في وقت مضى' });
       return;
     }
     // A missed or expired appointment can be given a new date; it then waits for the customer's confirmation again

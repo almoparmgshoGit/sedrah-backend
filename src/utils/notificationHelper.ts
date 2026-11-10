@@ -112,7 +112,9 @@ export async function createAndSendNotification(opts: NotificationPayload): Prom
       [opts.userId],
       finalTitle,
       finalSubtitle,
-      { ...(opts.data || {}), category: finalCategory }
+      { ...(opts.data || {}), category: finalCategory },
+      // The push goes to the same app that lists the notification
+      opts.audience || 'customer'
     );
 
     console.log(`📲 Notification & Push sent to user ${opts.userId}: "${finalTitle}"`);

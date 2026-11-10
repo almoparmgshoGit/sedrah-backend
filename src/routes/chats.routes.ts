@@ -29,5 +29,7 @@ router.get('/:companyName/appointment', authenticate, chatsController.getAppoint
 router.post('/:companyName/appointment', supportStaff, chatsController.setAppointment);
 router.patch('/:companyName/appointment/confirm', authenticate, chatsController.confirmAppointment);
 router.patch('/:companyName/appointment/reject', authenticate, chatsController.rejectAppointment);
+router.get('/:companyName/appointment/slots', authenticate, chatsController.getAppointmentSlots);
+router.post('/:companyName/appointment/choose', authenticate, chatsController.chooseAppointment);
 
 export default router;

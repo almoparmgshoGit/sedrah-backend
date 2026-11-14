@@ -77,7 +77,8 @@ router.post('/appointments/:id/attended', can('appointments.manage'), company.ma
 // ───── Notifications the company writes to its travelers ─────
 router.get('/broadcasts', can('notifications.send'), broadcasts.listBroadcasts as any);
 router.get('/broadcasts/audience', can('notifications.send'), broadcasts.getBroadcastAudience as any);
-router.post('/broadcasts', authLimiter, can('notifications.send'), active, body(schemas.broadcastSchema), broadcasts.sendBroadcast as any);
+// Not blocked while suspended: a suspended company still serves the travelers it already has
+router.post('/broadcasts', authLimiter, can('notifications.send'), body(schemas.broadcastSchema), broadcasts.sendBroadcast as any);
 
 // ───── Support tickets with the platform ─────
 router.get('/support/tickets', can('support.tickets'), support.listCompanyTickets as any);

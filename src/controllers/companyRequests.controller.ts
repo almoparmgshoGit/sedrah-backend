@@ -8,6 +8,7 @@ import { generate16CharId, generateRandomToken } from '../utils/formatId';
 import { logAudit } from '../utils/auditLogger';
 import { sendPlatformEmail } from '../utils/mailer';
 import { getPublicServerUrl, recordUpload } from '../utils/uploadAccess';
+import { fitImageToPreset, IMAGE_PRESETS, ImagePreset } from '../utils/imagePresets';
 import { notifyCitySubscribers } from './cities.controller';
 import { createAdminAlert, resolveAdminAlerts } from '../utils/adminAlerts';
 
@@ -36,12 +37,27 @@ const decodeImage = (dataUri?: string | null): { buffer: Buffer; ext: string } |
 };
 
 // Recording the upload is what lets the applicant open their own protected document later
-const saveImage = async (req: Request, image: { buffer: Buffer; ext: string } | null, folder: string, userId: string): Promise<string | null> => {
+// A preset (the logo) is cropped and resized to the size the customer app shows it at
+const saveImage = async (
+  req: Request,
+  image: { buffer: Buffer; ext: string } | null,
+  folder: string,
+  userId: string,
+  preset?: ImagePreset
+): Promise<string | null> => {
   if (!image) return null;
   const dir = path.join(uploadsDir, folder);
   fs.mkdirSync(dir, { recursive: true });
-  const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${image.ext}`;
+  let filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${image.ext}`;
   fs.writeFileSync(path.join(dir, filename), image.buffer);
+  if (preset) {
+    try {
+      filename = (await fitImageToPreset(path.join(dir, filename), preset)).filename;
+    } catch (error) {
+      console.error('Logo resize error:', error);
+      throw new InvalidImageError('تعذر ضبط مقاس الشعار، ارفعه بصيغة JPG أو PNG');
+    }
+  }
   await recordUpload(filename, folder, userId);
   return `${getPublicServerUrl(req)}/uploads/${folder}/${filename}`;
 };
@@ -120,7 +136,7 @@ export const createCompanyRequest = async (req: AuthRequest, res: Response): Pro
         generate16CharId(), userId, companyName.trim(), governorate.trim(), city.trim(), phone.trim(),
         email.trim().toLowerCase(), address.trim(), licenseNumber.trim(), taxNumber?.trim() || null,
         await saveImage(req, licenseImage, 'documents', userId),
-        await saveImage(req, logoImage, 'companies', userId),
+        await saveImage(req, logoImage, 'companies', userId, IMAGE_PRESETS.logo),
       ]
     );
 

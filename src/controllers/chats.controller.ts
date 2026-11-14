@@ -831,13 +831,28 @@ export const chatsController = {
          WHERE b.package_id = p.id AND p.company_id = c.id AND b.user_id = $1 AND (c.name = $2 OR c.id = $3)
            AND b.status = 'new' AND b.appointment_status IN ('pending', 'suggested')
            AND (b.appointment_date IS NULL OR b.appointment_date >= $4::date)
-         RETURNING b.id`,
+         RETURNING b.id, to_char(b.appointment_date, 'YYYY-MM-DD') AS day, b.appointment_time`,
         [userId, targetCompanyName, resolved.companyId || '', localToday()]
       );
 
       if (!updated && bookingRes.rows.length === 0) {
         res.status(409).json({ error: 'لا يوجد موعد بانتظار التأكيد' });
         return;
+      }
+
+      // Leave the confirmation in the chat; the app shows it as a "confirmed" card
+      if (targetChatId) {
+        const day = updated ? String(updated.appointment_date || '').slice(0, 10) : bookingRes.rows[0]?.day || '';
+        const time = updated ? updated.appointment_time : bookingRes.rows[0]?.appointment_time;
+        const text = `✅ أكدت حضوري للموعد${day ? `: ${day}${time ? ` الساعة ${time}` : ''}` : ''}`;
+        const timeStr = new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' });
+        const msgRes = await pool.query(
+          `INSERT INTO messages (id, chat_id, user_id, company_name, company_id, sender, text, time, status)
+           VALUES ($1, $2, $3, $4, $5, 'user', $6, $7, 'sent') RETURNING *`,
+          [generate16CharId(), targetChatId, userId, targetCompanyName, resolved.companyId || null, text, timeStr]
+        );
+        await pool.query('UPDATE chats SET last_message = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [text, targetChatId]);
+        if (io) io.to(`chat_${targetChatId}`).to(targetCompanyName).emit('receive_message', msgRes.rows[0]);
       }
 
       if (io && targetChatId) {

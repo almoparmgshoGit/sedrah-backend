@@ -1655,7 +1655,13 @@ export const markCompanyAppointmentAttended = async (req: CompanyRequest, res: R
          AND b.appointment_status IN ('pending', 'suggested', 'confirmed', 'missed', 'expired')`,
       [req.company.id, existing.user_id]
     );
-    if (io && existing.chat_id) io.to(`chat_${existing.chat_id}`).emit('appointment_updated', updated.rows[0]);
+    // Tells the customer in their chat that the visit is done; the app shows it as a "completed" card
+    await announceAppointment(
+      req,
+      { ...existing, ...updated.rows[0] },
+      'تم تسجيل حضورك',
+      `تم تسجيل حضورك لموعد ${String(existing.appointment_date || '').slice(0, 10)} مع ${req.company.name}. شكراً لزيارتك`
+    );
     await activity(req, 'appointment_attended', 'سجّل حضور عميل لموعده', 'appointment', param(req, 'id'));
     res.json({ success: true, message: 'تم تسجيل حضور العميل', data: { ...existing, ...updated.rows[0] } });
   } catch (error) {

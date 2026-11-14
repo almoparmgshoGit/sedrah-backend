@@ -4,6 +4,7 @@ import fs from 'fs';
 import multer from 'multer';
 import { authenticate, AuthRequest } from '../middlewares/security.middleware';
 import { getPublicServerUrl, recordUpload } from '../utils/uploadAccess';
+import { fitImageToPreset, getImagePreset, ResizeResult } from '../utils/imagePresets';
 
 const router = Router();
 
@@ -77,6 +78,14 @@ const isContentAllowed = (head: Buffer, mime: string, ext: string): boolean => {
   if (!kind) return false;
   return ext === '.pdf' ? kind === 'pdf' : kind === 'image';
 };
+
+const RESIZE_FAILED = 'تعذر ضبط مقاس الصورة، ارفعها بصيغة JPG أو PNG';
+
+// Size fields every response carries when a preset was applied, so the app can tell the user
+const sizeInfo = (result: ResizeResult | null) =>
+  result
+    ? { width: result.width, height: result.height, original_width: result.originalWidth, original_height: result.originalHeight, resized: result.resized }
+    : {};
 
 const isStaff = (req: any): boolean => STAFF_ROLES.includes(String(req.user?.role || ''));
 
@@ -161,7 +170,7 @@ router.post('/', authenticate, uploadHandler, async (req: AuthRequest, res: Resp
     }
     const category = (req.query.category as string) || 'general';
     const subFolder = ['chats', 'companies', 'receipts', 'profiles', 'sounds', 'documents'].includes(category) ? category : 'general';
-    const filename = req.file.filename;
+    let filename = req.file.filename;
 
     // The declared type is only a claim; the stored bytes must really be that kind of file
     const fd = fs.openSync(req.file.path, 'r');
@@ -177,11 +186,26 @@ router.post('/', authenticate, uploadHandler, async (req: AuthRequest, res: Resp
       return;
     }
 
+    // ?preset= crops and resizes a display image to the exact size the customer app shows it at
+    const preset = getImagePreset(req.query.preset);
+    let sized: ResizeResult | null = null;
+    if (preset && detectFileKind(head) === 'image') {
+      try {
+        sized = await fitImageToPreset(req.file.path, preset);
+        filename = sized.filename;
+      } catch (resizeError) {
+        console.error('Image resize error:', resizeError);
+        fs.unlink(req.file.path, () => {});
+        res.status(400).json({ error: RESIZE_FAILED });
+        return;
+      }
+    }
+
     await recordUpload(filename, subFolder, String(req.user!.id));
 
     const fileUrl = `${getPublicServerUrl(req)}/uploads/${subFolder}/${filename}`;
 
-    res.status(201).json({ success: true, url: fileUrl, filename });
+    res.status(201).json({ success: true, url: fileUrl, filename, ...sizeInfo(sized) });
   } catch (error: any) {
     console.error('Error uploading file:', error);
     res.status(500).json({ error: 'فشل رفع الملف' });
@@ -243,15 +267,30 @@ router.post('/base64', authenticate, async (req: AuthRequest, res: Response): Pr
     // The stored extension always comes from the validated type, never from the client's file name
     const cleanName = typeof originalName === 'string' ? originalName : '';
     const safeBaseName = path.basename(cleanName, path.extname(cleanName)).replace(/[^a-zA-Z0-9_\u0600-\u06FF-]/g, '_') || 'upload';
-    const filename = `${randomPrefix}-${safeBaseName}${ext}`;
+    let filename = `${randomPrefix}-${safeBaseName}${ext}`;
     const filePath = path.join(uploadDir, filename);
 
     fs.writeFileSync(filePath, buffer);
+
+    const preset = getImagePreset(req.query.preset);
+    let sized: ResizeResult | null = null;
+    if (preset && ext !== '.pdf') {
+      try {
+        sized = await fitImageToPreset(filePath, preset);
+        filename = sized.filename;
+      } catch (resizeError) {
+        console.error('Image resize error:', resizeError);
+        fs.unlink(filePath, () => {});
+        res.status(400).json({ error: RESIZE_FAILED });
+        return;
+      }
+    }
+
     await recordUpload(filename, subFolder, String(req.user!.id));
 
     const fileUrl = `${getPublicServerUrl(req)}/uploads/${subFolder}/${filename}`;
 
-    res.status(201).json({ success: true, url: fileUrl });
+    res.status(201).json({ success: true, url: fileUrl, ...sizeInfo(sized) });
   } catch (error: any) {
     console.error('Error uploading base64 image:', error);
     res.status(500).json({ error: 'فشل رفع الصورة' });

@@ -17,6 +17,7 @@ import { notifyCompanyTeam, recalcCompanyRating } from '../utils/companyAccess';
 import { companyReadySql } from '../utils/companyReadiness';
 import { companyActiveSql } from '../utils/companySuspension';
 import { resolveAdminAlerts } from '../utils/adminAlerts';
+import { applyVariantStockChange, normalizeProductStock, parseProductRow } from '../utils/productStock';
 import { ownerConflict, afterOwnerChange } from '../utils/companyOwner';
 
 const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
@@ -1734,13 +1735,7 @@ export const adminGetProducts = async (_req: AuthRequest, res: Response): Promis
        LEFT JOIN store_categories c ON p.category_id = c.id
        ORDER BY p.created_at DESC`
     );
-    const products = result.rows.map((p) => ({
-      ...p,
-      images: typeof p.images === 'string' ? JSON.parse(p.images || '[]') : p.images,
-      sizes: typeof p.sizes === 'string' ? JSON.parse(p.sizes || '[]') : p.sizes,
-      colors: typeof p.colors === 'string' ? JSON.parse(p.colors || '[]') : p.colors,
-    }));
-    res.json({ success: true, data: products });
+    res.json({ success: true, data: result.rows.map(parseProductRow) });
   } catch (error: any) {
     res.status(500).json({ error: 'فشل جلب المنتجات' });
   }
@@ -1759,6 +1754,7 @@ export const adminCreateProduct = async (req: AuthRequest, res: Response): Promi
       images = [],
       sizes = [],
       colors = [],
+      size_stock = {},
       attributes = {},
       stock = 0,
       is_featured = false,
@@ -1771,11 +1767,12 @@ export const adminCreateProduct = async (req: AuthRequest, res: Response): Promi
     }
 
     const generatedCustomId = custom_id?.trim() || `PROD-${Math.floor(1000 + Math.random() * 9000)}`;
+    const variantStock = normalizeProductStock({ sizes, colors, size_stock, stock });
 
     const result = await pool.query(
       `INSERT INTO store_products
-       (id, custom_id, name, description, price, discount_price, category_id, image_url, images, sizes, colors, attributes, stock, is_featured, is_active)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+       (id, custom_id, name, description, price, discount_price, category_id, image_url, images, sizes, colors, attributes, stock, is_featured, is_active, size_stock)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
        RETURNING *`,
       [
         generate16CharId(),
@@ -1787,16 +1784,17 @@ export const adminCreateProduct = async (req: AuthRequest, res: Response): Promi
         category_id ? String(category_id) : null,
         image_url || '',
         JSON.stringify(Array.isArray(images) ? images : []),
-        JSON.stringify(Array.isArray(sizes) ? sizes : []),
-        JSON.stringify(Array.isArray(colors) ? colors : []),
+        JSON.stringify(variantStock.sizes),
+        JSON.stringify(variantStock.colors),
         typeof attributes === 'object' ? JSON.stringify(attributes) : (attributes || '{}'),
-        stock !== undefined && stock !== '' && !isNaN(parseInt(stock, 10)) ? parseInt(stock, 10) : 0,
+        variantStock.stock,
         is_featured === true || is_featured === 'true',
         is_active === true || is_active === 'true',
+        JSON.stringify(variantStock.size_stock),
       ]
     );
 
-    res.status(201).json({ success: true, data: result.rows[0] });
+    res.status(201).json({ success: true, data: parseProductRow(result.rows[0]) });
   } catch (error: any) {
     console.error('Create product error:', error);
     res.status(500).json({ error: 'فشل إنشاء المنتج' });
@@ -1817,11 +1815,29 @@ export const adminUpdateProduct = async (req: AuthRequest, res: Response): Promi
       images,
       sizes,
       colors,
+      size_stock,
       attributes,
       stock,
       is_featured,
       is_active,
     } = req.body;
+
+    // Any stock-related field rewrites all of them together, so the total always matches the variants
+    let variantStock: ReturnType<typeof normalizeProductStock> | null = null;
+    if (sizes !== undefined || colors !== undefined || size_stock !== undefined || stock !== undefined) {
+      const currentRes = await pool.query('SELECT sizes, colors, size_stock, stock FROM store_products WHERE id = $1', [id]);
+      if (currentRes.rows.length === 0) {
+        res.status(404).json({ error: 'المنتج غير موجود' });
+        return;
+      }
+      const current = currentRes.rows[0];
+      variantStock = normalizeProductStock({
+        sizes: sizes !== undefined ? sizes : current.sizes,
+        colors: colors !== undefined ? colors : current.colors,
+        size_stock: size_stock !== undefined ? size_stock : current.size_stock,
+        stock: stock !== undefined ? stock : current.stock,
+      });
+    }
 
     const result = await pool.query(
       `UPDATE store_products
@@ -1838,7 +1854,8 @@ export const adminUpdateProduct = async (req: AuthRequest, res: Response): Promi
            attributes = COALESCE($11, attributes),
            stock = COALESCE($12, stock),
            is_featured = COALESCE($13, is_featured),
-           is_active = COALESCE($14, is_active)
+           is_active = COALESCE($14, is_active),
+           size_stock = COALESCE($17, size_stock)
        WHERE id = $15 RETURNING *`,
       [
         custom_id || null,
@@ -1849,15 +1866,16 @@ export const adminUpdateProduct = async (req: AuthRequest, res: Response): Promi
         category_id ? String(category_id) : null,
         image_url || null,
         images !== undefined ? JSON.stringify(Array.isArray(images) ? images : []) : null,
-        sizes !== undefined ? JSON.stringify(Array.isArray(sizes) ? sizes : []) : null,
-        colors !== undefined ? JSON.stringify(Array.isArray(colors) ? colors : []) : null,
+        variantStock ? JSON.stringify(variantStock.sizes) : null,
+        variantStock ? JSON.stringify(variantStock.colors) : null,
         attributes !== undefined ? (typeof attributes === 'object' ? JSON.stringify(attributes) : attributes) : null,
-        stock !== undefined && stock !== '' && !isNaN(parseInt(stock, 10)) ? parseInt(stock, 10) : null,
+        variantStock ? variantStock.stock : null,
         is_featured !== undefined ? (is_featured === true || is_featured === 'true') : null,
         is_active !== undefined ? (is_active === true || is_active === 'true') : null,
         id,
         // The discount is only touched when the request sends it; an explicit null or '' removes it
         discount_price !== undefined,
+        variantStock ? JSON.stringify(variantStock.size_stock) : null,
       ]
     );
 
@@ -1866,7 +1884,7 @@ export const adminUpdateProduct = async (req: AuthRequest, res: Response): Promi
       return;
     }
 
-    res.json({ success: true, data: result.rows[0] });
+    res.json({ success: true, data: parseProductRow(result.rows[0]) });
   } catch (error: any) {
     console.error('Update product error:', error);
     res.status(500).json({ error: 'فشل تحديث المنتج' });
@@ -2065,13 +2083,16 @@ export const adminUpdateOrderStatus = async (req: AuthRequest, res: Response): P
       }
 
       // Cancelled orders give their reserved quantities back to the store, once
+      // Each line goes back to the exact color/size it was taken from; a color or size the admin
+      // has since removed has nowhere to go back to and is skipped
       if (status === 'cancelled' && previousStatus !== 'cancelled') {
-        await client.query(
-          `UPDATE store_products p SET stock = p.stock + i.quantity
-           FROM (SELECT product_id, SUM(quantity)::int AS quantity FROM store_order_items WHERE order_id = $1 GROUP BY product_id) i
-           WHERE i.product_id = p.id`,
+        const itemsRes = await client.query(
+          'SELECT product_id, color, size, quantity FROM store_order_items WHERE order_id = $1 AND product_id IS NOT NULL',
           [id]
         );
+        for (const item of itemsRes.rows) {
+          await applyVariantStockChange(client, item.product_id, item.color, item.size, Number(item.quantity) || 0);
+        }
       }
 
       result = await client.query(

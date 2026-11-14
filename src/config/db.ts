@@ -828,6 +828,8 @@ export const initDB = async () => {
     `);
 
     await pool.query('ALTER TABLE store_products ADD COLUMN IF NOT EXISTS attributes TEXT DEFAULT \'{}\';');
+    // Quantity per size for products without colors; colors keep theirs inside the colors JSON
+    await pool.query('ALTER TABLE store_products ADD COLUMN IF NOT EXISTS size_stock TEXT DEFAULT \'{}\';');
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS store_banners (

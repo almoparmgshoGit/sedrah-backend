@@ -4,6 +4,7 @@ import { pool } from '../config/db';
 import { generate16CharId } from '../utils/formatId';
 import { createAndSendNotification } from '../utils/notificationHelper';
 import { createAdminAlert } from '../utils/adminAlerts';
+import { applyVariantStockChange, parseProductRow } from '../utils/productStock';
 
 const MAX_ORDER_LINES = 50;
 const MAX_ITEM_QUANTITY = 100;
@@ -102,12 +103,7 @@ export const getProducts = async (req: Request, res: Response) => {
 
     const result = await pool.query(query, params);
 
-    const products = result.rows.map((p) => ({
-      ...p,
-      images: typeof p.images === 'string' ? JSON.parse(p.images || '[]') : p.images,
-      sizes: typeof p.sizes === 'string' ? JSON.parse(p.sizes || '[]') : p.sizes,
-      colors: typeof p.colors === 'string' ? JSON.parse(p.colors || '[]') : p.colors,
-    }));
+    const products = result.rows.map(parseProductRow);
 
     return res.json({ success: true, data: products });
   } catch (error: any) {
@@ -130,12 +126,7 @@ export const getProductById = async (req: Request, res: Response) => {
       return res.status(404).json({ success: false, message: 'المنتج غير موجود' });
     }
 
-    const p = result.rows[0];
-    p.images = typeof p.images === 'string' ? JSON.parse(p.images || '[]') : p.images;
-    p.sizes = typeof p.sizes === 'string' ? JSON.parse(p.sizes || '[]') : p.sizes;
-    p.colors = typeof p.colors === 'string' ? JSON.parse(p.colors || '[]') : p.colors;
-
-    return res.json({ success: true, data: p });
+    return res.json({ success: true, data: parseProductRow(result.rows[0]) });
   } catch (error: any) {
     return res.status(500).json({ success: false, message: error.message || 'حدث خطأ في جلب بيانات المنتج' });
   }
@@ -263,14 +254,17 @@ export const createOrder = async (req: any, res: Response) => {
         total_price: itemTotal,
       });
 
-      // Atomic so concurrent orders cannot both take the last unit
-      const stockRes = await client.query(
-        'UPDATE store_products SET stock = stock - $1 WHERE id = $2 AND stock >= $1 RETURNING id',
-        [qty, prod.id]
-      );
-      if (stockRes.rows.length === 0) {
+      // Row-locked so concurrent orders cannot both take the last unit of the same color/size
+      const stockRes = await applyVariantStockChange(client, prod.id, colorStr, sizeStr, -qty);
+      if (!stockRes || !stockRes.ok) {
         await client.query('ROLLBACK');
-        return res.status(400).json({ success: false, message: `الكمية المطلوبة من "${prod.name}" غير متوفرة` });
+        const variantLabel = [colorStr, sizeStr].filter(Boolean).join(' / ');
+        const message = stockRes && !stockRes.ok && stockRes.reason === 'unknown_variant'
+          ? `الاختيار "${variantLabel}" من "${prod.name}" لم يعد متوفراً`
+          : stockRes && !stockRes.ok && stockRes.available > 0
+          ? `المتوفر من "${prod.name}"${variantLabel ? ` (${variantLabel})` : ''} ${stockRes.available} قطعة فقط`
+          : `"${prod.name}"${variantLabel ? ` (${variantLabel})` : ''} نفدت الكمية`;
+        return res.status(400).json({ success: false, message });
       }
     }
 

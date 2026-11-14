@@ -106,9 +106,9 @@ export const markAllAdminAlertsRead = async (req: AuthRequest, res: Response): P
     if (allowed.length > 0) {
       await pool.query(
         `INSERT INTO admin_alert_reads (alert_id, admin_id)
-         SELECT a.id, $1 FROM admin_alerts a
+         SELECT a.id, $1::varchar FROM admin_alerts a
          WHERE a.module = ANY($2)
-           AND NOT EXISTS (SELECT 1 FROM admin_alert_reads r WHERE r.alert_id = a.id AND r.admin_id = $1)
+           AND NOT EXISTS (SELECT 1 FROM admin_alert_reads r WHERE r.alert_id = a.id AND r.admin_id = $1::varchar)
          ON CONFLICT DO NOTHING`,
         [String(req.user!.id), allowed]
       );

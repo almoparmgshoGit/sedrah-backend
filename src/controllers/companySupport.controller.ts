@@ -156,6 +156,11 @@ export const sendCompanyTicketMessage = async (req: CompanyRequest, res: Respons
       res.status(404).json({ error: 'التذكرة غير موجودة' });
       return;
     }
+    // A normally closed ticket reopens when the company writes; one closed for good does not
+    if (ticket.status === 'closed_final') {
+      res.status(409).json({ error: 'هذه التذكرة مغلقة نهائياً ولا يمكن الكتابة عليها. افتح تذكرة جديدة' });
+      return;
+    }
     const image = await resolveUserUpload(req.body.imageUri, req, req.user!.id);
     if (image === false) {
       res.status(400).json({ error: 'المرفق غير صالح، ارفعه مرة أخرى' });
@@ -207,7 +212,7 @@ export const closeCompanyTicket = async (req: CompanyRequest, res: Response): Pr
       res.status(404).json({ error: 'التذكرة غير موجودة' });
       return;
     }
-    await pool.query(`UPDATE chats SET status = 'closed', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [ticket.id]);
+    await pool.query(`UPDATE chats SET status = CASE WHEN status = 'closed_final' THEN status ELSE 'closed' END, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [ticket.id]);
     if (io) io.to('support_staff').emit('ticket_updated', { id: ticket.id, status: 'closed' });
     await resolveAdminAlerts('chat', ticket.id, req.company.name);
     await logCompanyActivity(req.company.id, req.actor || {}, 'ticket_closed', `أغلق تذكرة الدعم ${ticket.ticket_number}`, 'ticket', ticket.id);

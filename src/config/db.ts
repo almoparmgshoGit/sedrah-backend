@@ -1070,6 +1070,24 @@ export const initDB = async () => {
     `);
     await pool.query('CREATE INDEX IF NOT EXISTS idx_company_activity_company ON company_activity(company_id, created_at DESC);');
 
+    // Notifications a company writes itself and sends to the travelers of one package or to a single booking
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS company_broadcasts (
+        id VARCHAR(16) PRIMARY KEY,
+        company_id VARCHAR(16) REFERENCES companies(id) ON DELETE CASCADE,
+        package_id VARCHAR(16),
+        booking_id VARCHAR(16),
+        audience VARCHAR(20) NOT NULL,
+        title VARCHAR(120) NOT NULL,
+        message TEXT NOT NULL,
+        recipients_count INT NOT NULL DEFAULT 0,
+        sent_by_user_id VARCHAR(16),
+        sent_by_name VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_company_broadcasts_company ON company_broadcasts(company_id, created_at DESC);');
+
     // Package details the company fills and the customer sees; search filters rely on the structured ones
     await pool.query(`
       ALTER TABLE packages ADD COLUMN IF NOT EXISTS gallery TEXT;

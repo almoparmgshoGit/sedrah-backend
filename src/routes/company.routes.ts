@@ -5,6 +5,7 @@ import * as company from '../controllers/company.controller';
 import * as schemas from '../validators/company.validator';
 import * as team from '../controllers/companyTeam.controller';
 import * as support from '../controllers/companySupport.controller';
+import * as broadcasts from '../controllers/companyBroadcasts.controller';
 
 const router = Router();
 
@@ -72,6 +73,11 @@ router.post('/appointments', can('appointments.manage'), active, body(schemas.ap
 router.put('/appointments/:id', can('appointments.manage'), body(schemas.rescheduleAppointmentSchema), company.rescheduleCompanyAppointment as any);
 router.post('/appointments/:id/cancel', can('appointments.manage'), body(schemas.cancelAppointmentSchema), company.cancelCompanyAppointment as any);
 router.post('/appointments/:id/attended', can('appointments.manage'), company.markCompanyAppointmentAttended as any);
+
+// ───── Notifications the company writes to its travelers ─────
+router.get('/broadcasts', can('notifications.send'), broadcasts.listBroadcasts as any);
+router.get('/broadcasts/audience', can('notifications.send'), broadcasts.getBroadcastAudience as any);
+router.post('/broadcasts', authLimiter, can('notifications.send'), active, body(schemas.broadcastSchema), broadcasts.sendBroadcast as any);
 
 // ───── Support tickets with the platform ─────
 router.get('/support/tickets', can('support.tickets'), support.listCompanyTickets as any);

@@ -250,3 +250,17 @@ export const ticketMessageSchema = z
   .refine((body) => Boolean(body.message || body.imageUri), 'اكتب رسالة أو أرفق صورة');
 
 export const reviewReplySchema = z.object({ reply: shortText(1000) }).strict();
+
+// A notification the company writes itself: to the travelers of one package, or to the client of one booking
+export const broadcastSchema = z
+  .object({
+    target: z.enum(['package', 'booking']),
+    packageId: shortText(16).optional(),
+    bookingId: shortText(16).optional(),
+    // confirmed: paid and confirmed bookings only; active: every booking that is not cancelled
+    audience: z.enum(['active', 'confirmed']).default('active'),
+    title: shortText(120).min(3, 'اكتب عنوان الإشعار'),
+    message: shortText(1000).min(5, 'اكتب نص الإشعار'),
+  })
+  .strict()
+  .refine((body) => (body.target === 'package' ? Boolean(body.packageId) : Boolean(body.bookingId)), 'اختر الباقة أو العميل');

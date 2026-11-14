@@ -201,6 +201,25 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
     let result: any;
     try {
       await client.query('BEGIN');
+
+      // The seat check above is only a quick answer; two customers booking the last seats at the same moment
+      // would both pass it. Locking the package row makes concurrent bookings of one package wait for each
+      // other, and the seats are counted again under that lock.
+      const lockedPkg = await client.query('SELECT seats_total FROM packages WHERE id = $1 FOR UPDATE', [resolvedPackageId]);
+      const lockedTotal = Number(lockedPkg.rows[0]?.seats_total) > 0 ? Number(lockedPkg.rows[0].seats_total) : null;
+      if (lockedTotal !== null) {
+        const bookedRes = await client.query(
+          `SELECT COALESCE(SUM(travelers_count), 0)::int AS booked FROM bookings WHERE package_id = $1 AND status <> 'cancelled'`,
+          [resolvedPackageId]
+        );
+        const left = lockedTotal - Number(bookedRes.rows[0].booked || 0);
+        if (travelersCount > left) {
+          await client.query('ROLLBACK');
+          res.status(409).json({ error: left <= 0 ? 'اكتمل عدد المقاعد في هذه الباقة' : `المتبقي في هذه الباقة ${left} مقعد فقط` });
+          return;
+        }
+      }
+
       result = await client.query(
         `INSERT INTO bookings (id, user_id, package_id, booking_reference, status, booking_method, room_type, travelers_count, children_count, total_price, notes, appointment_date, appointment_time, appointment_status, commission_amount, commission_method_used, commission_rate_used, customer_name, customer_phone, governorate, district)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) RETURNING *`,

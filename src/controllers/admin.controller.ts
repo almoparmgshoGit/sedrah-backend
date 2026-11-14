@@ -746,6 +746,15 @@ const bookingTransitionError = async (
   return null;
 };
 
+export type BookingPrecondition = (
+  client: PoolClient,
+  lockedBooking: any
+) => Promise<{ code: number; error: string } | null>;
+
+export interface BookingStatusRequest extends AuthRequest {
+  bookingPrecondition?: BookingPrecondition;
+}
+
 export const updateBookingStatusByAdmin = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const id = String(req.params.id);
@@ -766,6 +775,18 @@ export const updateBookingStatusByAdmin = async (req: AuthRequest, res: Response
         res.status(404).json({ error: 'الحجز غير موجود' });
         return;
       }
+      // Callers with their own rules (the company app) check them here, against the locked row, so a change
+      // made meanwhile (a receipt uploaded, another reject) is seen instead of a stale copy
+      const precondition = (req as BookingStatusRequest).bookingPrecondition;
+      if (precondition) {
+        const refused = await precondition(client, current);
+        if (refused) {
+          await client.query('ROLLBACK');
+          res.status(refused.code).json({ error: refused.error });
+          return;
+        }
+      }
+
       const currentStatus = current.status || 'new';
       // Sending the current status again changes nothing (the appointment form does that)
       status = requestedStatus && requestedStatus !== currentStatus ? requestedStatus : undefined;

@@ -9,7 +9,7 @@ import { logAudit } from '../utils/auditLogger';
 import { normalizeUploadUrl, resolveUserUpload } from '../utils/uploadAccess';
 import { getCompanyReadiness } from '../utils/companyReadiness';
 import { createAdminAlert } from '../utils/adminAlerts';
-import { updateBookingStatusByAdmin } from './admin.controller';
+import { updateBookingStatusByAdmin, type BookingStatusRequest } from './admin.controller';
 import {
   CompanyAccess,
   COMPANY_PERMISSION_GROUPS,
@@ -818,10 +818,15 @@ export const rejectCompanyOrder = async (req: CompanyRequest, res: Response, nex
       res.status(409).json({ error: 'لا يمكن رفض طلب تمت معالجته' });
       return;
     }
-    await pool.query(`UPDATE trip_stages SET status = 'cancelled' WHERE booking_id = $1`, [booking.id]);
     req.body = { status: 'cancelled', cancellation_reason: req.body.reason, cancelled_by: 'company' };
-    await activity(req, 'order_rejected', `رفض طلب الحجز #${booking.booking_reference}: ${req.body.cancellation_reason}`, 'order', booking.id);
+    // Checked again on the locked booking: a second reject or a receipt sent meanwhile is refused
+    (req as BookingStatusRequest).bookingPrecondition = async (_client, locked) =>
+      (locked.status || 'new') === 'new' ? null : { code: 409, error: 'لا يمكن رفض طلب تمت معالجته' };
     await updateBookingStatusByAdmin(req, res);
+    if (res.statusCode >= 400) return;
+    // A rejected request ends every stage, including a visit already recorded
+    await pool.query(`UPDATE trip_stages SET status = 'cancelled' WHERE booking_id = $1`, [booking.id]);
+    await activity(req, 'order_rejected', `رفض طلب الحجز #${booking.booking_reference}: ${req.body.cancellation_reason}`, 'order', booking.id);
   } catch (error) {
     next(error);
   }
@@ -849,10 +854,22 @@ export const cancelCompanyOrder = async (req: CompanyRequest, res: Response, nex
       });
       return;
     }
-    await pool.query(`UPDATE trip_stages SET status = 'cancelled' WHERE booking_id = $1 AND status <> 'completed'`, [booking.id]);
     req.body = { status: 'cancelled', cancellation_reason: req.body.reason, cancelled_by: 'company' };
-    await activity(req, 'order_cancelled', `ألغى الحجز #${booking.booking_reference}: ${req.body.cancellation_reason}`, 'order', booking.id);
+    // Checked again on the locked booking: a receipt uploaded since the check above moves the decision to the platform
+    (req as BookingStatusRequest).bookingPrecondition = async (client, locked) => {
+      if ((locked.status || 'new') !== 'new') {
+        return { code: 409, error: 'الإيصال قيد مراجعة الإدارة، تواصل مع دعم سدرة لإلغاء الحجز' };
+      }
+      const visit = await client.query(
+        `SELECT 1 FROM trip_stages WHERE booking_id = $1 AND stage_order = 1 AND status = 'completed'`,
+        [locked.id]
+      );
+      return visit.rows.length > 0 ? null : { code: 409, error: 'لا يمكن إلغاء هذا الطلب من التطبيق، تواصل مع دعم سدرة' };
+    };
+    // The status update also ends the stages that were not completed, inside the same transaction
     await updateBookingStatusByAdmin(req, res);
+    if (res.statusCode >= 400) return;
+    await activity(req, 'order_cancelled', `ألغى الحجز #${booking.booking_reference}: ${req.body.cancellation_reason}`, 'order', booking.id);
   } catch (error) {
     next(error);
   }

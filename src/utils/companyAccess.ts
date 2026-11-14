@@ -38,6 +38,17 @@ export const COMPANY_PERMISSION_GROUPS: PermissionGroup[] = [
     ],
   },
   {
+    key: 'notifications',
+    label: 'إشعارات المسافرين',
+    permissions: [
+      {
+        key: 'notifications.send',
+        label: 'إرسال إشعارات مكتوبة للمسافرين',
+        description: 'لكل المشتركين في باقة أو لعميل واحد، مثل مكان التجمع أو تغيير موعد الرحلة',
+      },
+    ],
+  },
+  {
     key: 'packages',
     label: 'الباقات',
     permissions: [
@@ -142,7 +153,7 @@ const DEFAULT_ROLES: Array<{ name: string; description: string; color: string; p
     permissions: [
       'orders.view', 'orders.manage', 'orders.view_amounts', 'trips.view', 'trips.stages',
       'packages.view', 'clients.view', 'clients.contact', 'clients.notes', 'clients.documents',
-      'chats.view', 'chats.reply', 'appointments.view', 'appointments.manage',
+      'chats.view', 'chats.reply', 'appointments.view', 'appointments.manage', 'notifications.send',
     ],
   },
   {

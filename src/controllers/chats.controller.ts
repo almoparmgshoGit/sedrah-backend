@@ -12,6 +12,7 @@ import { availableVisitSlots, toMinutes } from '../utils/appointmentEngine';
 import { companyTeamUserIds, notifyCompanyTeam } from '../utils/companyAccess';
 import { createAdminAlert, resolveAdminAlerts } from '../utils/adminAlerts';
 import { getGrantedPermissions, canAccessModule } from '../middlewares/permission.middleware';
+import { matchQuickQuestion, buildAutoReply, AUTO_REPLY_SENDER_NAME } from '../utils/chatAutoReply';
 
 const STAFF_ROLES = ['admin', 'super_admin', 'support', 'moderator', 'owner'];
 
@@ -25,14 +26,20 @@ const CUSTOMER_COMPANY_READ_ONLY_ERROR = 'محادثات العملاء مع ا�
 const INVALID_ATTACHMENT_ERROR = 'رابط المرفق غير صالح';
 
 const PLATFORM_DESK_NAME = 'إدارة منصة سدرة الرسمية';
-const TICKET_STATUSES = ['new', 'open', 'in_progress', 'resolved', 'closed'];
+/*
+ * closed:       closed, but a new message from the customer or company reopens it
+ * closed_final: closed for good. Nobody can write on it or reopen it; a new matter needs a new ticket
+ */
+const TICKET_STATUSES = ['new', 'open', 'in_progress', 'resolved', 'closed', 'closed_final'];
 const TICKET_STATUS_LABELS: Record<string, string> = {
   new: 'جديدة',
   open: 'مفتوحة',
   in_progress: 'قيد المتابعة',
   resolved: 'تم حلها',
   closed: 'مغلقة',
+  closed_final: 'مغلقة نهائياً',
 };
+export const FINAL_CLOSED_ERROR = 'هذه التذكرة مغلقة نهائياً ولا يمكن الكتابة عليها أو إعادة فتحها. افتح تذكرة جديدة';
 
 // What the support desk counts as a ticket (same rule as the is_ticket column of getAdminChats)
 const isTicketChat = (chat: any) => Boolean(chat?.ticket_number) || chat?.company_name === PLATFORM_DESK_NAME;
@@ -353,7 +360,12 @@ export const chatsController = {
           companyName: targetCompanyName,
           companyLogo,
           companyVerified,
-          isOfficialAdmin: targetCompanyName.includes('إدارة') || targetCompanyName.includes('ادارة') || targetCompanyName.includes('سدرة')
+          isOfficialAdmin: targetCompanyName.includes('إدارة') || targetCompanyName.includes('ادارة') || targetCompanyName.includes('سدرة'),
+          // A ticket's number and status, so the app shows its real state and stops writing on one closed for good
+          ticket_number: chatInfo?.ticket_number || null,
+          category_title: chatInfo?.category_title || null,
+          context: chatInfo?.context || null,
+          status: chatInfo?.ticket_number ? chatInfo?.status || 'open' : null,
         }
       });
     } catch (error: any) {
@@ -400,6 +412,10 @@ export const chatsController = {
       // Staff follow a customer's chat with a company without writing in it; support tickets stay writable
       if (resolved.chat && resolved.chat.user_id !== userId && !isTicketChat(resolved.chat)) {
         res.status(403).json({ error: CUSTOMER_COMPANY_READ_ONLY_ERROR });
+        return;
+      }
+      if (resolved.chat?.status === 'closed_final') {
+        res.status(409).json({ error: FINAL_CLOSED_ERROR });
         return;
       }
 
@@ -468,8 +484,36 @@ export const chatsController = {
         });
       }
 
-      // Push notification to company owner for new chat message (skip if owner is currently viewing the chat)
-      if (targetCompanyId) {
+      // A suggested question in a chat with a company is answered at once from the company's profile
+      let autoReply: any = null;
+      let autoAnswered = false;
+      const questionId = matchQuickQuestion(req.body.quickReplyId, message);
+      if (questionId && targetCompanyId && !safeImageUri && ticket.rows.length === 0 && targetCompanyName !== PLATFORM_DESK_NAME) {
+        try {
+          const reply = await buildAutoReply(questionId, String(targetCompanyId));
+          if (reply) {
+            const replyRes = await pool.query(
+              `INSERT INTO messages (id, chat_id, user_id, company_name, company_id, sender, text, time, status, sent_by_name)
+               VALUES ($1, $2, $3, $4, $5, 'company', $6, $7, 'received', $8) RETURNING *`,
+              [generate16CharId(), chatId, userId, targetCompanyName, targetCompanyId, reply.text, new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }), AUTO_REPLY_SENDER_NAME]
+            );
+            await pool.query(
+              `UPDATE chats SET last_message = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+              [reply.text, chatId]
+            );
+            autoReply = replyRes.rows[0];
+            autoAnswered = reply.answered;
+            if (io) io.to(`chat_${chatId}`).to(targetCompanyName).emit('receive_message', autoReply);
+          }
+        } catch (err) {
+          // The customer's message is already saved; without the automatic answer the team simply replies
+          console.error('Chat auto-reply failed:', err);
+        }
+      }
+
+      // Push notification to company owner for new chat message (skip if owner is currently viewing the chat).
+      // A question already answered automatically does not need the team.
+      if (targetCompanyId && !autoAnswered) {
         // The owner and every team member who handles chats
         const teamIds = await companyTeamUserIds(String(targetCompanyId), 'chats.view');
         if (teamIds.length > 0) {
@@ -486,7 +530,7 @@ export const chatsController = {
         }
       }
 
-      res.status(201).json({ success: true, data: createdMsg });
+      res.status(201).json({ success: true, data: createdMsg, autoReply });
     } catch (error: any) {
       console.error('Error in sendMessage:', error);
       res.status(500).json({ error: 'فشل إرسال الرسالة' });
@@ -885,6 +929,10 @@ export const chatsController = {
         res.status(400).json({ error: NOT_A_TICKET_ERROR });
         return;
       }
+      if (current.status === 'closed_final') {
+        res.status(409).json({ error: 'التذكرة مغلقة نهائياً ولا يمكن تغيير حالتها', data: current });
+        return;
+      }
 
       // Nothing changes: answer with the ticket as it is, without touching it or notifying anyone again
       const sameStatus = !status || (current.status || 'open') === status;
@@ -901,13 +949,14 @@ export const chatsController = {
              department = COALESCE($2, c.department),
              updated_at = CURRENT_TIMESTAMP
          FROM (SELECT id, status AS old_status FROM chats WHERE id = $3 FOR UPDATE) o
-         WHERE c.id = o.id
+         WHERE c.id = o.id AND COALESCE(o.old_status, 'open') <> 'closed_final'
          RETURNING c.*, o.old_status`,
         [status || null, department || null, chatId]
       );
 
       if (updateRes.rows.length === 0) {
-        res.status(404).json({ error: 'التذكرة غير موجودة' });
+        // Closed for good by someone else a moment ago
+        res.status(409).json({ error: 'التذكرة مغلقة نهائياً ولا يمكن تغيير حالتها' });
         return;
       }
       const statusChanged = Boolean(status) && (updateRes.rows[0].old_status || 'open') !== status;
@@ -917,7 +966,7 @@ export const chatsController = {
         io.to('support_staff').emit('ticket_updated', updateRes.rows[0]);
       }
 
-      if (status === 'resolved' || status === 'closed') {
+      if (status === 'resolved' || status === 'closed' || status === 'closed_final') {
         await resolveAdminAlerts('chat', String(chatId), req.user?.email || null);
       }
 
@@ -1007,6 +1056,10 @@ export const chatsController = {
         return;
       }
 
+      if (chat.status === 'closed_final') {
+        res.status(409).json({ error: 'التذكرة مغلقة نهائياً ولا يمكن الرد عليها' });
+        return;
+      }
       if (chat.status === 'closed') {
         res.status(409).json({ error: 'التذكرة مغلقة، أعد فتحها أولاً' });
         return;
@@ -1306,6 +1359,8 @@ export const chatsController = {
   async assignAndOpenTicket(req: AuthRequest, res: Response): Promise<void> {
     try {
       const chatId = await resolveChatId(req.params.chatId);
+      // No adminId: the staff member takes the ticket for themselves ("استلام"). With one: an explicit reassignment.
+      const isSelfClaim = !req.body?.adminId;
       const adminId = req.body?.adminId ? String(req.body.adminId) : String(req.user?.id || '');
 
       const staffRes = await pool.query(
@@ -1328,7 +1383,7 @@ export const chatsController = {
         res.status(400).json({ error: NOT_A_TICKET_ERROR });
         return;
       }
-      if (current.status === 'closed') {
+      if (current.status === 'closed' || current.status === 'closed_final') {
         res.status(409).json({ error: 'التذكرة مغلقة، أعد فتحها قبل إسنادها' });
         return;
       }
@@ -1337,19 +1392,35 @@ export const chatsController = {
         res.status(200).json({ success: true, message: `التذكرة مسندة بالفعل إلى ${adminName}`, data: current, unchanged: true });
         return;
       }
+      // Taking a ticket never takes it away from a colleague; moving it to someone else is done by reassigning
+      if (isSelfClaim && current.assigned_admin_id) {
+        res.status(409).json({ error: `التذكرة مستلمة بالفعل بواسطة ${current.assigned_admin_name || 'موظف آخر'}`, data: current });
+        return;
+      }
 
+      // Checked again in the update itself: two staff members pressing "استلام" together never both get the ticket
       const updateRes = await pool.query(
         `UPDATE chats
          SET assigned_admin_id = $1,
              assigned_admin_name = $2,
              status = CASE WHEN COALESCE(status, 'open') IN ('new', 'open') THEN 'in_progress' ELSE status END,
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = $3 RETURNING *`,
-        [adminId, adminName, chatId]
+         WHERE id = $3
+           AND COALESCE(status, 'open') NOT IN ('closed', 'closed_final')
+           AND (NOT $4::boolean OR assigned_admin_id IS NULL OR assigned_admin_id = $1)
+         RETURNING *`,
+        [adminId, adminName, chatId, isSelfClaim]
       );
 
       if (updateRes.rows.length === 0) {
-        res.status(404).json({ error: 'التذكرة غير موجودة' });
+        const latest = (await pool.query('SELECT * FROM chats WHERE id = $1', [chatId])).rows[0];
+        if (!latest) {
+          res.status(404).json({ error: 'التذكرة غير موجودة' });
+        } else if (latest.status === 'closed' || latest.status === 'closed_final') {
+          res.status(409).json({ error: 'التذكرة مغلقة، أعد فتحها قبل إسنادها', data: latest });
+        } else {
+          res.status(409).json({ error: `التذكرة مستلمة بالفعل بواسطة ${latest.assigned_admin_name || 'موظف آخر'}`, data: latest });
+        }
         return;
       }
 
@@ -1437,7 +1508,7 @@ export const chatsController = {
       const chatId = await resolveChatId(req.params.chatId);
 
       const updateRes = await pool.query(
-        `UPDATE chats SET status = 'closed', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND (user_id = $2 OR $3 = true) RETURNING *`,
+        `UPDATE chats SET status = CASE WHEN status = 'closed_final' THEN status ELSE 'closed' END, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND (user_id = $2 OR $3 = true) RETURNING *`,
         [chatId, userId, req.user?.role === 'admin' || req.user?.role === 'super_admin']
       );
 
@@ -1476,7 +1547,7 @@ export const chatsController = {
         return;
       }
 
-      if (chat.status === 'closed' || chat.status === 'resolved') {
+      if (['closed', 'closed_final', 'resolved'].includes(chat.status)) {
         res.status(409).json({ error: 'لا يمكن إرسال تذكير على تذكرة مغلقة أو تم حلها' });
         return;
       }
